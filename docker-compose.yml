@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgis/postgis:15-3.3
+    container_name: localy_postgres
+    environment:
+      POSTGRES_USER: localy_user
+      POSTGRES_PASSWORD: localy_pass
+      POSTGRES_DB: localy_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - localy_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: localy_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - localy_network
+
+  minio:
+    image: minio/minio:latest
+    container_name: localy_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - localy_network
+
+  backend:
+    build: .
+    container_name: localy_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env.development
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    networks:
+      - localy_network
+
+  celery_worker:
+    build: .
+    container_name: localy_celery
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    env_file:
+      - .env.development
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - localy_network
+
+  celery_beat:
+    build: .
+    container_name: localy_celery_beat
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    env_file:
+      - .env.development
+    depends_on:
+      - redis
+    networks:
+      - localy_network
+
+  flower:
+    build: .
+    container_name: localy_flower
+    command: celery -A app.tasks.celery_app flower --port=5555
+    env_file:
+      - .env.development
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - localy_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  localy_network:
+    driver: bridge
