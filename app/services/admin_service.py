@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from datetime import date, timedelta
 from uuid import UUID
 
-from app.crud.admin import (
+from app.crud.admin_crud import (
     admin_dashboard_crud,
     admin_user_crud,
     admin_business_crud,

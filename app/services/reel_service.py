@@ -6,11 +6,11 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 from uuid import UUID
 
-from app.crud.reels import reel_crud, reel_like_crud, reel_comment_crud, reel_view_crud
-from app.models.user import User
-from app.schemas.reels import ReelCreate, ReelUpdate, ReelCommentCreate, ReelViewCreate
+from app.crud.reels_crud import reel_crud, reel_like_crud, reel_comment_crud, reel_view_crud
+from app.models.user_model import User
+from app.schemas.reels_schema import ReelCreate, ReelUpdate, ReelCommentCreate, ReelViewCreate
 from app.core.exceptions import NotFoundException, PermissionDeniedException
-
+from app.crud.business_crud import business_crud
 
 class ReelService:
 
@@ -18,7 +18,7 @@ class ReelService:
             self, db: Session, *, business_id: UUID, obj_in: ReelCreate, user: User
     ) -> dict:
         """Business owner creates a reel."""
-        from app.crud.business import business_crud
+
         business = business_crud.get(db, id=business_id)
         if not business or business.user_id != user.id:
             raise PermissionDeniedException("You don't own this business")
@@ -75,7 +75,7 @@ class ReelService:
         if not reel:
             raise NotFoundException("Reel not found")
 
-        from app.crud.business import business_crud
+
         business = business_crud.get(db, id=reel.business_id)
         if not business or business.user_id != user.id:
             raise PermissionDeniedException("You don't own this reel")
@@ -90,7 +90,7 @@ class ReelService:
         if not reel:
             raise NotFoundException("Reel not found")
 
-        from app.crud.business import business_crud
+
         business = business_crud.get(db, id=reel.business_id)
         if not business or business.user_id != user.id:
             raise PermissionDeniedException("You don't own this reel")

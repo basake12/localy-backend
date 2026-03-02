@@ -13,8 +13,8 @@ from app.dependencies import (
     require_business,
     get_pagination_params
 )
-from app.schemas.common import SuccessResponse
-from app.schemas.tickets import (
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.tickets_schema import (
     TicketEventCreateRequest,
     TicketEventResponse,
     TicketEventListResponse,
@@ -26,21 +26,21 @@ from app.schemas.tickets import (
     TicketEventSearchFilters
 )
 from app.services.ticket_service import ticket_service
-from app.crud.tickets import (
+from app.crud.tickets_crud import (
     ticket_event_crud,
     ticket_tier_crud,
     ticket_booking_crud
 )
-from app.crud.business import business_crud
-from app.models.user import User
+from app.crud.business_crud import business_crud
+from app.models.user_model import User
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,
     ValidationException
 )
-from app.models.tickets import TicketBooking
+from app.models.tickets_model import TicketBooking
 from sqlalchemy import func
-from app.models.tickets import EventCategoryEnum
+from app.models.tickets_model import EventCategoryEnum
 
 router = APIRouter()
 

@@ -4,8 +4,8 @@ from uuid import UUID
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user
-from app.models.user import User
-from app.schemas.notifications import (
+from app.models.user_model import User
+from app.schemas.notifications_schema import (
     NotificationOut,
     NotificationListOut,
     PreferencesOut,

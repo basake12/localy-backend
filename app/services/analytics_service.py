@@ -6,11 +6,11 @@ from sqlalchemy import func, and_
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
-from app.models.user import User
-from app.models.business import Business
-from app.models.rider import Rider
-from app.models.wallet import WalletTransaction
-from app.models.analytics import DailyAnalyticsSnapshot
+from app.models.user_model import User
+from app.models.business_model import Business
+from app.models.rider_model import Rider
+from app.models.wallet_model import WalletTransaction
+from app.models.analytics_model import DailyAnalyticsSnapshot
 
 
 class AnalyticsService:

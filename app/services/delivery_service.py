@@ -4,21 +4,21 @@ from uuid import UUID
 from datetime import datetime
 from decimal import Decimal
 
-from app.crud.delivery import (
+from app.crud.delivery_crud import (
     delivery_crud,
     delivery_zone_crud,
     rider_earnings_crud
 )
-from app.crud.wallet import wallet_crud
-from app.crud.user import user_crud
+from app.crud.wallet_crud import wallet_crud
+from app.crud.user_crud import user_crud
 from app.core.exceptions import (
     NotFoundException,
     ValidationException,
     InsufficientBalanceException
 )
 from app.core.constants import TransactionType
-from app.models.user import User
-from app.models.delivery import Delivery
+from app.models.user_model import User
+from app.models.delivery_model import Delivery
 
 
 class DeliveryService:

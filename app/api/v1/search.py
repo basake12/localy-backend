@@ -1,5 +1,5 @@
 """
-search.py — /search/*
+search_crud.py — /search/*
 
 Unified search across all platform entities.
 """
@@ -10,8 +10,8 @@ from typing import Optional
 
 from app.core.database import get_db
 from app.dependencies import get_current_user_optional
-from app.models.user import User
-from app.schemas.search import (
+from app.models.user_model import User
+from app.schemas.search_schema import (
     SearchRequest, SearchResponse,
     AutocompleteRequest, AutocompleteResponse,
     PopularSearchesResponse,

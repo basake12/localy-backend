@@ -1,6 +1,6 @@
 from celery import shared_task
 from app.core.database import SessionLocal
-from app.crud.notification import notification_crud
+from app.crud.notification_crud import notification_crud
 
 
 @shared_task(name="tasks.create_notification")

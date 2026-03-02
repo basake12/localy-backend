@@ -1,7 +1,7 @@
 from celery import shared_task
 from app.core.database import SessionLocal
-from app.services.subscription import subscription_service
-from app.crud.subscription import subscription_crud
+from app.services.subscription_service import subscription_service
+from app.crud.subscription_crud import subscription_crud
 from app.tasks.email import send_email_async
 
 

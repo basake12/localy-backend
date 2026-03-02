@@ -4,9 +4,9 @@ from uuid import UUID
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user
-from app.models.user import User
-from app.models.wallet import TransactionType
-from app.schemas.wallet import (
+from app.models.user_model import User
+from app.models.wallet_model import TransactionType
+from app.schemas.wallet_schema import (
     WalletOut,
     WalletTopUpRequest,
     WalletWithdrawRequest,
@@ -14,7 +14,7 @@ from app.schemas.wallet import (
     WalletTransactionOut,
     WalletTransactionListOut
 )
-from app.schemas.common import SuccessResponse
+from app.schemas.common_schema import SuccessResponse
 from app.services.wallet_service import wallet_service
 from app.services.payment_service import payment_service
 

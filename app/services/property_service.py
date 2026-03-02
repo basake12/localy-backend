@@ -4,7 +4,7 @@ from uuid import UUID
 from datetime import date, time, datetime, timedelta
 from decimal import Decimal
 
-from app.crud.properties import (
+from app.crud.properties_crud import (
     property_agent_crud,
     property_crud,
     property_viewing_crud,
@@ -12,14 +12,14 @@ from app.crud.properties import (
     saved_property_crud,
     property_inquiry_crud
 )
-from app.crud.business import business_crud
+from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException,
     ValidationException,
     PermissionDeniedException
 )
-from app.models.user import User
-from app.models.properties import (
+from app.models.user_model import User
+from app.models.properties_model import (
     Property, PropertyViewing, PropertyOffer,
     PropertyStatusEnum, OfferStatusEnum
 )

@@ -2,11 +2,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.schemas.common import SuccessResponse
-from app.schemas.user import UserWithProfileResponse, UpdateCustomerProfileRequest
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.user_schema import UserWithProfileResponse, UpdateCustomerProfileRequest
 from app.dependencies import get_current_active_user, require_customer
-from app.models.user import User
-from app.crud.user import user_crud
+from app.models.user_model import User
+from app.crud.user_crud import user_crud
 
 router = APIRouter()
 

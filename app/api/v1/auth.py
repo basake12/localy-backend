@@ -47,7 +47,7 @@ from app.core.exceptions import (
 )
 from app.core.constants import UserType, UserStatus
 from app.config import settings
-from app.schemas.auth import (
+from app.schemas.auth_schema import (
     CustomerRegisterRequest,
     BusinessRegisterRequest,
     RiderRegisterRequest,
@@ -62,16 +62,16 @@ from app.schemas.auth import (
     AppleAuthRequest,
     ResendOTPRequest,
 )
-from app.schemas.common import SuccessResponse
-from app.crud.user import user_crud
-from app.crud.wallet import wallet_crud
+from app.schemas.common_schema import SuccessResponse
+from app.crud.user_crud import user_crud
+from app.crud.wallet_crud import wallet_crud
 from app.dependencies import get_current_user, get_current_admin_user
-from app.models.user import User
+from app.models.user_model import User
 from app.core.email import email_service
 from app.core.sms import sms_service
 from app.core.oauth_service import google_oauth, apple_oauth
 import secrets as _s
-from app.schemas.auth import RegisterRequest
+from app.schemas.auth_schema import RegisterRequest
 from app.core.security import decode_token, validate_password_strength
 from uuid import UUID
 

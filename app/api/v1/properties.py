@@ -12,8 +12,8 @@ from app.dependencies import (
     require_business,
     get_pagination_params
 )
-from app.schemas.common import SuccessResponse
-from app.schemas.properties import (
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.properties_schema import (
     PropertyAgentCreateRequest,
     PropertyAgentResponse,
     PropertyCreateRequest,
@@ -26,7 +26,7 @@ from app.schemas.properties import (
     PropertySearchFilters
 )
 from app.services.property_service import property_service
-from app.crud.properties import (
+from app.crud.properties_crud import (
     property_agent_crud,
     property_crud,
     property_viewing_crud,
@@ -34,8 +34,8 @@ from app.crud.properties import (
     saved_property_crud,
     property_inquiry_crud
 )
-from app.crud.business import business_crud
-from app.models.user import User
+from app.crud.business_crud import business_crud
+from app.models.user_model import User
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,

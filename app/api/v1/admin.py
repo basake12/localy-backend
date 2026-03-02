@@ -1,5 +1,5 @@
 """
-admin.py — /admin/*
+admin_crud.py — /admin/*
 
 Every route is gated behind require_admin().
 Response envelopes follow the project-wide {success, data} convention.
@@ -13,9 +13,9 @@ from uuid import UUID
 
 from app.core.database       import get_db
 from app.dependencies        import require_admin, get_pagination_params
-from app.models.user         import User
+from app.models.user_model   import User
 
-from app.schemas.admin import (
+from app.schemas.admin_schema import (
     DashboardOverview,
     TrendResponse,
     AdminUserListOut,

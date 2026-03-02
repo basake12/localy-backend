@@ -3,10 +3,10 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user
-from app.models.user import User
-from app.schemas.rider import RiderOut, RiderUpdate, RiderLocationUpdate, RiderStatsOut
-from app.schemas.common import SuccessResponse
-from app.crud.rider import rider_crud
+from app.models.user_model import User
+from app.schemas.rider_schema import RiderOut, RiderUpdate, RiderLocationUpdate, RiderStatsOut
+from app.schemas.common_schema import SuccessResponse
+from app.crud.rider_crud import rider_crud
 
 router = APIRouter()
 

@@ -9,14 +9,14 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 from datetime import datetime
 
-from app.crud.chat import (
+from app.crud.chat_crud import (
     conversation_crud, message_crud,
     presence_crud, typing_crud
 )
 from app.core.websocket_manager import ws_manager
 from app.core.exceptions import NotFoundException, ValidationException
-from app.models.chat import Conversation, Message
-from app.models.user import User
+from app.models.chat_model import Conversation, Message
+from app.models.user_model import User
 
 
 class ChatService:

@@ -4,14 +4,14 @@ from uuid import UUID
 from datetime import date, time, datetime
 from decimal import Decimal
 
-from app.crud.services import (
+from app.crud.services_crud import (
     service_provider_crud,
     service_crud,
     service_availability_crud,
     service_booking_crud
 )
-from app.crud.wallet import wallet_crud
-from app.crud.business import business_crud
+from app.crud.wallet_crud import wallet_crud
+from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException,
     ValidationException,
@@ -19,8 +19,8 @@ from app.core.exceptions import (
     BookingNotAvailableException
 )
 from app.core.constants import TransactionType
-from app.models.user import User
-from app.models.services import ServiceBooking
+from app.models.user_model import User
+from app.models.services_model import ServiceBooking
 
 
 class ServiceService:

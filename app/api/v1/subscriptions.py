@@ -4,12 +4,12 @@ from typing import List
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user
-from app.models.user import User
-from app.models.subscription import SubscriptionPlanTypeEnum, BillingCycleEnum
-from app.schemas.subscription import SubscriptionPlanOut, SubscriptionOut, SubscriptionCreate, SubscriptionCancelRequest
-from app.schemas.common import SuccessResponse
+from app.models.user_model import User
+from app.models.subscription_model import SubscriptionPlanTypeEnum, BillingCycleEnum
+from app.schemas.subscription_schema import SubscriptionPlanOut, SubscriptionOut, SubscriptionCreate, SubscriptionCancelRequest
+from app.schemas.common_schema import SuccessResponse
 from app.services.subscription_service import subscription_service
-from app.crud.subscription import subscription_plan_crud
+from app.crud.subscription_crud import subscription_plan_crud
 router = APIRouter()
 
 

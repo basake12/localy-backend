@@ -12,8 +12,8 @@ from app.dependencies import (
     get_pagination_params,
     get_current_user_optional
 )
-from app.schemas.common import SuccessResponse, PaginatedResponse
-from app.schemas.hotels import (
+from app.schemas.common_schema import SuccessResponse, PaginatedResponse
+from app.schemas.hotels_schema import (
     HotelCreateRequest,
     HotelResponse,
     RoomTypeCreateRequest,
@@ -28,15 +28,15 @@ from app.schemas.hotels import (
     HotelSearchFilters
 )
 from app.services.hotel_service import hotel_service
-from app.crud.hotels import hotel_crud, room_type_crud, hotel_booking_crud
-from app.crud.business import business_crud
-from app.models.user import User
+from app.crud.hotels_crud import hotel_crud, room_type_crud, hotel_booking_crud
+from app.crud.business_crud import business_crud
+from app.models.user_model import User
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,
     ValidationException
 )
-from app.models.hotels import HotelService
+from app.models.hotels_model import HotelService
 from datetime import datetime
 
 router = APIRouter()

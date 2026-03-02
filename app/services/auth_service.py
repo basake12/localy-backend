@@ -7,7 +7,7 @@ This file can redirect to the main auth_service or contain additional auth utili
 # This file can be used for additional auth-related business logic
 
 from app.core.security import create_access_token, create_refresh_token, verify_password, hash_password
-from app.crud.user import user_crud
+from app.crud.user_crud import user_crud
 
 # Re-export for convenience
 __all__ = [

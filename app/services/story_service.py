@@ -6,11 +6,11 @@ from typing import Optional, List, Dict
 from sqlalchemy.orm import Session
 from uuid import UUID
 
-from app.crud.stories import story_crud, story_view_crud
-from app.models.user import User
-from app.schemas.stories import StoryCreate, StoryUpdate
+from app.crud.stories_crud import story_crud, story_view_crud
+from app.models.user_model import User
+from app.schemas.stories_schema import StoryCreate, StoryUpdate
 from app.core.exceptions import NotFoundException, PermissionDeniedException
-
+from app.crud.business_crud import business_crud
 
 class StoryService:
 
@@ -19,7 +19,7 @@ class StoryService:
     ) -> dict:
         """Business owner creates a story."""
         # Permission check: user must own this business
-        from app.crud.business import business_crud
+
         business = business_crud.get(db, id=business_id)
         if not business or business.user_id != user.id:
             raise PermissionDeniedException("You don't own this business")
@@ -98,7 +98,6 @@ class StoryService:
             raise NotFoundException("Story not found")
 
         # Permission check
-        from app.crud.business import business_crud
         business = business_crud.get(db, id=story.business_id)
         if not business or business.user_id != user.id:
             raise PermissionDeniedException("You don't own this story")
@@ -113,7 +112,7 @@ class StoryService:
         if not story:
             raise NotFoundException("Story not found")
 
-        from app.crud.business import business_crud
+
         business = business_crud.get(db, id=story.business_id)
         if not business or business.user_id != user.id:
             raise PermissionDeniedException("You don't own this story")

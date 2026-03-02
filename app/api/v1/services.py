@@ -11,8 +11,8 @@ from app.dependencies import (
     require_business,
     get_pagination_params
 )
-from app.schemas.common import SuccessResponse
-from app.schemas.services import (
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.services_schema import (
     ServiceProviderCreateRequest,
     ServiceProviderResponse,
     ServiceCreateRequest,
@@ -29,14 +29,14 @@ from app.schemas.services import (
     ServiceSearchFilters
 )
 from app.services.service_service import service_service
-from app.crud.services import (
+from app.crud.services_crud import (
     service_provider_crud,
     service_crud,
     service_availability_crud,
     service_booking_crud
 )
-from app.crud.business import business_crud
-from app.models.user import User
+from app.crud.business_crud import business_crud
+from app.models.user_model import User
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,

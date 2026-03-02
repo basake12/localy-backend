@@ -11,8 +11,8 @@ from app.dependencies import (
     require_customer,
     get_pagination_params
 )
-from app.schemas.common import SuccessResponse
-from app.schemas.chat import (
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.chat_schema import (
     ConversationCreateRequest,
     ConversationResponse,
     MessageCreateRequest,
@@ -24,12 +24,12 @@ from app.schemas.chat import (
     TypingStartRequest
 )
 from app.services.chat_service import chat_service
-from app.crud.chat import (
+from app.crud.chat_crud import (
     conversation_crud, message_crud,
     presence_crud, typing_crud
 )
 from app.core.websocket_manager import ws_manager
-from app.models.user import User
+from app.models.user_model import User
 from app.core.exceptions import NotFoundException, ValidationException
 from app.core.security import decode_token   # reuse existing JWT decode util
 

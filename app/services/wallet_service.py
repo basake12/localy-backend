@@ -3,9 +3,9 @@ from typing import Optional
 from uuid import UUID
 from decimal import Decimal
 
-from app.models.user import User
-from app.models.wallet import Wallet, WalletTransaction, TransactionType, TransactionStatus
-from app.crud.wallet import wallet_crud, transaction_crud
+from app.models.user_model import User
+from app.models.wallet_model import Wallet, WalletTransaction, TransactionType, TransactionStatus
+from app.crud.wallet_crud import wallet_crud, transaction_crud
 from app.core.exceptions import (
     NotFoundException,
     InsufficientFundsException,

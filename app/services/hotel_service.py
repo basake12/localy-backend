@@ -4,10 +4,10 @@ from uuid import UUID
 from datetime import date
 from decimal import Decimal
 
-from app.crud.hotels import hotel_crud, room_type_crud, hotel_booking_crud
-from app.crud.business import business_crud
+from app.crud.hotels_crud import hotel_crud, room_type_crud, hotel_booking_crud
+from app.crud.business_crud import business_crud
 from app.core.exceptions import NotFoundException, PermissionDeniedException
-from app.models.user import User
+from app.models.user_model import User
 
 
 class HotelService:

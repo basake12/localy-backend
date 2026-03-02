@@ -1,5 +1,5 @@
 """
-stories.py — /stories/*
+stories_crud.py — /stories/*
 
 Business stories with 24h expiry.
 """
@@ -11,8 +11,8 @@ from uuid import UUID
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user, get_current_user_optional, require_business, get_pagination_params
-from app.models.user import User
-from app.schemas.stories import StoryCreate, StoryUpdate, StoryOut, StoryFeedOut
+from app.models.user_model import User
+from app.schemas.stories_schema import StoryCreate, StoryUpdate, StoryOut, StoryFeedOut
 from app.services.story_service import story_service
 
 

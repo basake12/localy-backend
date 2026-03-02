@@ -2,9 +2,9 @@ from sqlalchemy.orm import Session
 from typing import Optional, List, Tuple
 from uuid import UUID
 
-from app.models.user import User
-from app.models.jobs import JobPosting, JobApplication, JobStatus, ApplicationStatus
-from app.schemas.jobs import (
+from app.models.user_model import User
+from app.models.jobs_model import JobPosting, JobApplication, JobStatus, ApplicationStatus
+from app.schemas.jobs_schema import (
     JobPostingCreate,
     JobPostingUpdate,
     JobApplicationCreate,
@@ -12,8 +12,8 @@ from app.schemas.jobs import (
     JobApplicationStatusUpdate,
     JobStatsOut,
 )
-from app.crud.jobs import job_crud, application_crud
-from app.crud.business import business_crud
+from app.crud.jobs_crud import job_crud, application_crud
+from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,

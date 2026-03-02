@@ -20,15 +20,15 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 from datetime import datetime
 
-from app.crud.notifications import notification_crud, preference_crud, device_token_crud
-from app.models.notifications import (
+from app.crud.notifications_crud import notification_crud, preference_crud, device_token_crud
+from app.models.notifications_model import (
     Notification,
     NotificationChannelEnum,
     NotificationStatusEnum,
     NotificationCategoryEnum,
 )
-from app.models.user import User
-from app.schemas.notifications import NotificationPayload, PreferenceToggle
+from app.models.user_model import User
+from app.schemas.notifications_schema import NotificationPayload, PreferenceToggle
 from app.core.exceptions import NotFoundException
 
 logger = logging.getLogger(__name__)

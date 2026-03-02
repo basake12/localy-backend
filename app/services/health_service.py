@@ -4,19 +4,19 @@ from uuid import UUID
 from datetime import date, time, datetime
 from decimal import Decimal
 
-from app.crud.health import (
+from app.crud.health_crud import (
     doctor_crud, consultation_crud, prescription_crud,
     pharmacy_crud, pharmacy_order_crud,
     lab_center_crud, lab_booking_crud
 )
-from app.crud.wallet import wallet_crud
-from app.crud.business import business_crud
+from app.crud.wallet_crud import wallet_crud
+from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException, ValidationException, InsufficientBalanceException
 )
 from app.core.constants import TransactionType
-from app.models.user import User
-from app.models.health import (
+from app.models.user_model import User
+from app.models.health_model import (
     Consultation, Prescription, PharmacyOrder, LabBooking,
     ConsultationStatusEnum, PrescriptionStatusEnum
 )

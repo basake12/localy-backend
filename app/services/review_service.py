@@ -9,10 +9,10 @@ from typing import Optional, Dict
 from sqlalchemy.orm import Session
 from uuid import UUID
 
-from app.crud.reviews import review_crud, helpful_vote_crud, review_response_crud
-from app.models.reviews import Review, ReviewStatusEnum, ReviewableTypeEnum, ReviewContextEnum
-from app.models.user import User, UserTypeEnum
-from app.schemas.reviews import (
+from app.crud.reviews_crud import review_crud, helpful_vote_crud, review_response_crud
+from app.models.reviews_model import Review, ReviewStatusEnum, ReviewableTypeEnum, ReviewContextEnum
+from app.models.user_model import User, UserTypeEnum
+from app.schemas.reviews_schema import (
     ReviewCreate, ReviewUpdate,
     ReviewResponseCreate, ReviewResponseUpdate,
     ReviewFlagCreate, ReviewModerationUpdate,
@@ -24,7 +24,7 @@ from app.core.exceptions import (
     PermissionDeniedException,
     ValidationException,
 )
-
+from app.schemas.reviews_schema import RATING_BREAKDOWN_KEYS
 
 # ---------------------------------------------------------------------------
 # TRANSACTION VERIFICATION
@@ -48,13 +48,13 @@ def _verify_transaction(
     Column mapping matches the actual ORM models exactly.
     ProductOrder is special-cased: reviewable_id == vendor_id, verified via OrderItem → Product.
     """
-    from app.models.hotels     import HotelBooking
-    from app.models.products   import ProductOrder, OrderItem, Product
-    from app.models.services   import ServiceBooking
-    from app.models.food       import FoodOrder
-    from app.models.delivery   import Delivery
-    from app.models.health     import Consultation
-    from app.models.properties import PropertyViewing
+    from app.models.hotels_model     import HotelBooking
+    from app.models.products_model   import ProductOrder, OrderItem, Product
+    from app.models.services_model   import ServiceBooking
+    from app.models.food_model       import FoodOrder
+    from app.models.delivery_model   import Delivery
+    from app.models.health_model     import Consultation
+    from app.models.properties_model import PropertyViewing
 
     # --------------- ProductOrder special case ---------------
     # ProductOrder has no direct vendor_id; link is OrderItem.product_id → Product.vendor_id
@@ -155,7 +155,6 @@ class ReviewService:
 
         # 3. Validate rating_breakdown keys against allowed set
         if payload.rating_breakdown:
-            from app.schemas.reviews import RATING_BREAKDOWN_KEYS
             allowed = RATING_BREAKDOWN_KEYS.get(payload.reviewable_type, set())
             extra = set(payload.rating_breakdown.keys()) - allowed
             if extra:

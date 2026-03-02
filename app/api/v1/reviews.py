@@ -4,8 +4,8 @@ from uuid import UUID
 
 from app.core.database import get_db
 from app.dependencies import get_current_user, get_current_active_user, require_admin
-from app.models.user import User
-from app.schemas.reviews import (
+from app.models.user_model import User
+from app.schemas.reviews_schema import (
     ReviewCreate, ReviewUpdate, ReviewOut, ReviewListOut,
     HelpfulVoteCreate, HelpfulVoteOut,
     ReviewResponseCreate, ReviewResponseUpdate, ReviewResponseOut,

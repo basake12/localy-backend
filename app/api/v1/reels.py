@@ -1,5 +1,5 @@
 """
-reels.py — /reels/*
+reels_crud.py — /reels/*
 
 Short-form video content.
 """
@@ -11,8 +11,8 @@ from uuid import UUID
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user, get_current_user_optional, require_business, get_pagination_params
-from app.models.user import User
-from app.schemas.reels import (
+from app.models.user_model import User
+from app.schemas.reels_schema import (
     ReelCreate, ReelUpdate, ReelOut, ReelListOut,
     ReelCommentCreate, ReelCommentListOut, ReelViewCreate,
 )

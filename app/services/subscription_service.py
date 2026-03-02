@@ -6,9 +6,9 @@ from uuid import UUID
 from datetime import datetime
 from decimal import Decimal
 
-from app.models.user import User
-from app.models.subscription import SubscriptionPlan, Subscription, SubscriptionPlanTypeEnum, BillingCycleEnum
-from app.crud.subscription import subscription_crud, subscription_plan_crud
+from app.models.user_model import User
+from app.models.subscription_model import SubscriptionPlan, Subscription, SubscriptionPlanTypeEnum, BillingCycleEnum
+from app.crud.subscription_crud import subscription_crud, subscription_plan_crud
 from app.services.wallet_service import wallet_service
 from app.services.payment_service import payment_service
 from app.core.exceptions import (

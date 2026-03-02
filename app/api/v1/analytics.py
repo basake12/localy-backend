@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 
 from app.core.database import get_db
 from app.dependencies import get_current_admin_user
-from app.models.user import User
-from app.schemas.common import SuccessResponse
+from app.models.user_model import User
+from app.schemas.common_schema import SuccessResponse
 from app.services.analytics_service import analytics_service
 
 router = APIRouter()

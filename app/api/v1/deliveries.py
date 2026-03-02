@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import Delivery
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -14,8 +15,8 @@ from app.dependencies import (
     require_admin,
     get_pagination_params
 )
-from app.schemas.common import SuccessResponse
-from app.schemas.delivery import (
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.delivery_schema import (
     DeliveryCreateRequest,
     DeliveryResponse,
     DeliveryListResponse,
@@ -30,15 +31,15 @@ from app.schemas.delivery import (
     DeliveryZoneResponse
 )
 from app.services.delivery_service import delivery_service
-from app.crud.delivery import (
+from app.crud.delivery_crud import (
     delivery_crud,
     delivery_zone_crud,
     rider_earnings_crud
 )
-from app.crud.user import user_crud
-from app.models.user import User
-from app.models.rider import Rider
-from app.models.delivery import DeliveryTracking
+from app.crud.user_crud import user_crud
+from app.models.user_model import User
+from app.models.rider_model import Rider
+from app.models.delivery_model import DeliveryTracking
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,

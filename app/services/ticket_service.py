@@ -4,13 +4,13 @@ from uuid import UUID
 from datetime import date
 from decimal import Decimal
 
-from app.crud.tickets import (
+from app.crud.tickets_crud import (
     ticket_event_crud,
     ticket_tier_crud,
     ticket_booking_crud
 )
-from app.crud.wallet import wallet_crud
-from app.crud.business import business_crud
+from app.crud.wallet_crud import wallet_crud
+from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException,
     ValidationException,
@@ -18,8 +18,8 @@ from app.core.exceptions import (
     BookingNotAvailableException
 )
 from app.core.constants import TransactionType
-from app.models.user import User
-from app.models.tickets import TicketBooking
+from app.models.user_model import User
+from app.models.tickets_model import TicketBooking
 
 
 class TicketService:

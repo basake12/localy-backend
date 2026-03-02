@@ -5,9 +5,9 @@ from uuid import UUID
 
 from app.core.database import get_db
 from app.dependencies import get_current_user, get_current_active_user
-from app.models.user import User
-from app.models.jobs import JobStatus, ApplicationStatus
-from app.schemas.jobs import (
+from app.models.user_model import User
+from app.models.jobs_model import JobStatus, ApplicationStatus
+from app.schemas.jobs_schema import (
     JobPostingCreate,
     JobPostingUpdate,
     JobPostingOut,

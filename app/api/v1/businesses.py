@@ -3,10 +3,10 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_current_active_user
-from app.models.user import User
-from app.schemas.business import BusinessOut, BusinessUpdate, BusinessListOut
-from app.schemas.common import SuccessResponse
-from app.crud.business import business_crud
+from app.models.user_model import User
+from app.schemas.business_schema import BusinessOut, BusinessUpdate, BusinessListOut
+from app.schemas.common_schema import SuccessResponse
+from app.crud.business_crud import business_crud
 
 router = APIRouter()
 

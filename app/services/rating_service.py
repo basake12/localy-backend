@@ -5,8 +5,8 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 from decimal import Decimal
 
-from app.crud.business import business_crud
-from app.crud.rider import rider_crud
+from app.crud.business_crud import business_crud
+from app.crud.rider_crud import rider_crud
 from app.core.utils import calculate_new_average
 
 

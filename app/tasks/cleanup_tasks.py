@@ -1,6 +1,6 @@
 from celery import shared_task
 from app.core.database import SessionLocal
-from app.crud.subscription import subscription_crud
+from app.crud.subscription_crud import subscription_crud
 from datetime import datetime, timedelta
 
 

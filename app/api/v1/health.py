@@ -10,8 +10,8 @@ from app.dependencies import (
     get_current_active_user, require_customer,
     require_business, get_pagination_params
 )
-from app.schemas.common import SuccessResponse
-from app.schemas.health import (
+from app.schemas.common_schema import SuccessResponse
+from app.schemas.health_schema import (
     DoctorCreateRequest, DoctorResponse,
     DoctorAvailabilityCreateRequest, DoctorAvailabilityResponse,
     DoctorSearchFilters,
@@ -26,22 +26,22 @@ from app.schemas.health import (
     LabResultResponse, LabCenterSearchFilters
 )
 from app.services.health_service import health_service
-from app.crud.health import (
+from app.crud.health_crud import (
     doctor_crud, doctor_availability_crud, consultation_crud,
     prescription_crud, pharmacy_crud, pharmacy_product_crud,
     pharmacy_order_crud, lab_center_crud, lab_test_crud,
     lab_booking_crud, lab_result_crud
 )
-from app.crud.business import business_crud
-from app.models.user import User
+from app.crud.business_crud import business_crud
+from app.models.user_model import User
 from app.core.exceptions import (
     NotFoundException, PermissionDeniedException, ValidationException
 )
 from geoalchemy2.elements import WKTElement
-from app.models.health import LabResult
+from app.models.health_model import LabResult
 from sqlalchemy import func
-from app.models.health import Consultation as ConsultModel
-from app.models.health import DoctorSpecializationEnum
+from app.models.health_model import Consultation as ConsultModel
+from app.models.health_model import DoctorSpecializationEnum
 
 router = APIRouter()
 

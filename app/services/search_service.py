@@ -9,15 +9,15 @@ from uuid import UUID
 from geoalchemy2.elements import WKTElement
 from geoalchemy2.functions import ST_Distance, ST_GeogFromText
 
-from app.crud.search import search_query_crud
-from app.models.hotels import Hotel
-from app.models.products import Product
-from app.models.food import Restaurant
-from app.models.services import Service
-from app.models.properties import Property
-from app.models.health import Doctor
-from app.models.tickets import TicketEvent
-from app.schemas.search import SearchRequest, SearchResultItem
+from app.crud.search_crud import search_query_crud
+from app.models.hotels_model import Hotel
+from app.models.products_model import Product
+from app.models.food_model import Restaurant
+from app.models.services_model import Service
+from app.models.properties_model import Property
+from app.models.health_model import Doctor
+from app.models.tickets_model import TicketEvent
+from app.schemas.search_model import SearchRequest, SearchResultItem
 
 
 class SearchService:
