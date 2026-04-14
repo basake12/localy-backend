@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Integer, Numeric, Date, Index
 from sqlalchemy.dialects.postgresql import JSONB
 
-from app.models.base import BaseModel
+from app.models.base_model import BaseModel
 
 
 class DailyAnalyticsSnapshot(BaseModel):

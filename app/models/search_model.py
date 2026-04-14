@@ -30,7 +30,7 @@ class SearchQuery(BaseModel):
     results_count = Column(Integer, default=0)
 
     # Location context
-    location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=True)
     location_name = Column(String(200), nullable=True)  # "Abuja", "Lagos Island", etc.
 
     # Filters applied

@@ -17,6 +17,7 @@ from app.schemas.reviews_schema import (
     ReviewResponseCreate, ReviewResponseUpdate,
     ReviewFlagCreate, ReviewModerationUpdate,
     HelpfulVoteCreate,
+    RATING_BREAKDOWN_KEYS,
 )
 from app.core.exceptions import (
     NotFoundException,
@@ -24,7 +25,6 @@ from app.core.exceptions import (
     PermissionDeniedException,
     ValidationException,
 )
-from app.schemas.reviews_schema import RATING_BREAKDOWN_KEYS
 
 # ---------------------------------------------------------------------------
 # TRANSACTION VERIFICATION
@@ -155,7 +155,7 @@ class ReviewService:
 
         # 3. Validate rating_breakdown keys against allowed set
         if payload.rating_breakdown:
-            allowed = RATING_BREAKDOWN_KEYS.get(payload.reviewable_type, set())
+            allowed = RATING_BREAKDOWN_KEYS.get(payload.reviewable_type, frozenset())
             extra = set(payload.rating_breakdown.keys()) - allowed
             if extra:
                 raise ValidationException(
@@ -296,8 +296,9 @@ class HelpfulVoteService:
         if review.reviewer_id == voter.id:
             raise ValidationException("You cannot vote on your own review.")
 
+        # FIX: was review=review (ORM object) — CRUD method expects review_id: UUID
         vote = helpful_vote_crud.upsert(
-            db, review=review, voter_id=voter.id, is_helpful=payload.is_helpful
+            db, review_id=review.id, voter_id=voter.id, is_helpful=payload.is_helpful
         )
         db.commit()
         db.refresh(review)
@@ -322,9 +323,9 @@ class ReviewResponseService:
         if not review:
             raise NotFoundException("Review")
 
-        # Business owner check:  the responder must own a Business whose id == reviewable_id
+        # Business owner check: the responder must own a Business whose id == reviewable_id
         # (for hotel/product/service/restaurant/doctor/property the reviewable_id IS the business-linked entity)
-        # Simplified: allow if user is business type  OR  admin
+        # Simplified: allow if user is business type OR admin
         if responder.user_type not in (UserTypeEnum.BUSINESS, UserTypeEnum.ADMIN):
             raise PermissionDeniedException("Only business owners can respond to reviews.")
 
@@ -348,7 +349,7 @@ class ReviewResponseService:
         return resp
 
     def update_response(self, db: Session, *, review_id: UUID, responder: User, payload: ReviewResponseUpdate):
-        review = self._resolve_review_and_check_ownership(db, review_id=review_id, responder=responder)
+        self._resolve_review_and_check_ownership(db, review_id=review_id, responder=responder)
 
         existing = review_response_crud.get(db, review_id=review_id)
         if not existing:
@@ -387,7 +388,13 @@ class ModerationService:
         if payload.status not in valid_statuses:
             raise ValidationException(f"status must be one of {valid_statuses}")
 
-        review_crud.moderate(db, review=review, status=payload.status, moderator_id=moderator.id)
+        review_crud.moderate(
+            db,
+            review=review,
+            status=payload.status,
+            moderator_id=moderator.id,
+            moderator_note=payload.moderator_note,
+        )
         db.commit()
         db.refresh(review)
         return review

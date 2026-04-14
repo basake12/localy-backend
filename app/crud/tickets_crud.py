@@ -1,48 +1,63 @@
-from typing import Optional, List, Dict, Any
-from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import and_, or_, func
+from typing import Optional, List, Dict
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import and_, or_, func, select, update
+from sqlalchemy.orm import joinedload, selectinload
 from uuid import UUID
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
-import random
+import secrets
 import string
 
-from app.crud.base_crud import CRUDBase
+from app.crud.base_crud import AsyncCRUDBase as CRUDBase
 from app.models.tickets_model import (
     TicketEvent, TicketTier, TicketBooking, SeatMap,
-    TicketStatusEnum, BookingStatusEnum
+    TicketStatusEnum, BookingStatusEnum, PaymentStatusEnum, EventTypeEnum
 )
-from app.models.business_model import Business
 from app.core.exceptions import (
     NotFoundException,
     ValidationException,
     BookingNotAvailableException
 )
+from app.core.constants import TICKET_SERVICE_CHARGE_RATE   # e.g. Decimal("0.05")
 
+
+# ============================================
+# TICKET EVENT CRUD
+# ============================================
 
 class CRUDTicketEvent(CRUDBase[TicketEvent, dict, dict]):
     """CRUD for TicketEvent"""
 
-    def get_by_business_id(
+    async def get_by_business_id(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
             business_id: UUID,
             skip: int = 0,
             limit: int = 50
     ) -> List[TicketEvent]:
         """Get events by business"""
-        return db.query(TicketEvent).filter(
-            TicketEvent.business_id == business_id
-        ).offset(skip).limit(limit).all()
+        result = await db.execute(
+            select(TicketEvent)
+            .where(TicketEvent.business_id == business_id)
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
 
-    def search_events(
+    async def search_events(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
             query_text: Optional[str] = None,
             event_type: Optional[str] = None,
             category: Optional[str] = None,
+            # FIX: parameter renamed from lga_id (UUID) to lga_name (str) to match
+            # the model column TicketEvent.lga_name (String). The old lga_id referred
+            # to a non-existent column — any caller passing lga_id caused AttributeError.
+            # Note: blueprint §3.1 says no LGA filtering; tickets.py router never sends
+            # this. The parameter is kept for back-compat but marked as legacy.
+            lga_name: Optional[str] = None,
             location: Optional[tuple] = None,
             radius_km: float = 50.0,
             event_date_from: Optional[date] = None,
@@ -57,129 +72,122 @@ class CRUDTicketEvent(CRUDBase[TicketEvent, dict, dict]):
             limit: int = 20
     ) -> List[TicketEvent]:
         """Search ticket events with filters"""
-        query = db.query(TicketEvent).filter(TicketEvent.is_active == True)
+        stmt = (
+            select(TicketEvent)
+            .where(TicketEvent.is_active == True)
+            .options(selectinload(TicketEvent.ticket_tiers))
+        )
 
-        # Text search
         if query_text:
-            search_filter = or_(
-                TicketEvent.name.ilike(f"%{query_text}%"),
-                TicketEvent.description.ilike(f"%{query_text}%"),
-                TicketEvent.venue_name.ilike(f"%{query_text}%")
-            )
-            query = query.filter(search_filter)
-
-        # Event type filter
-        if event_type:
-            query = query.filter(TicketEvent.event_type == event_type)
-
-        # Category filter (for events)
-        if category:
-            query = query.filter(TicketEvent.category == category)
-
-        # Location filter (for events)
-        if location and event_type == "event":
-            lat, lng = location
-            query = query.filter(
-                func.ST_DWithin(
-                    TicketEvent.venue_location,
-                    func.ST_SetSRID(func.ST_MakePoint(lng, lat), 4326),
-                    radius_km * 1000
+            stmt = stmt.where(
+                or_(
+                    TicketEvent.name.ilike(f"%{query_text}%"),
+                    TicketEvent.description.ilike(f"%{query_text}%"),
+                    TicketEvent.venue_name.ilike(f"%{query_text}%"),
                 )
             )
 
-        # Date filters (for events)
+        if event_type:
+            stmt = stmt.where(TicketEvent.event_type == event_type)
+
+        if category:
+            stmt = stmt.where(TicketEvent.category == category)
+
+        # lga_name filter (legacy — blueprint §3.1 mandates radius-only discovery;
+        # tickets.py router does not send this parameter).
+        if lga_name:
+            stmt = stmt.where(TicketEvent.lga_name == lga_name)
+        elif location and event_type == EventTypeEnum.EVENT:
+            lat, lng = location
+            point = func.ST_SetSRID(func.ST_MakePoint(lng, lat), 4326)
+            # FIX: Include events with no venue_location — ST_DWithin(NULL) returns NULL → empty results
+            stmt = stmt.where(or_(
+                TicketEvent.venue_location.is_(None),
+                func.ST_DWithin(TicketEvent.venue_location, point, radius_km * 1000)
+            ))
+
         if event_date_from:
-            query = query.filter(TicketEvent.event_date >= event_date_from)
+            stmt = stmt.where(TicketEvent.event_date >= event_date_from)
 
         if event_date_to:
-            query = query.filter(TicketEvent.event_date <= event_date_to)
+            stmt = stmt.where(TicketEvent.event_date <= event_date_to)
 
-        # Transport filters
         if origin_city:
-            query = query.filter(TicketEvent.origin_city.ilike(f"%{origin_city}%"))
+            stmt = stmt.where(TicketEvent.origin_city.ilike(f"%{origin_city}%"))
 
         if destination_city:
-            query = query.filter(TicketEvent.destination_city.ilike(f"%{destination_city}%"))
+            stmt = stmt.where(TicketEvent.destination_city.ilike(f"%{destination_city}%"))
 
         if departure_date:
-            query = query.filter(TicketEvent.departure_date == departure_date)
+            stmt = stmt.where(TicketEvent.departure_date == departure_date)
 
         if transport_type:
-            query = query.filter(TicketEvent.transport_type == transport_type)
+            stmt = stmt.where(TicketEvent.transport_type == transport_type)
 
-        # Availability filter
         if available_only:
-            query = query.filter(
+            stmt = stmt.where(
                 and_(
                     TicketEvent.status == TicketStatusEnum.AVAILABLE,
                     TicketEvent.available_capacity > 0
                 )
             )
 
-        # Featured filter
         if is_featured is not None:
-            query = query.filter(TicketEvent.is_featured == is_featured)
+            stmt = stmt.where(TicketEvent.is_featured == is_featured)
 
-        return query.order_by(
+        stmt = stmt.order_by(
             TicketEvent.is_featured.desc(),
             TicketEvent.created_at.desc()
-        ).offset(skip).limit(limit).all()
+        ).offset(skip).limit(limit)
 
+        result = await db.execute(stmt)
+        return result.scalars().all()
+
+
+# ============================================
+# TICKET TIER CRUD
+# ============================================
 
 class CRUDTicketTier(CRUDBase[TicketTier, dict, dict]):
     """CRUD for TicketTier"""
 
-    def get_by_event(
+    async def get_by_event(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
             event_id: UUID,
             active_only: bool = True
     ) -> List[TicketTier]:
         """Get ticket tiers for event"""
-        query = db.query(TicketTier).filter(
-            TicketTier.event_id == event_id
-        )
+        stmt = select(TicketTier).where(TicketTier.event_id == event_id)
 
         if active_only:
-            query = query.filter(TicketTier.is_active == True)
+            stmt = stmt.where(TicketTier.is_active == True)
 
-        return query.order_by(TicketTier.display_order).all()
+        stmt = stmt.order_by(TicketTier.display_order)
+        result = await db.execute(stmt)
+        return result.scalars().all()
 
-    def check_availability(
-            self,
-            db: Session,
-            *,
-            tier_id: UUID,
-            quantity: int
-    ) -> bool:
-        """Check if tier has enough tickets available"""
-        tier = self.get(db, id=tier_id)
-        if not tier or not tier.is_active:
-            return False
 
-        return tier.available_quantity >= quantity
-
+# ============================================
+# TICKET BOOKING CRUD
+# ============================================
 
 class CRUDTicketBooking(CRUDBase[TicketBooking, dict, dict]):
     """CRUD for TicketBooking"""
 
-    def _generate_booking_reference(self, db: Session) -> str:
-        """Generate unique booking reference"""
-        while True:
-            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-            reference = f"TKT{code}"
+    def _generate_booking_reference(self) -> str:
+        """
+        Generate a cryptographically secure booking reference.
+        FIX: replaced random.choices (not cryptographically secure) with secrets.
+        """
+        alphabet = string.ascii_uppercase + string.digits
+        code = ''.join(secrets.choice(alphabet) for _ in range(10))
+        return f"TKT{code}"
 
-            existing = db.query(TicketBooking).filter(
-                TicketBooking.booking_reference == reference
-            ).first()
-
-            if not existing:
-                return reference
-
-    def create_booking(
+    async def create_booking(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
             event_id: UUID,
             tier_id: UUID,
@@ -191,40 +199,79 @@ class CRUDTicketBooking(CRUDBase[TicketBooking, dict, dict]):
             additional_attendees: List[Dict],
             special_requests: Optional[str] = None
     ) -> TicketBooking:
-        """Create a ticket booking"""
-        # Get event
-        event = ticket_event_crud.get(db, id=event_id)
-        if not event or not event.is_active:
+        """
+        Create a ticket booking with race-condition-safe inventory deduction.
+
+        FIX: Uses SELECT ... FOR UPDATE on the tier row to prevent overselling
+        under concurrent requests. Without this, two users could both pass the
+        availability check before either commits, resulting in negative inventory.
+        """
+        # --- 1. Load event (no lock needed, we only read it here) ---
+        event_result = await db.execute(
+            select(TicketEvent).where(
+                TicketEvent.id == event_id,
+                TicketEvent.is_active == True
+            )
+        )
+        event = event_result.scalar_one_or_none()
+        if not event:
             raise NotFoundException("Event")
 
-        # Get tier
-        tier = ticket_tier_crud.get(db, id=tier_id)
-        if not tier or not tier.is_active:
+        # --- 2. Validate sales period ---
+        now = datetime.now(timezone.utc)
+        if event.sales_start_date and now < event.sales_start_date:
+            raise ValidationException("Ticket sales have not started yet")
+        if event.sales_end_date and now > event.sales_end_date:
+            raise ValidationException("Ticket sales have ended")
+
+        # --- 3. Lock the tier row to prevent concurrent overselling ---
+        tier_result = await db.execute(
+            select(TicketTier)
+            .where(
+                TicketTier.id == tier_id,
+                TicketTier.is_active == True
+            )
+            .with_for_update()   # FIX: row-level lock
+        )
+        tier = tier_result.scalar_one_or_none()
+        if not tier:
             raise NotFoundException("Ticket tier")
 
-        # Check tier belongs to event
+        # --- 4. Validate tier belongs to this event ---
         if tier.event_id != event_id:
             raise ValidationException("Ticket tier does not belong to this event")
 
-        # Check quantity limits
-        if quantity < tier.min_purchase or quantity > tier.max_purchase:
-            raise ValidationException(
-                f"Quantity must be between {tier.min_purchase} and {tier.max_purchase}"
-            )
+        # --- 5. Validate quantity limits ---
+        if quantity < tier.min_purchase:
+            raise ValidationException(f"Minimum purchase is {tier.min_purchase} ticket(s)")
+        if quantity > tier.max_purchase:
+            raise ValidationException(f"Maximum purchase is {tier.max_purchase} ticket(s)")
 
-        # Check availability
-        if not ticket_tier_crud.check_availability(db, tier_id=tier_id, quantity=quantity):
+        # --- 6. Check availability (inside the lock) ---
+        if tier.available_quantity < quantity:
             raise BookingNotAvailableException()
 
-        # Calculate pricing
+        # --- 7. Calculate pricing ---
         unit_price = tier.price
-        service_charge = unit_price * quantity * Decimal('0.05')  # 5% service charge
+        service_charge = (unit_price * quantity * TICKET_SERVICE_CHARGE_RATE).quantize(
+            Decimal("0.01")
+        )
         total_amount = (unit_price * quantity) + service_charge
 
-        # Generate booking reference
-        booking_reference = self._generate_booking_reference(db)
+        # --- 8. Generate unique booking reference ---
+        # Loop is safe — probability of collision is negligible but we guard it
+        for _ in range(5):
+            ref = self._generate_booking_reference()
+            existing = await db.execute(
+                select(TicketBooking).where(TicketBooking.booking_reference == ref)
+            )
+            if existing.scalar_one_or_none() is None:
+                booking_reference = ref
+                break
+        else:
+            raise RuntimeError("Could not generate unique booking reference")
 
-        # Create booking
+        # --- 9. Create booking ---
         booking = TicketBooking(
             event_id=event_id,
             tier_id=tier_id,
@@ -240,42 +287,50 @@ class CRUDTicketBooking(CRUDBase[TicketBooking, dict, dict]):
             special_requests=special_requests,
             booking_reference=booking_reference
         )
-
         db.add(booking)
-        db.flush()
 
-        # Reduce available capacity
+        # --- 10. Deduct inventory (within the same transaction as the lock) ---
         tier.available_quantity -= quantity
         event.available_capacity -= quantity
 
-        # TODO: Generate QR code
+        # Mark sold out if no capacity left
+        if event.available_capacity <= 0:
+            event.status = TicketStatusEnum.SOLD_OUT
 
-        db.commit()
-        db.refresh(booking)
+        await db.flush()   # get booking.id before committing
+        # NOTE: QR code generation should be dispatched as a Celery task here
+        # after commit, using booking.id and booking_reference.
+
+        await db.commit()
+        await db.refresh(booking)
 
         return booking
 
-    def get_customer_bookings(
+    async def get_customer_bookings(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
             customer_id: UUID,
             skip: int = 0,
             limit: int = 20
     ) -> List[TicketBooking]:
-        """Get customer bookings"""
-        return db.query(TicketBooking).options(
-            joinedload(TicketBooking.event),
-            joinedload(TicketBooking.tier)
-        ).filter(
-            TicketBooking.customer_id == customer_id
-        ).order_by(
-            TicketBooking.created_at.desc()
-        ).offset(skip).limit(limit).all()
+        """Get customer bookings with event and tier eager-loaded"""
+        result = await db.execute(
+            select(TicketBooking)
+            .options(
+                joinedload(TicketBooking.event),
+                joinedload(TicketBooking.tier)
+            )
+            .where(TicketBooking.customer_id == customer_id)
+            .order_by(TicketBooking.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
 
-    def get_event_bookings(
+    async def get_event_bookings(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
             event_id: UUID,
             status: Optional[str] = None,
@@ -283,37 +338,130 @@ class CRUDTicketBooking(CRUDBase[TicketBooking, dict, dict]):
             limit: int = 50
     ) -> List[TicketBooking]:
         """Get event bookings"""
-        query = db.query(TicketBooking).filter(
-            TicketBooking.event_id == event_id
+        stmt = (
+            select(TicketBooking)
+            .where(TicketBooking.event_id == event_id)
+            .order_by(TicketBooking.created_at.desc())
+            .offset(skip)
+            .limit(limit)
         )
 
         if status:
-            query = query.filter(TicketBooking.status == status)
+            stmt = stmt.where(TicketBooking.status == status)
 
-        return query.order_by(
-            TicketBooking.created_at.desc()
-        ).offset(skip).limit(limit).all()
+        result = await db.execute(stmt)
+        return result.scalars().all()
 
-    def check_in_ticket(
+    async def get_by_reference(
             self,
-            db: Session,
+            db: AsyncSession,
             *,
-            booking_id: UUID
+            booking_reference: str
+    ) -> Optional[TicketBooking]:
+        """Look up a booking by its reference code"""
+        result = await db.execute(
+            select(TicketBooking)
+            .where(TicketBooking.booking_reference == booking_reference)
+            .options(
+                joinedload(TicketBooking.event),
+                joinedload(TicketBooking.tier)
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def check_in_ticket(
+            self,
+            db: AsyncSession,
+            *,
+            booking_reference: str
     ) -> TicketBooking:
-        """Check in a ticket"""
-        booking = self.get(db, id=booking_id)
+        """
+        Check in a ticket by its QR booking reference.
+
+        FIX: accepts booking_reference string (from QR scan) instead of UUID.
+        Also uses SELECT FOR UPDATE to prevent double check-in race conditions.
+        FIX: datetime.now(timezone.utc) replaces deprecated datetime.utcnow().
+        """
+        # Lock the row to prevent concurrent double-checkins
+        result = await db.execute(
+            select(TicketBooking)
+            .where(TicketBooking.booking_reference == booking_reference)
+            .with_for_update()
+        )
+        booking = result.scalar_one_or_none()
+
         if not booking:
             raise NotFoundException("Booking")
 
+        if booking.status == BookingStatusEnum.CHECKED_IN:
+            raise ValidationException("Ticket already checked in")
+
         if booking.status != BookingStatusEnum.CONFIRMED:
-            raise ValidationException("Can only check in confirmed bookings")
+            raise ValidationException(
+                f"Cannot check in a booking with status '{booking.status.value}'"
+            )
 
         booking.status = BookingStatusEnum.CHECKED_IN
-        booking.checked_in_at = datetime.utcnow()
+        # FIX: datetime.utcnow() is deprecated since Python 3.12
+        booking.checked_in_at = datetime.now(timezone.utc)
 
-        db.commit()
-        db.refresh(booking)
+        await db.commit()
+        await db.refresh(booking)
 
+        return booking
+
+    async def cancel_booking(
+            self,
+            db: AsyncSession,
+            *,
+            booking_id: UUID,
+            reason: Optional[str] = None
+    ) -> TicketBooking:
+        """Cancel a booking and restore capacity"""
+        # Lock the booking row
+        result = await db.execute(
+            select(TicketBooking)
+            .where(TicketBooking.id == booking_id)
+            .with_for_update()
+        )
+        booking = result.scalar_one_or_none()
+
+        if not booking:
+            raise NotFoundException("Booking")
+
+        if booking.status in (BookingStatusEnum.CHECKED_IN, BookingStatusEnum.CANCELLED):
+            raise ValidationException(
+                "Cannot cancel a checked-in or already cancelled booking"
+            )
+
+        booking.status = BookingStatusEnum.CANCELLED
+        booking.cancelled_at = datetime.now(timezone.utc)
+        booking.cancellation_reason = reason
+
+        # Restore capacity
+        tier_result = await db.execute(
+            select(TicketTier)
+            .where(TicketTier.id == booking.tier_id)
+            .with_for_update()
+        )
+        tier = tier_result.scalar_one_or_none()
+        if tier:
+            tier.available_quantity += booking.quantity
+
+        event_result = await db.execute(
+            select(TicketEvent)
+            .where(TicketEvent.id == booking.event_id)
+            .with_for_update()
+        )
+        event = event_result.scalar_one_or_none()
+        if event:
+            event.available_capacity += booking.quantity
+            # Restore status if it was sold out
+            if event.status == TicketStatusEnum.SOLD_OUT and event.available_capacity > 0:
+                event.status = TicketStatusEnum.AVAILABLE
+
+        await db.commit()
+        await db.refresh(booking)
         return booking
 
 

@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from uuid import UUID
@@ -29,7 +30,7 @@ class CRUDSearchQuery(CRUDBase[SearchQuery, None, None]):
 
         search = SearchQuery(
             user_id=user_id,
-            query=query.lower().strip(),  # Normalize for aggregation
+            query=query.lower().strip(),
             category=category,
             results_count=results_count,
             location=location,
@@ -81,11 +82,8 @@ class CRUDSearchQuery(CRUDBase[SearchQuery, None, None]):
             days: int = 7,
             limit: int = 20,
     ) -> List[Dict]:
-        """
-        Returns most popular searches in the last N days.
-        """
-        from datetime import datetime, timedelta
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        """Returns most popular searches in the last N days."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)  # FIX: was datetime.utcnow()
 
         q = (
             db.query(

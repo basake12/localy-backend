@@ -139,7 +139,7 @@ class Doctor(BaseModel):
     # Practice Info
     hospital_name = Column(String(255), nullable=True)
     hospital_address = Column(Text, nullable=True)
-    hospital_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    hospital_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
     clinic_address = Column(Text, nullable=True)
 
     # Consultation Settings
@@ -169,7 +169,7 @@ class Doctor(BaseModel):
     is_active = Column(Boolean, default=True)
 
     # Relationships
-    business = relationship("Business")
+    business = relationship("Business", back_populates="doctor")
     availabilities = relationship(
         "DoctorAvailability",
         back_populates="doctor",
@@ -380,7 +380,7 @@ class Prescription(BaseModel):
     )
     fulfilled_order_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("pharmacy_orders.id", ondelete="SET NULL"),
+        ForeignKey("pharmacy_orders.id", ondelete="SET NULL", use_alter=True, name="fk_prescription_fulfilled_order"),
         nullable=True
     )
 
@@ -435,7 +435,7 @@ class Pharmacy(BaseModel):
     address = Column(Text, nullable=False)
     city = Column(String(100), nullable=False, index=True)
     state = Column(String(100), nullable=False)
-    location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False)
+    location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=False)
 
     # Hours
     opening_time = Column(Time, nullable=True)
@@ -465,7 +465,7 @@ class Pharmacy(BaseModel):
     is_verified = Column(Boolean, default=False)
 
     # Relationships
-    business = relationship("Business")
+    business = relationship("Business", back_populates="pharmacy")
     products = relationship(
         "PharmacyProduct",
         back_populates="pharmacy",
@@ -576,7 +576,7 @@ class PharmacyOrder(BaseModel):
 
     # Delivery Info
     delivery_address = Column(Text, nullable=True)
-    delivery_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    delivery_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
     delivery_instructions = Column(Text, nullable=True)
 
     # Customer Info
@@ -704,7 +704,7 @@ class LabCenter(BaseModel):
     address = Column(Text, nullable=False)
     city = Column(String(100), nullable=False, index=True)
     state = Column(String(100), nullable=False)
-    location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False)
+    location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=False)
 
     # Hours
     opening_time = Column(Time, nullable=True)
@@ -732,7 +732,7 @@ class LabCenter(BaseModel):
     is_verified = Column(Boolean, default=False)
 
     # Relationships
-    business = relationship("Business")
+    business = relationship("Business", back_populates="lab_center")
     tests = relationship(
         "LabTest",
         back_populates="lab_center",
@@ -833,7 +833,7 @@ class LabBooking(BaseModel):
 
     # Home Collection Details
     home_address = Column(Text, nullable=True)
-    home_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    home_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     # Patient Info
     patient_name = Column(String(200), nullable=False)

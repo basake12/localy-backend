@@ -70,7 +70,7 @@ class ServiceProvider(BaseModel):
     travel_fee = Column(Numeric(10, 2), default=0.00)
 
     # Provider Location (if they have a physical location)
-    provider_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    provider_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
     provider_address = Column(Text, nullable=True)
 
     # Availability Settings
@@ -250,7 +250,7 @@ class ServiceBooking(BaseModel):
         nullable=False
     )
     service_address = Column(Text, nullable=True)
-    service_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    service_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     # Pricing
     base_price = Column(Numeric(10, 2), nullable=False)

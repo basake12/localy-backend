@@ -1,21 +1,19 @@
 """
-CORS middleware configuration.
-"""
-from fastapi.middleware.cors import CORSMiddleware
-from app.config import settings
+app/middleware/cors.py
 
-
-def add_cors_middleware(app):
-    """Add CORS middleware to app."""
+CORS is configured directly in app/main.py via:
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"]
+        ...
     )
 
+This file is intentionally kept as a reference stub.
+Do NOT call add_cors_middleware() — doing so would register CORSMiddleware
+a second time, which causes duplicate CORS headers and broken preflight
+responses in some browsers.
 
-
+Allowed origins are controlled by ALLOWED_ORIGINS in .env:
+    ALLOWED_ORIGINS=https://localy.ng,https://admin.localy.ng
+"""

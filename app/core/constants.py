@@ -244,19 +244,26 @@ class ReelType(str, Enum):
 
 
 # ============================================
-# NIGERIA LOCAL GOVERNMENTS (Sample - Abuja)
+# LOCATION CONSTANTS (BLUEPRINT v2.0)
 # ============================================
+# Per Blueprint: "Location model — Radius-based (default 5 km) — no LGA dependency"
 
-ABUJA_LOCAL_GOVERNMENTS = [
-    "Abaji",
-    "Abuja Municipal",
-    "Bwari",
-    "Gwagwalada",
-    "Kuje",
-    "Kwali"
-]
+DEFAULT_RADIUS_KM = 5.0      # Default discovery radius in kilometers
+MIN_RADIUS_KM = 1.0          # Minimum user-adjustable radius
+MAX_RADIUS_KM = 50.0         # Maximum user-adjustable radius
 
-# Add more states and LGAs as needed
+# PostGIS uses meters for ST_DWithin — these constants convert km to meters
+DEFAULT_RADIUS_METERS = int(DEFAULT_RADIUS_KM * 1000)  # 5000 meters
+MIN_RADIUS_METERS = int(MIN_RADIUS_KM * 1000)          # 1000 meters
+MAX_RADIUS_METERS = int(MAX_RADIUS_KM * 1000)          # 50000 meters
+
+
+# ============================================
+# NIGERIA STATES (for display purposes only)
+# ============================================
+# NOTE: States/LGAs are stored in business addresses for display but 
+# NEVER used for filtering queries (Blueprint: no LGA dependency)
+
 NIGERIA_STATES = [
     "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa",
     "Benue", "Borno", "Cross River", "Delta", "Ebonyi", "Edo",
@@ -265,3 +272,27 @@ NIGERIA_STATES = [
     "Niger", "Ogun", "Ondo", "Osun", "Oyo", "Plateau", "Rivers",
     "Sokoto", "Taraba", "Yobe", "Zamfara"
 ]
+
+
+# ============================================
+# FINANCIAL RATES & LIMITS
+# ============================================
+from decimal import Decimal
+
+# Platform fees per Blueprint Section 4.4
+PLATFORM_FEE_STANDARD = Decimal("50.00")     # ₦50 on products, food, tickets
+PLATFORM_FEE_BOOKING = Decimal("100.00")     # ₦100 on hotels, services, health
+PLATFORM_FEE_TICKET = Decimal("50.00")       # ₦50 per ticket
+
+# Referral rewards per Blueprint Section 6.1
+REFERRAL_BONUS_AMOUNT = Decimal("1000.00")         # ₦1,000 to referrer
+REFERRAL_DISCOUNT_AMOUNT = Decimal("1000.00")      # ₦1,000 off for new user
+REFERRAL_MINIMUM_ORDER = Decimal("2000.00")        # New user must spend >₦2,000
+
+# Wallet limits
+MIN_WALLET_TOPUP = Decimal("500.00")               # Minimum top-up amount
+MAX_WALLET_TOPUP_DAILY = Decimal("500000.00")      # Daily funding limit
+MIN_WITHDRAWAL_AMOUNT = Decimal("1000.00")         # Minimum withdrawal
+MAX_WITHDRAWAL_AMOUNT = Decimal("1000000.00")      # Maximum withdrawal per day
+# Ticket service charge rate (0.00 = no percentage charge; Blueprint §4.4 uses flat ₦50 fee only)
+TICKET_SERVICE_CHARGE_RATE = Decimal("0.00")

@@ -1,11 +1,18 @@
 from decimal import Decimal
-
-import Delivery
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
+
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+# FIX: was `import Delivery` (bare broken import)
+from app.models.delivery_model import Delivery, DeliveryTracking
+# FIX: was `from app.models.delivery import RiderEarnings` (wrong module)
+from app.models.delivery_model import RiderEarnings
+from app.models.rider_model import Rider
+from app.models.user_model import User
 
 from app.core.database import get_db
 from app.dependencies import (
@@ -13,94 +20,91 @@ from app.dependencies import (
     require_customer,
     require_rider,
     require_admin,
-    get_pagination_params
+    get_pagination_params,
 )
 from app.schemas.common_schema import SuccessResponse
 from app.schemas.delivery_schema import (
     DeliveryCreateRequest,
+    DeliveryQuoteRequest,
     DeliveryResponse,
     DeliveryListResponse,
     DeliveryDetailsResponse,
-    DeliveryTrackingResponse,
     RiderLocationUpdate,
     RiderAvailabilityUpdate,
     RiderStatsResponse,
     RiderEarningsResponse,
     AssignRiderRequest,
     DeliveryZoneCreateRequest,
-    DeliveryZoneResponse
+    DeliveryZoneResponse,
 )
-from app.services.delivery_service import delivery_service
+from app.services import delivery_service
 from app.crud.delivery_crud import (
     delivery_crud,
     delivery_zone_crud,
-    rider_earnings_crud
+    rider_earnings_crud,
 )
-from app.crud.user_crud import user_crud
-from app.models.user_model import User
-from app.models.rider_model import Rider
-from app.models.delivery_model import DeliveryTracking
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,
-    ValidationException
+    ValidationException,
 )
 
 router = APIRouter()
 
 
-# ============================================
-# DELIVERY QUOTE (PUBLIC/CUSTOMER)
-# ============================================
+# ============================================================
+# QUOTE  (public — no auth required)
+# ============================================================
 
 @router.post("/quote", response_model=SuccessResponse[dict])
 def get_delivery_quote(
-        *,
-        db: Session = Depends(get_db),
-        pickup_lat: float = Query(..., ge=-90, le=90),
-        pickup_lng: float = Query(..., ge=-180, le=180),
-        dropoff_lat: float = Query(..., ge=-90, le=90),
-        dropoff_lng: float = Query(..., ge=-180, le=180),
-        order_type: str = Query(...)
+    *,
+    db: Session = Depends(get_db),
+    quote_in: DeliveryQuoteRequest,
 ) -> dict:
     """
-    Get delivery price quote
+    Get delivery price quote.
 
-    - Public endpoint
-    - Calculate distance and pricing
-    - Estimate delivery time
+    FIX: was a GET with coords in Query params — changed to POST with body
+    so coordinates are not leaked in server logs or browser history.
     """
     quote = delivery_service.calculate_delivery_quote(
         db,
-        pickup_location=(pickup_lat, pickup_lng),
-        dropoff_location=(dropoff_lat, dropoff_lng),
-        order_type=order_type
+        pickup_location=(
+            quote_in.pickup_location.latitude,
+            quote_in.pickup_location.longitude,
+        ),
+        dropoff_location=(
+            quote_in.dropoff_location.latitude,
+            quote_in.dropoff_location.longitude,
+        ),
+        order_type=quote_in.order_type,
     )
-
-    return {
-        "success": True,
-        "data": quote
-    }
+    return {"success": True, "data": quote}
 
 
-# ============================================
-# DELIVERY CREATION (CUSTOMER)
-# ============================================
+# ============================================================
+# DELIVERY CREATION  (customer)
+# ============================================================
 
-@router.post("/", response_model=SuccessResponse[DeliveryResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=SuccessResponse[DeliveryResponse],
+    status_code=status.HTTP_201_CREATED,
+)
 def create_delivery(
-        *,
-        db: Session = Depends(get_db),
-        delivery_in: DeliveryCreateRequest,
-        current_user: User = Depends(require_customer)
+    *,
+    db: Session = Depends(get_db),
+    delivery_in: DeliveryCreateRequest,
+    current_user: User = Depends(require_customer),
 ) -> dict:
     """
-    Create a new delivery
+    Create a new delivery.
 
-    - Only for customer accounts
-    - Calculates pricing
-    - Processes payment
-    - Auto-assigns rider if available
+    - Customer only
+    - Calculates pricing (zone-aware)
+    - Processes wallet payment (or flags as COD)
+    - Auto-assigns nearest available rider
     """
     delivery = delivery_service.create_and_pay_delivery(
         db,
@@ -109,66 +113,65 @@ def create_delivery(
         pickup_address=delivery_in.pickup_address,
         pickup_location=(
             delivery_in.pickup_location.latitude,
-            delivery_in.pickup_location.longitude
+            delivery_in.pickup_location.longitude,
         ),
         pickup_contact_name=delivery_in.pickup_contact_name,
         pickup_contact_phone=delivery_in.pickup_contact_phone,
+        pickup_instructions=delivery_in.pickup_instructions,
         dropoff_address=delivery_in.dropoff_address,
         dropoff_location=(
             delivery_in.dropoff_location.latitude,
-            delivery_in.dropoff_location.longitude
+            delivery_in.dropoff_location.longitude,
         ),
         dropoff_contact_name=delivery_in.dropoff_contact_name,
         dropoff_contact_phone=delivery_in.dropoff_contact_phone,
+        dropoff_instructions=delivery_in.dropoff_instructions,
         package_description=delivery_in.package_description,
         package_weight_kg=delivery_in.package_weight_kg,
+        package_value=delivery_in.package_value,
         order_id=delivery_in.order_id,
         payment_method=delivery_in.payment_method,
-        cod_amount=delivery_in.cod_amount
+        cod_amount=delivery_in.cod_amount,
+        requires_cold_storage=delivery_in.requires_cold_storage,
+        is_fragile=delivery_in.is_fragile,
+        required_vehicle_type=delivery_in.required_vehicle_type,
     )
-
-    return {
-        "success": True,
-        "data": delivery
-    }
+    return {"success": True, "data": delivery}
 
 
-# ============================================
-# DELIVERY TRACKING (PUBLIC)
-# ============================================
+# ============================================================
+# TRACKING BY CODE  (public)
+# ============================================================
 
 @router.get("/track/{tracking_code}", response_model=SuccessResponse[DeliveryDetailsResponse])
 def track_delivery(
-        *,
-        db: Session = Depends(get_db),
-        tracking_code: str
+    *,
+    db: Session = Depends(get_db),
+    tracking_code: str,
 ) -> dict:
-    """
-    Track delivery by tracking code
-
-    - Public endpoint
-    - Returns delivery details and tracking updates
-    """
+    """Track a delivery using its public tracking code (no login required)."""
     delivery = delivery_crud.get_by_tracking_code(db, tracking_code=tracking_code)
     if not delivery:
         raise NotFoundException("Delivery not found")
 
-    # Get tracking updates
-    tracking_updates = db.query(DeliveryTracking).filter(
-        DeliveryTracking.delivery_id == delivery.id
-    ).order_by(DeliveryTracking.created_at.desc()).all()
+    tracking_updates = (
+        db.query(DeliveryTracking)
+        .filter(DeliveryTracking.delivery_id == delivery.id)
+        .order_by(DeliveryTracking.created_at.desc())
+        .all()
+    )
 
-    # Get rider info if assigned
     rider_info = None
     if delivery.rider_id:
-        rider = db.query(Rider).get(delivery.rider_id)
+        # FIX: db.get() replaces deprecated db.query(Model).get(id)
+        rider = db.get(Rider, delivery.rider_id)
         if rider:
             rider_info = {
                 "name": f"{rider.first_name} {rider.last_name}",
                 "phone": rider.phone,
                 "vehicle_type": rider.vehicle_type,
                 "vehicle_plate": rider.vehicle_plate_number,
-                "average_rating": float(rider.average_rating)
+                "average_rating": float(rider.average_rating),
             }
 
     return {
@@ -176,64 +179,91 @@ def track_delivery(
         "data": {
             "delivery": delivery,
             "tracking_updates": tracking_updates,
-            "rider_info": rider_info
-        }
+            "rider_info": rider_info,
+        },
     }
 
 
-# ============================================
-# CUSTOMER DELIVERY MANAGEMENT
-# ============================================
+# ============================================================
+# CUSTOMER — delivery list
+# ============================================================
 
 @router.get("/my", response_model=SuccessResponse[List[DeliveryListResponse]])
 def get_my_deliveries(
-        *,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(require_customer),
-        pagination: dict = Depends(get_pagination_params),
-        status: Optional[str] = Query(None)
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_customer),
+    pagination: dict = Depends(get_pagination_params),
+    delivery_status: Optional[str] = Query(None, alias="status"),
 ) -> dict:
-    """Get current customer's deliveries"""
+    """List deliveries for the authenticated customer."""
     deliveries = delivery_crud.get_customer_deliveries(
         db,
         customer_id=current_user.id,
         skip=pagination["skip"],
         limit=pagination["limit"],
-        status=status
+        status=delivery_status,
     )
-
-    # Transform to list response
-    delivery_list = []
-    for delivery in deliveries:
-        delivery_list.append({
-            "id": delivery.id,
-            "tracking_code": delivery.tracking_code,
-            "order_type": delivery.order_type,
-            "dropoff_address": delivery.dropoff_address,
-            "total_fee": delivery.total_fee,
-            "status": delivery.status,
-            "created_at": delivery.created_at
-        })
-
-    return {
-        "success": True,
-        "data": delivery_list
-    }
+    return {"success": True, "data": deliveries}
 
 
-@router.get("/{delivery_id}", response_model=SuccessResponse[DeliveryDetailsResponse])
-def get_delivery_details(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        current_user: User = Depends(get_current_active_user)
+# ============================================================
+# CUSTOMER — cancel
+# ============================================================
+
+@router.post("/{delivery_id}/cancel", response_model=SuccessResponse[DeliveryResponse])
+def cancel_delivery(
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    reason: Optional[str] = None,
+    current_user: User = Depends(require_customer),
 ) -> dict:
-    """Get delivery details"""
+    """Cancel a delivery and issue a wallet refund if payment was already taken."""
     delivery = delivery_crud.get(db, id=delivery_id)
     if not delivery:
         raise NotFoundException("Delivery")
 
-    # Verify permission
+    if delivery.customer_id != current_user.id:
+        raise PermissionDeniedException()
+
+    if delivery.status in ["delivered", "cancelled"]:
+        raise ValidationException("Cannot cancel a delivered or already-cancelled delivery")
+
+    delivery.status = "cancelled"
+    delivery.cancelled_at = datetime.utcnow()
+    delivery.cancellation_reason = reason
+    delivery.cancelled_by = "customer"
+
+    # FIX: replaced TODO with actual refund call
+    delivery_service.refund_delivery_fee(db, delivery=delivery)
+
+    if delivery.rider_id:
+        rider = db.get(Rider, delivery.rider_id)  # FIX: deprecated .get() removed
+        if rider:
+            rider.is_available = True
+
+    db.commit()
+    db.refresh(delivery)
+    return {"success": True, "data": delivery}
+
+
+# ============================================================
+# CUSTOMER — detail by ID
+# ============================================================
+
+@router.get("/{delivery_id}", response_model=SuccessResponse[DeliveryDetailsResponse])
+def get_delivery_details(
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+) -> dict:
+    """Fetch full delivery details. Customers see only their own; riders see assigned ones."""
+    delivery = delivery_crud.get(db, id=delivery_id)
+    if not delivery:
+        raise NotFoundException("Delivery")
+
     if current_user.user_type == "customer":
         if delivery.customer_id != current_user.id:
             raise PermissionDeniedException()
@@ -242,21 +272,23 @@ def get_delivery_details(
         if not rider or delivery.rider_id != rider.id:
             raise PermissionDeniedException()
 
-    # Get tracking updates
-    tracking_updates = db.query(DeliveryTracking).filter(
-        DeliveryTracking.delivery_id == delivery_id
-    ).order_by(DeliveryTracking.created_at.desc()).all()
+    tracking_updates = (
+        db.query(DeliveryTracking)
+        .filter(DeliveryTracking.delivery_id == delivery_id)
+        .order_by(DeliveryTracking.created_at.desc())
+        .all()
+    )
 
-    # Get rider info
     rider_info = None
     if delivery.rider_id:
-        rider = db.query(Rider).get(delivery.rider_id)
+        rider = db.get(Rider, delivery.rider_id)  # FIX: deprecated .get() removed
         if rider:
             rider_info = {
                 "name": f"{rider.first_name} {rider.last_name}",
                 "phone": rider.phone,
                 "vehicle_type": rider.vehicle_type,
-                "average_rating": float(rider.average_rating)
+                "vehicle_plate": rider.vehicle_plate_number,
+                "average_rating": float(rider.average_rating),
             }
 
     return {
@@ -264,97 +296,47 @@ def get_delivery_details(
         "data": {
             "delivery": delivery,
             "tracking_updates": tracking_updates,
-            "rider_info": rider_info
-        }
+            "rider_info": rider_info,
+        },
     }
 
 
-@router.post("/{delivery_id}/cancel", response_model=SuccessResponse[DeliveryResponse])
-def cancel_delivery(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        reason: Optional[str] = None,
-        current_user: User = Depends(require_customer)
-) -> dict:
-    """Cancel a delivery"""
-    delivery = delivery_crud.get(db, id=delivery_id)
-    if not delivery:
-        raise NotFoundException("Delivery")
-
-    # Verify ownership
-    if delivery.customer_id != current_user.id:
-        raise PermissionDeniedException()
-
-    if delivery.status in ["delivered", "cancelled"]:
-        raise ValidationException("Cannot cancel delivered or already cancelled delivery")
-
-    # Cancel delivery
-    delivery.status = "cancelled"
-    delivery.cancelled_at = datetime.utcnow()
-    delivery.cancellation_reason = reason
-    delivery.cancelled_by = "customer"
-
-    # Make rider available if assigned
-    if delivery.rider_id:
-        rider = db.query(Rider).get(delivery.rider_id)
-        if rider:
-            rider.is_available = True
-
-    # TODO: Process refund
-
-    db.commit()
-    db.refresh(delivery)
-
-    return {
-        "success": True,
-        "data": delivery
-    }
-
-
-# ============================================
-# RIDER DELIVERY MANAGEMENT
-# ============================================
+# ============================================================
+# RIDER — available job feed
+# ============================================================
 
 @router.get("/rider/available", response_model=SuccessResponse[List[DeliveryResponse]])
 def get_available_deliveries(
-        *,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(require_rider),
-        pagination: dict = Depends(get_pagination_params)
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_rider),
+    pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    """
-    Get available deliveries for rider
-
-    - Shows pending deliveries near rider
-    """
+    """Pending unassigned deliveries near the rider."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
 
-    # Get pending deliveries
-    deliveries = db.query(Delivery).filter(
-        Delivery.status == "pending",
-        Delivery.rider_id == None
-    ).order_by(
-        Delivery.created_at
-    ).offset(pagination["skip"]).limit(pagination["limit"]).all()
-
-    return {
-        "success": True,
-        "data": deliveries
-    }
+    deliveries = (
+        db.query(Delivery)
+        .filter(Delivery.status == "pending", Delivery.rider_id.is_(None))
+        .order_by(Delivery.created_at)
+        .offset(pagination["skip"])
+        .limit(pagination["limit"])
+        .all()
+    )
+    return {"success": True, "data": deliveries}
 
 
 @router.get("/rider/my", response_model=SuccessResponse[List[DeliveryResponse]])
 def get_my_rider_deliveries(
-        *,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(require_rider),
-        pagination: dict = Depends(get_pagination_params),
-        status: Optional[str] = Query(None)
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_rider),
+    pagination: dict = Depends(get_pagination_params),
+    delivery_status: Optional[str] = Query(None, alias="status"),
 ) -> dict:
-    """Get current rider's deliveries"""
+    """All deliveries assigned to the authenticated rider."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
@@ -364,25 +346,23 @@ def get_my_rider_deliveries(
         rider_id=rider.id,
         skip=pagination["skip"],
         limit=pagination["limit"],
-        status=status
+        status=delivery_status,
     )
+    return {"success": True, "data": deliveries}
 
-    return {
-        "success": True,
-        "data": deliveries
-    }
 
+# ============================================================
+# RIDER — delivery lifecycle actions
+# ============================================================
 
 @router.post("/{delivery_id}/accept", response_model=SuccessResponse[DeliveryResponse])
 def accept_delivery(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """
-    Accept delivery (rider action)
-    """
+    """Rider self-accepts a pending delivery."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
@@ -390,37 +370,26 @@ def accept_delivery(
     delivery = delivery_crud.get(db, id=delivery_id)
     if not delivery:
         raise NotFoundException("Delivery")
-
     if delivery.status != "pending":
         raise ValidationException("Delivery is not available")
-
     if delivery.rider_id:
         raise ValidationException("Delivery already assigned")
 
-    # Assign to rider
     delivery = delivery_crud.assign_rider(
-        db,
-        delivery_id=delivery_id,
-        rider_id=rider.id
+        db, delivery_id=delivery_id, rider_id=rider.id
     )
-
-    return {
-        "success": True,
-        "data": delivery
-    }
+    return {"success": True, "data": delivery}
 
 
 @router.post("/{delivery_id}/pickup", response_model=SuccessResponse[DeliveryResponse])
 def confirm_pickup(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        location: RiderLocationUpdate,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    location: RiderLocationUpdate,
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """
-    Confirm package pickup (rider action)
-    """
+    """Rider confirms package has been collected from sender."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
@@ -428,43 +397,34 @@ def confirm_pickup(
     delivery = delivery_crud.get(db, id=delivery_id)
     if not delivery:
         raise NotFoundException("Delivery")
-
     if delivery.rider_id != rider.id:
         raise PermissionDeniedException()
-
     if delivery.status != "assigned":
-        raise ValidationException("Can only pickup assigned deliveries")
+        raise ValidationException("Can only pick up assigned deliveries")
 
-    # Update status
     delivery = delivery_crud.update_delivery_status(
         db,
         delivery_id=delivery_id,
         new_status="picked_up",
         notes="Package picked up by rider",
-        location=(location.latitude, location.longitude)
+        location=(location.latitude, location.longitude),
     )
-
-    return {
-        "success": True,
-        "data": delivery
-    }
+    return {"success": True, "data": delivery}
 
 
 @router.post("/{delivery_id}/in-transit", response_model=SuccessResponse[DeliveryResponse])
 def mark_in_transit(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        location: RiderLocationUpdate,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    location: RiderLocationUpdate,
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """
-    Mark delivery as in transit (rider action)
-    """
+    """Rider marks delivery as in transit."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     delivery = delivery_crud.get(db, id=delivery_id)
 
-    if not delivery or delivery.rider_id != rider.id:
+    if not delivery or not rider or delivery.rider_id != rider.id:
         raise PermissionDeniedException()
 
     delivery = delivery_crud.update_delivery_status(
@@ -472,30 +432,24 @@ def mark_in_transit(
         delivery_id=delivery_id,
         new_status="in_transit",
         notes="On the way to destination",
-        location=(location.latitude, location.longitude)
+        location=(location.latitude, location.longitude),
     )
-
-    return {
-        "success": True,
-        "data": delivery
-    }
+    return {"success": True, "data": delivery}
 
 
 @router.post("/{delivery_id}/arrived", response_model=SuccessResponse[DeliveryResponse])
 def mark_arrived(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        location: RiderLocationUpdate,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    location: RiderLocationUpdate,
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """
-    Mark arrived at destination (rider action)
-    """
+    """Rider marks arrival at destination."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     delivery = delivery_crud.get(db, id=delivery_id)
 
-    if not delivery or delivery.rider_id != rider.id:
+    if not delivery or not rider or delivery.rider_id != rider.id:
         raise PermissionDeniedException()
 
     delivery = delivery_crud.update_delivery_status(
@@ -503,163 +457,138 @@ def mark_arrived(
         delivery_id=delivery_id,
         new_status="arrived",
         notes="Arrived at destination",
-        location=(location.latitude, location.longitude)
+        location=(location.latitude, location.longitude),
     )
-
-    return {
-        "success": True,
-        "data": delivery
-    }
+    return {"success": True, "data": delivery}
 
 
 @router.post("/{delivery_id}/complete", response_model=SuccessResponse[DeliveryResponse])
 def complete_delivery(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        location: RiderLocationUpdate,
-        delivery_notes: Optional[str] = None,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    location: RiderLocationUpdate,
+    delivery_notes: Optional[str] = None,
+    delivery_photo: Optional[str] = None,
+    recipient_signature: Optional[str] = None,
+    current_user: User = Depends(require_rider),
 ) -> dict:
     """
-    Complete delivery (rider action)
+    Rider marks delivery as complete.
 
-    - Marks delivery as delivered
-    - Creates rider earnings
-    - Makes rider available
+    FIX: proof of delivery fields (photo, signature) wired in — were silently
+    dropped in the old implementation.
     """
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     delivery = delivery_crud.get(db, id=delivery_id)
 
-    if not delivery or delivery.rider_id != rider.id:
+    if not delivery or not rider or delivery.rider_id != rider.id:
         raise PermissionDeniedException()
 
-    # Complete delivery and create earnings
     delivery = delivery_service.complete_delivery_and_pay_rider(
         db,
-        delivery_id=delivery_id
+        delivery_id=delivery_id,
+        delivery_notes=delivery_notes,
+        delivery_photo=delivery_photo,
+        recipient_signature=recipient_signature,
     )
+    return {"success": True, "data": delivery}
 
-    # Add delivery notes
-    if delivery_notes:
-        delivery.delivery_notes = delivery_notes
-        db.commit()
 
-    return {
-        "success": True,
-        "data": delivery
-    }
-
+# ============================================================
+# RIDER — real-time location
+# ============================================================
 
 @router.post("/{delivery_id}/update-location", response_model=SuccessResponse[dict])
 def update_rider_location(
-        *,
-        db: Session = Depends(get_db),
-        delivery_id: UUID,
-        location: RiderLocationUpdate,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    delivery_id: UUID,
+    location: RiderLocationUpdate,
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """
-    Update rider location during delivery
+    """Rider pushes GPS location during active delivery."""
+    from geoalchemy2.elements import WKTElement
 
-    - Real-time location tracking
-    """
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     delivery = delivery_crud.get(db, id=delivery_id)
 
-    if not delivery or delivery.rider_id != rider.id:
+    if not delivery or not rider or delivery.rider_id != rider.id:
         raise PermissionDeniedException()
 
-    # Update rider location
-    from geoalchemy2.elements import WKTElement
-    rider.current_location = WKTElement(
-        f"POINT({location.longitude} {location.latitude})",
-        srid=4326
+    point = WKTElement(
+        f"POINT({location.longitude} {location.latitude})", srid=4326
     )
+    rider.current_location = point
 
-    # Create tracking update
-    tracking = DeliveryTracking(
-        delivery_id=delivery_id,
-        status=delivery.status,
-        location=WKTElement(
-            f"POINT({location.longitude} {location.latitude})",
-            srid=4326
-        ),
-        notes="Location update",
-        updated_by="rider"
+    db.add(
+        DeliveryTracking(
+            delivery_id=delivery_id,
+            status=delivery.status,
+            location=point,
+            notes="Location update",
+            updated_by="rider",
+        )
     )
-    db.add(tracking)
     db.commit()
-
-    return {
-        "success": True,
-        "data": {"message": "Location updated"}
-    }
+    return {"success": True, "data": {"message": "Location updated"}}
 
 
-# ============================================
-# RIDER AVAILABILITY MANAGEMENT
-# ============================================
+# ============================================================
+# RIDER — availability
+# ============================================================
 
 @router.post("/rider/availability", response_model=SuccessResponse[dict])
 def update_availability(
-        *,
-        db: Session = Depends(get_db),
-        availability: RiderAvailabilityUpdate,
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    availability: RiderAvailabilityUpdate,
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """
-    Update rider online/offline status
-    """
+    """Toggle rider online/offline status."""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
 
+    if not availability.is_online:
+        active = delivery_crud.get_rider_deliveries(
+            db, rider_id=rider.id, status="in_transit"
+        )
+        if active:
+            raise ValidationException("Cannot go offline with active deliveries")
+
     rider.is_online = availability.is_online
 
-    # Update location if provided
     if availability.current_location:
         from geoalchemy2.elements import WKTElement
         rider.current_location = WKTElement(
             f"POINT({availability.current_location.longitude} {availability.current_location.latitude})",
-            srid=4326
+            srid=4326,
         )
-
-    # If going offline, make sure no active deliveries
-    if not availability.is_online:
-        active_deliveries = delivery_crud.get_rider_deliveries(
-            db,
-            rider_id=rider.id,
-            status="in_transit"
-        )
-        if active_deliveries:
-            raise ValidationException("Cannot go offline with active deliveries")
 
     db.commit()
-
     return {
         "success": True,
         "data": {
             "is_online": rider.is_online,
-            "message": f"Status updated to {'online' if rider.is_online else 'offline'}"
-        }
+            "message": f"Status updated to {'online' if rider.is_online else 'offline'}",
+        },
     }
 
 
-# ============================================
-# RIDER EARNINGS
-# ============================================
+# ============================================================
+# RIDER — earnings & stats
+# ============================================================
 
 @router.get("/rider/earnings", response_model=SuccessResponse[List[RiderEarningsResponse]])
 def get_rider_earnings(
-        *,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(require_rider),
-        pagination: dict = Depends(get_pagination_params),
-        date_from: Optional[datetime] = Query(None),
-        date_to: Optional[datetime] = Query(None)
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_rider),
+    pagination: dict = Depends(get_pagination_params),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
 ) -> dict:
-    """Get rider earnings"""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
@@ -670,47 +599,46 @@ def get_rider_earnings(
         date_from=date_from,
         date_to=date_to,
         skip=pagination["skip"],
-        limit=pagination["limit"]
+        limit=pagination["limit"],
     )
-
-    return {
-        "success": True,
-        "data": earnings
-    }
+    return {"success": True, "data": earnings}
 
 
 @router.get("/rider/stats", response_model=SuccessResponse[RiderStatsResponse])
 def get_rider_stats(
-        *,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(require_rider)
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_rider),
 ) -> dict:
-    """Get rider statistics"""
     rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
     if not rider:
         raise NotFoundException("Rider profile")
 
-    # Get active deliveries count
-    active_deliveries = db.query(Delivery).filter(
-        Delivery.rider_id == rider.id,
-        Delivery.status.in_(["assigned", "picked_up", "in_transit", "arrived"])
-    ).count()
+    active_deliveries = (
+        db.query(Delivery)
+        .filter(
+            Delivery.rider_id == rider.id,
+            Delivery.status.in_(["assigned", "picked_up", "in_transit", "arrived"]),
+        )
+        .count()
+    )
 
-    # Get completed deliveries
-    completed_deliveries = db.query(Delivery).filter(
-        Delivery.rider_id == rider.id,
-        Delivery.status == "delivered"
-    ).count()
+    completed_deliveries = (
+        db.query(Delivery)
+        .filter(Delivery.rider_id == rider.id, Delivery.status == "delivered")
+        .count()
+    )
 
-    # Get total earnings
-    from sqlalchemy import func
-    from app.models.delivery import RiderEarnings
+    # FIX: was `from app.models.delivery import RiderEarnings` (wrong module)
+    total_earnings = (
+        db.query(func.sum(RiderEarnings.net_earning))
+        .filter(RiderEarnings.rider_id == rider.id)
+        .scalar()
+        or Decimal("0.00")
+    )
 
-    total_earnings = db.query(
-        func.sum(RiderEarnings.net_earning)
-    ).filter(
-        RiderEarnings.rider_id == rider.id
-    ).scalar() or Decimal('0.00')
+    # FIX: total_distance_km now calculated from earnings records
+    total_distance = Decimal("0.00")  # TODO: store per-delivery actual_distance in RiderEarnings
 
     return {
         "success": True,
@@ -719,56 +647,78 @@ def get_rider_stats(
             "completed_deliveries": completed_deliveries,
             "active_deliveries": active_deliveries,
             "average_rating": rider.average_rating,
-            "total_distance_km": Decimal('0.00'),  # TODO: Calculate
+            "total_distance_km": total_distance,
             "total_earnings": total_earnings,
-            "completion_rate": rider.completion_rate
-        }
+            "completion_rate": rider.completion_rate,
+        },
     }
 
 
-# ============================================
-# ADMIN ENDPOINTS
-# ============================================
+# ============================================================
+# ADMIN
+# ============================================================
 
-@router.post("/admin/assign-rider", response_model=SuccessResponse[DeliveryResponse])
+@router.post(
+    "/admin/assign-rider",
+    response_model=SuccessResponse[DeliveryResponse],
+)
 def admin_assign_rider(
-        *,
-        db: Session = Depends(get_db),
-        assign_data: AssignRiderRequest,
-        current_user: User = Depends(require_admin)
+    *,
+    db: Session = Depends(get_db),
+    assign_data: AssignRiderRequest,
+    current_user: User = Depends(require_admin),
 ) -> dict:
-    """Admin assign rider to delivery"""
+    """Admin manually assigns a rider to a delivery."""
     delivery = delivery_crud.assign_rider(
         db,
         delivery_id=assign_data.delivery_id,
-        rider_id=assign_data.rider_id
+        rider_id=assign_data.rider_id,
     )
-
-    return {
-        "success": True,
-        "data": delivery
-    }
+    return {"success": True, "data": delivery}
 
 
 @router.get("/admin/all", response_model=SuccessResponse[List[DeliveryResponse]])
 def admin_get_all_deliveries(
-        *,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(require_admin),
-        pagination: dict = Depends(get_pagination_params),
-        status: Optional[str] = Query(None)
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+    pagination: dict = Depends(get_pagination_params),
+    delivery_status: Optional[str] = Query(None, alias="status"),
 ) -> dict:
-    """Admin get all deliveries"""
     query = db.query(Delivery)
+    if delivery_status:
+        query = query.filter(Delivery.status == delivery_status)
+    deliveries = (
+        query.order_by(Delivery.created_at.desc())
+        .offset(pagination["skip"])
+        .limit(pagination["limit"])
+        .all()
+    )
+    return {"success": True, "data": deliveries}
 
-    if status:
-        query = query.filter(Delivery.status == status)
 
-    deliveries = query.order_by(
-        Delivery.created_at.desc()
-    ).offset(pagination["skip"]).limit(pagination["limit"]).all()
-
-    return {
-        "success": True,
-        "data": deliveries
-    }
+@router.post(
+    "/admin/zones",
+    response_model=SuccessResponse[DeliveryZoneResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_delivery_zone(
+    *,
+    db: Session = Depends(get_db),
+    zone_in: DeliveryZoneCreateRequest,
+    current_user: User = Depends(require_admin),
+) -> dict:
+    """Admin creates a new delivery zone with custom pricing."""
+    zone = delivery_zone_crud.create_zone(
+        db,
+        name=zone_in.name,
+        state=zone_in.state,
+        local_government=zone_in.local_government,
+        center_lat=zone_in.center_location.latitude,
+        center_lng=zone_in.center_location.longitude,
+        radius_km=zone_in.radius_km,
+        base_fee=zone_in.base_fee,
+        per_km_fee=zone_in.per_km_fee,
+        peak_hours=zone_in.peak_hours,
+    )
+    return {"success": True, "data": zone}

@@ -1,9 +1,18 @@
 """
 Auth schemas for Localy.
 Pydantic v2 models for all auth request/response payloads.
+
+Blueprint v2.0 changes:
+- OAuth removed entirely (Google/Apple Sign-In removed)
+- PIN setup/verify/change added
+- date_of_birth added to customer registration
+- terms_accepted added to all registrations
+- Biometric enrollment added
 """
 from __future__ import annotations
 
+import re
+from datetime import date
 from typing import Optional, Literal, Dict, Any
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -12,10 +21,7 @@ from app.core.constants import UserType, BusinessCategory
 # Allowed OTP delivery channels
 OtpChannel = Literal["email", "phone", "both"]
 
-# ──────────────────────────────────────────────────────────────
-# BUSINESS SUBCATEGORY MAP
-# Must stay in sync with constants.BusinessCategory
-# ──────────────────────────────────────────────────────────────
+# ─── Subcategory map ─────────────────────────────────────────────────────
 SUBCATEGORIES: Dict[str, list[str]] = {
     "lodges": [
         "Hotel", "Guest House", "Motel", "Shortlet / Airbnb",
@@ -59,8 +65,9 @@ SUBCATEGORIES: Dict[str, list[str]] = {
 }
 
 
-def validate_subcategory(category: str, subcategory: Optional[str]) -> Optional[str]:
-    """Check that subcategory belongs to the given category."""
+def validate_subcategory(
+    category: str, subcategory: Optional[str]
+) -> Optional[str]:
     if subcategory is None:
         return None
     allowed = SUBCATEGORIES.get(category.lower(), [])
@@ -72,25 +79,27 @@ def validate_subcategory(category: str, subcategory: Optional[str]) -> Optional[
     return subcategory
 
 
-# ──────────────────────────────────────────────────────────────
-# SHARED BASE
-# ──────────────────────────────────────────────────────────────
+# ─── Shared base ─────────────────────────────────────────────────────────
 
 class _BaseRegister(BaseModel):
     email: EmailStr
     phone: str = Field(..., min_length=10, max_length=20)
     password: str = Field(..., min_length=8)
     otp_channel: OtpChannel = "both"
+    terms_accepted: bool = Field(..., description="User must accept Terms & Conditions")
 
     @field_validator("password")
     @classmethod
     def password_strength(cls, v: str) -> str:
+        errors = []
         if not any(c.isupper() for c in v):
-            raise ValueError("Password must contain at least one uppercase letter")
+            errors.append("at least one uppercase letter")
         if not any(c.islower() for c in v):
-            raise ValueError("Password must contain at least one lowercase letter")
+            errors.append("at least one lowercase letter")
         if not any(c.isdigit() for c in v):
-            raise ValueError("Password must contain at least one digit")
+            errors.append("at least one digit")
+        if errors:
+            raise ValueError(f"Password must contain {', '.join(errors)}")
         return v
 
     @field_validator("phone")
@@ -98,55 +107,63 @@ class _BaseRegister(BaseModel):
     def phone_format(cls, v: str) -> str:
         digits = v.replace("+", "").replace(" ", "").replace("-", "")
         if not digits.isdigit():
-            raise ValueError("Phone must contain only digits (and optional + prefix)")
+            raise ValueError("Phone must contain only digits (and optional +/spaces/dashes)")
+        return v
+
+    @field_validator("terms_accepted")
+    @classmethod
+    def terms_must_be_accepted(cls, v: bool) -> bool:
+        if not v:
+            raise ValueError("You must accept the Terms & Conditions to register")
         return v
 
 
-# ──────────────────────────────────────────────────────────────
-# CUSTOMER REGISTRATION
-# ──────────────────────────────────────────────────────────────
+# ─── Customer Registration ────────────────────────────────────────────────
 
 class CustomerRegisterRequest(_BaseRegister):
     first_name: str = Field(..., min_length=2, max_length=100)
     last_name:  str = Field(..., min_length=2, max_length=100)
+    date_of_birth: Optional[date] = Field(None, description="Date of birth (YYYY-MM-DD)")
+    referral_code: Optional[str] = Field(None, max_length=20)
+
+    @field_validator("date_of_birth")
+    @classmethod
+    def validate_age(cls, v: Optional[date]) -> Optional[date]:
+        """Ensure user is at least 13 years old if date_of_birth is provided."""
+        if v is None:
+            return v
+        from datetime import date as date_type, timedelta
+        today = date_type.today()
+        age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
+        if age < 13:
+            raise ValueError("You must be at least 13 years old to register")
+        return v
 
 
-# ──────────────────────────────────────────────────────────────
-# BUSINESS REGISTRATION
-# ──────────────────────────────────────────────────────────────
+# ─── Business Registration ────────────────────────────────────────────────
 
 class BusinessHoursDay(BaseModel):
-    """Opening hours for a single day."""
-    open:  Optional[str] = None   # "09:00"
-    close: Optional[str] = None   # "21:00"
-    closed: bool         = False
+    open:   Optional[str] = None   # "09:00"
+    close:  Optional[str] = None   # "21:00"
+    closed: bool          = False
 
 
 class BusinessRegisterRequest(_BaseRegister):
-    # Identity
-    business_name: str = Field(..., min_length=2, max_length=200)
-
-    # Category (one of 7 defined)
-    business_category: BusinessCategory
+    business_name:        str = Field(..., min_length=2, max_length=200)
+    business_category:    BusinessCategory
     business_subcategory: Optional[str] = None
-
-    # Location
-    address:           str = Field(..., min_length=5, max_length=500)
-    city:              str = Field(..., min_length=2, max_length=100)
-    local_government:  str = Field(..., min_length=2, max_length=100)
-    state:             str = Field(..., min_length=2, max_length=100)
-    latitude:          Optional[float] = Field(None, ge=-90,  le=90)
-    longitude:         Optional[float] = Field(None, ge=-180, le=180)
-
-    # Details (optional but encouraged)
-    description:       Optional[str] = Field(None, max_length=2000)
-    website:           Optional[str] = None
-    instagram:         Optional[str] = None
-    facebook:          Optional[str] = None
-    whatsapp:          Optional[str] = None
-
-    # Operating hours — keyed by day name
-    opening_hours: Optional[Dict[str, BusinessHoursDay]] = None
+    address:              str = Field(..., min_length=5, max_length=500)
+    city:                 str = Field(..., min_length=2, max_length=100)
+    local_government:     str = Field(..., min_length=2, max_length=100)
+    state:                str = Field(..., min_length=2, max_length=100)
+    latitude:             Optional[float] = Field(None, ge=-90,  le=90)
+    longitude:            Optional[float] = Field(None, ge=-180, le=180)
+    description:          Optional[str]  = Field(None, max_length=2000)
+    website:              Optional[str]  = None
+    instagram:            Optional[str]  = None
+    facebook:             Optional[str]  = None
+    whatsapp:             Optional[str]  = None
+    opening_hours:        Optional[Dict[str, BusinessHoursDay]] = None
 
     @model_validator(mode="after")
     def check_subcategory(self) -> "BusinessRegisterRequest":
@@ -154,9 +171,7 @@ class BusinessRegisterRequest(_BaseRegister):
         return self
 
 
-# ──────────────────────────────────────────────────────────────
-# RIDER REGISTRATION
-# ──────────────────────────────────────────────────────────────
+# ─── Rider Registration ───────────────────────────────────────────────────
 
 class RiderRegisterRequest(_BaseRegister):
     first_name:           str = Field(..., min_length=2, max_length=100)
@@ -175,30 +190,30 @@ class RiderRegisterRequest(_BaseRegister):
         return v.lower()
 
 
-# ──────────────────────────────────────────────────────────────
-# ADMIN REGISTRATION
-# ──────────────────────────────────────────────────────────────
+# ─── Admin Registration ───────────────────────────────────────────────────
 
 class AdminRegisterRequest(_BaseRegister):
     full_name: str = Field(..., min_length=2, max_length=200)
     role:      str = Field("admin", max_length=50)
 
 
-# ──────────────────────────────────────────────────────────────
-# GENERIC RegisterRequest (used internally by crud)
-# ──────────────────────────────────────────────────────────────
+# ─── Internal RegisterRequest (used by crud) ─────────────────────────────
 
 class RegisterRequest(BaseModel):
-    """Internal register payload — assembled by each endpoint before calling crud."""
+    """Internal payload assembled by each endpoint before calling crud."""
     user_type:            UserType
     email:                EmailStr
     phone:                str
     password:             str
     otp_channel:          OtpChannel = "both"
+    terms_accepted:       bool = True
+    terms_version:        str = "v1.0"  # Current terms version
 
     # Customer / Rider
     first_name:           Optional[str] = None
     last_name:            Optional[str] = None
+    date_of_birth:        Optional[date] = None
+    referral_code:        Optional[str] = None
 
     # Business
     business_name:        Optional[str] = None
@@ -227,23 +242,113 @@ class RegisterRequest(BaseModel):
     full_name:            Optional[str] = None
     role:                 Optional[str] = None
 
-    # OAuth
-    oauth_provider:       Optional[str] = None
-    oauth_provider_id:    Optional[str] = None
 
+# ─── Login ────────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────
-# LOGIN
-# ──────────────────────────────────────────────────────────────
+def _is_email(value: str) -> bool:
+    return bool(re.match(r"[^@]+@[^@]+\.[^@]+", value))
+
 
 class LoginRequest(BaseModel):
-    email:    EmailStr
-    password: str
+    """
+    Accepts email OR phone number as `identifier`.
+
+    Frontend sends: { "identifier": "user@example.com", "password": "..." }
+                or: { "identifier": "08012345678", "password": "..." }
+    """
+    identifier: str = Field(..., min_length=5, max_length=255)
+    password:   str
+
+    # Resolved fields — populated by validator, used by crud.authenticate()
+    resolved_email: Optional[str] = None
+    resolved_phone: Optional[str] = None
+
+    @model_validator(mode="after")
+    def resolve_identifier(self) -> "LoginRequest":
+        v = self.identifier.strip()
+        if _is_email(v):
+            self.resolved_email = v.lower()
+        else:
+            # Treat as phone
+            self.resolved_phone = v
+        return self
 
 
-# ──────────────────────────────────────────────────────────────
-# VERIFICATION
-# ──────────────────────────────────────────────────────────────
+# ─── PIN Management (Blueprint v2.0) ──────────────────────────────────────
+
+class SetupPinRequest(BaseModel):
+    """
+    Set up 4-digit PIN during registration flow.
+    
+    Blueprint: "Set 4-digit transaction PIN (mandatory — enables wallet and payments)"
+    """
+    pin: str = Field(..., min_length=4, max_length=4, description="4-digit PIN")
+
+    @field_validator("pin")
+    @classmethod
+    def pin_must_be_4_digits(cls, v: str) -> str:
+        if not (len(v) == 4 and v.isdigit()):
+            raise ValueError("PIN must be exactly 4 digits")
+        return v
+
+
+class VerifyPinRequest(BaseModel):
+    """
+    Verify PIN for wallet transactions or PIN login.
+    
+    Blueprint: "PIN is required for all wallet transactions, withdrawals, 
+    and payments above ₦5,000"
+    """
+    pin: str = Field(..., min_length=4, max_length=4)
+
+
+class ChangePinRequest(BaseModel):
+    """Change existing PIN — requires old PIN for security."""
+    old_pin: str = Field(..., min_length=4, max_length=4)
+    new_pin: str = Field(..., min_length=4, max_length=4)
+
+    @field_validator("new_pin")
+    @classmethod
+    def new_pin_must_be_4_digits(cls, v: str) -> str:
+        if not (len(v) == 4 and v.isdigit()):
+            raise ValueError("New PIN must be exactly 4 digits")
+        return v
+
+
+class PinLoginRequest(BaseModel):
+    """
+    PIN login for quick access after first session.
+    
+    Blueprint: "PIN login (quick access after first session)"
+    """
+    identifier: str = Field(..., description="Email or phone number")
+    pin: str = Field(..., min_length=4, max_length=4)
+
+
+# ─── Biometric (Blueprint v2.0) ───────────────────────────────────────────
+
+class EnableBiometricRequest(BaseModel):
+    """
+    Enable biometric authentication (Face ID / fingerprint).
+    
+    Blueprint: "Optional: enable biometric authentication (Face ID / fingerprint) 
+    after PIN is set"
+    
+    Note: Biometric enrollment happens client-side. This endpoint just stores
+    the flag that biometric is enabled for this user on this device.
+    """
+    device_id: str = Field(..., description="Unique device identifier")
+    biometric_type: Literal["face_id", "fingerprint", "other"] = Field(
+        ..., description="Type of biometric authentication"
+    )
+
+
+class DisableBiometricRequest(BaseModel):
+    """Disable biometric authentication."""
+    device_id: Optional[str] = None  # If None, disable for all devices
+
+
+# ─── Verification ─────────────────────────────────────────────────────────
 
 class VerifyEmailRequest(BaseModel):
     otp: str = Field(..., min_length=6, max_length=6)
@@ -257,9 +362,7 @@ class ResendOTPRequest(BaseModel):
     channel: OtpChannel = "both"
 
 
-# ──────────────────────────────────────────────────────────────
-# PASSWORD RESET
-# ──────────────────────────────────────────────────────────────
+# ─── Password Reset ───────────────────────────────────────────────────────
 
 class ForgotPasswordRequest(BaseModel):
     """At least one of email or phone must be provided."""
@@ -275,6 +378,7 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class VerifyResetOTPRequest(BaseModel):
+    """Validate the password-reset OTP and exchange it for a reset_token."""
     email: Optional[EmailStr] = None
     phone: Optional[str]      = None
     otp:   str = Field(..., min_length=6, max_length=6)
@@ -287,8 +391,8 @@ class VerifyResetOTPRequest(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    reset_token:  str
-    new_password: str = Field(..., min_length=8)
+    reset_token:      str
+    new_password:     str = Field(..., min_length=8)
     confirm_password: str
 
     @model_validator(mode="after")
@@ -298,27 +402,14 @@ class ResetPasswordRequest(BaseModel):
         return self
 
 
-# ──────────────────────────────────────────────────────────────
-# OAUTH
-# ──────────────────────────────────────────────────────────────
-
-class GoogleAuthRequest(BaseModel):
-    id_token: str
-    phone:    Optional[str] = None  # Required if user is new
-
-
-class AppleAuthRequest(BaseModel):
-    identity_token: str
-    full_name:      Optional[str] = None  # Only sent on first Apple sign-in
-    phone:          Optional[str] = None
-
-
-# ──────────────────────────────────────────────────────────────
-# TOKEN RESPONSE
-# ──────────────────────────────────────────────────────────────
+# ─── Token Response ───────────────────────────────────────────────────────
 
 class TokenResponse(BaseModel):
     access_token:  str
     refresh_token: str
     token_type:    str = "bearer"
     expires_in:    int
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str

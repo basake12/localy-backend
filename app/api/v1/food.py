@@ -1,7 +1,8 @@
 from decimal import Decimal
+from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Query, status, Body
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from uuid import UUID
 from datetime import date, datetime
@@ -20,6 +21,7 @@ from app.schemas.food_schema import (
     MenuCategoryCreateRequest,
     MenuCategoryResponse,
     MenuItemCreateRequest,
+    MenuItemUpdateRequest,
     MenuItemResponse,
     MenuResponse,
     ReservationCreateRequest,
@@ -28,6 +30,10 @@ from app.schemas.food_schema import (
     FoodOrderResponse,
     FoodOrderListResponse,
     RestaurantSearchFilters,
+    CookingServiceCreateRequest,
+    CookingServiceResponse,
+    CookingBookingCreateRequest,
+    CookingBookingResponse,
 )
 from app.services.food_service import food_service
 from app.crud.food_crud import (
@@ -36,9 +42,12 @@ from app.crud.food_crud import (
     menu_item_crud,
     table_reservation_crud,
     food_order_crud,
+    cooking_service_crud,
+    cooking_booking_crud,
 )
-from app.crud.business_crud import business_crud
 from app.models.user_model import User
+from app.models.business_model import Business
+from app.models.food_model import FoodOrder, TableReservation, CookingService
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,
@@ -48,32 +57,52 @@ from app.core.exceptions import (
 router = APIRouter()
 
 
+def _get_business(db: Session, user_id) -> Optional[Business]:
+    """
+    Sync helper — replaces business_crud.get_by_user_id() throughout this router.
+    business_crud (CRUDBusiness) extends AsyncCRUDBase; all its methods are
+    coroutines and cannot be called from sync endpoints without await.
+    """
+    return db.query(Business).filter(Business.user_id == user_id).first()
+
+
 # ============================================================
-# PUBLIC: RESTAURANT LIST  (Flutter: GET /food/restaurants)
+# PUBLIC: RESTAURANT LIST (Radius-based ONLY — NO LGA)
 # ============================================================
 
-@router.get("/restaurants", response_model=SuccessResponse[List[dict]])
+@router.get("/restaurants", response_model=SuccessResponse[dict])
 def list_restaurants(
-    *,
-    db: Session = Depends(get_db),
-    lga_id: Optional[str] = Query(None),
-    q: Optional[str] = Query(None),
-    category: Optional[str] = Query(None),
-    offers_delivery: Optional[bool] = Query(None),
-    pagination: dict = Depends(get_pagination_params),
+        *,
+        db: Session = Depends(get_db),
+        q: Optional[str] = Query(None),
+        category: Optional[str] = Query(None),
+        offers_delivery: Optional[bool] = Query(None),
+        latitude: Optional[float] = Query(None),
+        longitude: Optional[float] = Query(None),
+        radius_km: float = Query(5.0, ge=1, le=50),
+        pagination: dict = Depends(get_pagination_params),
 ) -> dict:
     """
     List / search restaurants — the primary browse endpoint.
 
+    BLUEPRINT v2.0 COMPLIANCE:
+    - Radius-based search ONLY (default 5 km)
+    - NO LGA filtering
+    - Location required for geo-filtered results
+
     Flutter: ApiEndpoints.restaurantsList → GET /food/restaurants
-    Supports: ?lga_id, ?q (text search), ?category (cuisine), ?offers_delivery
     """
+    location = None
+    if latitude is not None and longitude is not None:
+        location = (latitude, longitude)
+
     results = food_service.search_restaurants(
         db,
         query_text=q,
         cuisine_type=category,
+        location=location,
+        radius_km=radius_km,
         offers_delivery=offers_delivery,
-        lga_id=lga_id,
         skip=pagination["skip"],
         limit=pagination["limit"],
     )
@@ -86,9 +115,9 @@ def list_restaurants(
 
 @router.get("/restaurants/{restaurant_id}", response_model=SuccessResponse[dict])
 def get_restaurant_details(
-    *,
-    db: Session = Depends(get_db),
-    restaurant_id: UUID,
+        *,
+        db: Session = Depends(get_db),
+        restaurant_id: UUID,
 ) -> dict:
     """
     Full restaurant profile + embedded menu.
@@ -100,9 +129,9 @@ def get_restaurant_details(
 
 @router.get("/restaurants/{restaurant_id}/menu", response_model=SuccessResponse[MenuResponse])
 def get_restaurant_menu(
-    *,
-    db: Session = Depends(get_db),
-    restaurant_id: UUID,
+        *,
+        db: Session = Depends(get_db),
+        restaurant_id: UUID,
 ) -> dict:
     """
     Menu categories + items only.
@@ -130,14 +159,17 @@ def get_restaurant_menu(
 
 @router.post("/restaurants/search", response_model=SuccessResponse[List[dict]])
 def search_restaurants(
-    *,
-    db: Session = Depends(get_db),
-    search_params: RestaurantSearchFilters,
-    pagination: dict = Depends(get_pagination_params),
+        *,
+        db: Session = Depends(get_db),
+        search_params: RestaurantSearchFilters,
+        pagination: dict = Depends(get_pagination_params),
 ) -> dict:
     """
-    Advanced search with location radius and filters.
-    Flutter can call this for the filter-sheet results.
+    Advanced search with location radius and dietary filters.
+
+    BLUEPRINT v2.0 COMPLIANCE:
+    - Radius-based ONLY
+    - Supports dietary filters: halal, vegetarian, vegan, gluten-free
     """
     location = None
     if search_params.location:
@@ -151,7 +183,7 @@ def search_restaurants(
         query_text=search_params.query,
         cuisine_type=search_params.cuisine_type,
         location=location,
-        radius_km=search_params.radius_km or 10.0,
+        radius_km=search_params.radius_km or 5.0,
         price_range=search_params.price_range,
         offers_delivery=search_params.offers_delivery,
         min_rating=search_params.min_rating,
@@ -171,13 +203,13 @@ def search_restaurants(
     status_code=status.HTTP_201_CREATED,
 )
 def create_restaurant(
-    *,
-    db: Session = Depends(get_db),
-    restaurant_in: RestaurantCreateRequest,
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        restaurant_in: RestaurantCreateRequest,
+        current_user: User = Depends(require_business),
 ) -> dict:
-    """Create restaurant for a food-category business."""
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """Create restaurant for a food-category business"""
+    business = _get_business(db, current_user.id)
     if not business:
         raise NotFoundException("Business")
     if business.category != "food":
@@ -193,15 +225,15 @@ def create_restaurant(
 
 @router.get("/my", response_model=SuccessResponse[RestaurantResponse])
 def get_my_restaurant(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_business),
 ) -> dict:
     """
     Get current business's restaurant profile.
     Flutter: ApiEndpoints.myRestaurant
     """
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    business = _get_business(db, current_user.id)
     if not business:
         raise NotFoundException("Business")
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
@@ -210,36 +242,38 @@ def get_my_restaurant(
     return {"success": True, "data": restaurant}
 
 
+@router.patch("/my", response_model=SuccessResponse[RestaurantResponse])
+def update_my_restaurant(
+        *,
+        db: Session = Depends(get_db),
+        updates: dict = Body(...),
+        current_user: User = Depends(require_business),
+) -> dict:
+    """Update restaurant settings (real-time wait, virtual tour, etc.)"""
+    business = _get_business(db, current_user.id)
+    restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
+    if not restaurant:
+        raise NotFoundException("Restaurant")
+
+    restaurant = restaurant_crud.update(db, db_obj=restaurant, obj_in=updates)
+    return {"success": True, "data": restaurant}
+
+
 # ============================================================
 # MENU MANAGEMENT (BUSINESS)
 # ============================================================
 
-@router.post("/menu", include_in_schema=False)
-def menu_root_redirect() -> dict:
-    from fastapi import HTTPException
-    raise HTTPException(
-        status_code=404,
-        detail={
-            "message": "Use /food/menu/categories or /food/menu/items",
-            "valid_endpoints": [
-                "POST /api/v1/food/menu/categories",
-                "POST /api/v1/food/menu/items",
-            ],
-        },
-    )
-
-
 @router.get("/my/menu", response_model=SuccessResponse[MenuResponse])
 def get_my_menu(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_business),
 ) -> dict:
     """
     Full menu for the authenticated restaurant owner.
     Flutter Dashboard: manage_menu_screen
     """
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
@@ -267,13 +301,13 @@ def get_my_menu(
     status_code=status.HTTP_201_CREATED,
 )
 def create_menu_category(
-    *,
-    db: Session = Depends(get_db),
-    category_in: MenuCategoryCreateRequest,
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        category_in: MenuCategoryCreateRequest,
+        current_user: User = Depends(require_business),
 ) -> dict:
-    """Create a menu category."""
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """Create a menu category"""
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
@@ -286,12 +320,12 @@ def create_menu_category(
 
 @router.get("/menu/my/categories", response_model=SuccessResponse[List[MenuCategoryResponse]])
 def get_my_menu_categories(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_business),
 ) -> dict:
-    """List all categories for the authenticated restaurant."""
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """List all categories for the authenticated restaurant"""
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
@@ -308,17 +342,17 @@ def get_my_menu_categories(
     status_code=status.HTTP_201_CREATED,
 )
 def create_menu_item(
-    *,
-    db: Session = Depends(get_db),
-    item_in: MenuItemCreateRequest,
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        item_in: MenuItemCreateRequest,
+        current_user: User = Depends(require_business),
 ) -> dict:
-    """Create a new menu item."""
+    """Create a new menu item"""
     category = menu_category_crud.get(db, id=item_in.category_id)
     if not category:
         raise NotFoundException("Menu category")
 
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant or category.restaurant_id != restaurant.id:
         raise PermissionDeniedException()
@@ -329,18 +363,14 @@ def create_menu_item(
 
 @router.patch("/menu/items/{item_id}", response_model=SuccessResponse[MenuItemResponse])
 def update_menu_item(
-    *,
-    db: Session = Depends(get_db),
-    item_id: UUID,
-    is_available: Optional[bool] = None,
-    price: Optional[Decimal] = None,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    discount_price: Optional[Decimal] = None,
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        item_id: UUID,
+        item_in: MenuItemUpdateRequest = Body(...),
+        current_user: User = Depends(require_business),
 ) -> dict:
     """
-    Partial update a menu item (availability toggle, price, name, etc.).
+    Partial update a menu item (availability toggle, price, name, halal, etc.).
     Flutter Dashboard: manage_menu_screen edit + toggle
     """
     item = menu_item_crud.get(db, id=item_id)
@@ -348,44 +378,30 @@ def update_menu_item(
         raise NotFoundException("Menu item")
 
     category = menu_category_crud.get(db, id=item.category_id)
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant or category.restaurant_id != restaurant.id:
         raise PermissionDeniedException()
 
-    update_data = {}
-    if is_available is not None:
-        update_data["is_available"] = is_available
-    if price is not None:
-        update_data["price"] = price
-    if name is not None:
-        update_data["name"] = name
-    if description is not None:
-        update_data["description"] = description
-    if discount_price is not None:
-        update_data["discount_price"] = discount_price
-
+    update_data = item_in.model_dump(exclude_none=True)
     item = menu_item_crud.update(db, db_obj=item, obj_in=update_data)
     return {"success": True, "data": item}
 
 
 @router.delete("/menu/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_menu_item(
-    *,
-    db: Session = Depends(get_db),
-    item_id: UUID,
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        item_id: UUID,
+        current_user: User = Depends(require_business),
 ) -> None:
-    """
-    Delete a menu item.
-    Flutter Dashboard: manage_menu_screen delete button
-    """
+    """Delete a menu item"""
     item = menu_item_crud.get(db, id=item_id)
     if not item:
         raise NotFoundException("Menu item")
 
     category = menu_category_crud.get(db, id=item.category_id)
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant or category.restaurant_id != restaurant.id:
         raise PermissionDeniedException()
@@ -403,14 +419,20 @@ def delete_menu_item(
     status_code=status.HTTP_201_CREATED,
 )
 def create_food_order(
-    *,
-    db: Session = Depends(get_db),
-    order_in: FoodOrderCreateRequest,
-    current_user: User = Depends(require_customer),
+        *,
+        db: Session = Depends(get_db),
+        order_in: FoodOrderCreateRequest,
+        current_user: User = Depends(require_customer),
 ) -> dict:
     """
     Place a food order.
-    Flutter: ApiEndpoints.createFoodOrder(restaurantId)
+
+    BLUEPRINT v2.0 COMPLIANCE:
+    - Platform fee ₦50 included in total
+    - Supports scheduled delivery
+    - Supports group orders
+
+    Flutter: ApiEndpoints.foodOrders → POST /food/orders
     """
     delivery_location = None
     if order_in.delivery_location:
@@ -419,132 +441,135 @@ def create_food_order(
             order_in.delivery_location.longitude,
         )
 
+    # Resolve customer_name / customer_phone — explicitly query profile
+    # since lazy-loaded relationships may not be available in sync context.
+    # Final fallbacks ensure NOT NULL DB constraint is never violated.
+    customer_name = order_in.customer_name
+    customer_phone = order_in.customer_phone
+    if not customer_name or not customer_phone:
+        from app.models.user_model import CustomerProfile
+        profile = db.query(CustomerProfile).filter(
+            CustomerProfile.user_id == current_user.id
+        ).first()
+        if profile:
+            if not customer_name:
+                customer_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
+            if not customer_phone:
+                customer_phone = current_user.phone or ""
+    customer_name = customer_name or "Customer"
+    customer_phone = customer_phone or current_user.phone or ""
+
     order = food_service.create_order_and_pay(
         db,
         current_user=current_user,
         restaurant_id=order_in.restaurant_id,
         order_type=order_in.order_type,
         items=[item.model_dump() for item in order_in.items],
-        customer_name=order_in.customer_name,
-        customer_phone=order_in.customer_phone,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
         delivery_address=order_in.delivery_address,
         delivery_location=delivery_location,
         delivery_instructions=order_in.delivery_instructions,
+        scheduled_delivery_time=order_in.scheduled_delivery_time,
+        group_order_id=order_in.group_order_id,
+        is_group_order_host=order_in.is_group_order_host,
         special_instructions=order_in.special_instructions,
         payment_method=order_in.payment_method,
         tip=order_in.tip,
-        promo_code=getattr(order_in, "promo_code", None),
+        promo_code=order_in.promo_code,
     )
-    return {"success": True, "data": order}
+
+    # Eager-load items for response
+    db.refresh(order)
+    order_with_items = db.query(FoodOrder).options(
+        joinedload(FoodOrder.items)
+    ).filter(FoodOrder.id == order.id).first()
+
+    return {"success": True, "data": order_with_items}
 
 
-@router.get("/orders/my", response_model=SuccessResponse[List[FoodOrderListResponse]])
-def get_my_food_orders(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_customer),
-    pagination: dict = Depends(get_pagination_params),
+@router.get("/orders/my", response_model=SuccessResponse[List[FoodOrderResponse]])
+def get_my_orders(
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_customer),
+        pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    """
-    Customer's order history.
-    Flutter: ApiEndpoints.myFoodOrders
-    """
+    """Get customer's food order history"""
     orders = food_order_crud.get_customer_orders(
         db,
         customer_id=current_user.id,
         skip=pagination["skip"],
         limit=pagination["limit"],
     )
-    order_list = []
-    for order in orders:
-        restaurant = restaurant_crud.get(db, id=order.restaurant_id)
-        business = business_crud.get(db, id=restaurant.business_id) if restaurant else None
-        order_list.append({
-            "id": order.id,
-            "restaurant_name": business.business_name if business else "Unknown",
-            "order_type": order.order_type,
-            "total_amount": order.total_amount,
-            "order_status": order.order_status,
-            "created_at": order.created_at,
-        })
-    return {"success": True, "data": order_list}
+    return {"success": True, "data": orders}
 
 
 @router.get("/orders/{order_id}", response_model=SuccessResponse[FoodOrderResponse])
-def get_food_order_details(
-    *,
-    db: Session = Depends(get_db),
-    order_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+def get_order_details(
+        *,
+        db: Session = Depends(get_db),
+        order_id: UUID,
+        current_user: User = Depends(get_current_active_user),
 ) -> dict:
-    """
-    Single order detail — used by tracking screen.
-    Flutter: ApiEndpoints.foodOrderById(id)
-    """
-    order = food_order_crud.get(db, id=order_id)
+    """Get order details"""
+    order = db.query(FoodOrder).options(
+        joinedload(FoodOrder.items)
+    ).filter(FoodOrder.id == order_id).first()
+
     if not order:
         raise NotFoundException("Order")
 
-    if current_user.user_type == "customer":
-        if order.customer_id != current_user.id:
-            raise PermissionDeniedException()
-    elif current_user.user_type == "business":
-        business = business_crud.get_by_user_id(db, user_id=current_user.id)
-        restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
-        if not restaurant or order.restaurant_id != restaurant.id:
-            raise PermissionDeniedException()
+    # Check ownership (customer or business owner)
+    business = _get_business(db, current_user.id)
+    is_owner = order.customer_id == current_user.id
+    is_restaurant_owner = (
+            business
+            and restaurant_crud.get_by_business_id(db, business_id=business.id)
+            and restaurant_crud.get_by_business_id(db, business_id=business.id).id
+            == order.restaurant_id
+    )
+
+    if not (is_owner or is_restaurant_owner):
+        raise PermissionDeniedException()
 
     return {"success": True, "data": order}
 
 
-@router.post("/orders/{order_id}/cancel", response_model=SuccessResponse[FoodOrderResponse])
-def cancel_food_order(
-    *,
-    db: Session = Depends(get_db),
-    order_id: UUID,
-    reason: Optional[str] = None,
-    current_user: User = Depends(require_customer),
-) -> dict:
-    """
-    Cancel a food order (customer action).
-    Flutter: ApiEndpoints.cancelFoodOrder(id)
-    """
-    order = food_order_crud.get(db, id=order_id)
-    if not order:
-        raise NotFoundException("Order")
-    if order.customer_id != current_user.id:
-        raise PermissionDeniedException()
-    if order.order_status not in ["pending", "confirmed"]:
-        raise ValidationException(
-            "Orders can only be cancelled when pending or confirmed"
-        )
+class _CancelOrderRequest(BaseModel):
+    reason: Optional[str] = None
 
-    order.order_status = "cancelled"
-    order.cancellation_reason = reason
-    order.cancelled_at = datetime.utcnow()
-    db.commit()
-    db.refresh(order)
+@router.post("/orders/{order_id}/cancel", response_model=SuccessResponse[FoodOrderResponse])
+def cancel_order(
+        *,
+        db: Session = Depends(get_db),
+        order_id: UUID,
+        payload: Optional[_CancelOrderRequest] = Body(default=None),
+        current_user: User = Depends(require_customer),
+) -> dict:
+    """Cancel an order (customer only, within allowed statuses).
+    Body is optional — POST with no body, empty {}, or {"reason": "..."}."""
+    order = food_order_crud.cancel_order(
+        db, order_id=order_id, customer_id=current_user.id,
+        reason=payload.reason if payload else None
+    )
     return {"success": True, "data": order}
 
 
 # ============================================================
-# FOOD ORDERS — BUSINESS (KDS + status transitions)
+# FOOD ORDERS — BUSINESS
 # ============================================================
 
 @router.get("/my/orders", response_model=SuccessResponse[List[FoodOrderResponse]])
 def get_restaurant_orders(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
-    pagination: dict = Depends(get_pagination_params),
-    order_status: Optional[str] = Query(None, alias="status"),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_business),
+        status: Optional[str] = Query(None),
+        pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    """
-    Restaurant's incoming orders, optionally filtered by status.
-    Flutter Dashboard: active_orders_screen (polls this with ?status=pending,preparing)
-    Also: ApiEndpoints.myRestaurantOrders
-    """
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """Get orders for the authenticated restaurant"""
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
@@ -552,29 +577,23 @@ def get_restaurant_orders(
     orders = food_order_crud.get_restaurant_orders(
         db,
         restaurant_id=restaurant.id,
-        status=order_status,
+        status=status,
         skip=pagination["skip"],
         limit=pagination["limit"],
     )
     return {"success": True, "data": orders}
 
 
-@router.patch(
-    "/my/orders/{order_id}/status",
-    response_model=SuccessResponse[FoodOrderResponse],
-)
+@router.patch("/orders/{order_id}/status", response_model=SuccessResponse[FoodOrderResponse])
 def update_order_status(
-    *,
-    db: Session = Depends(get_db),
-    order_id: UUID,
-    new_status: str = Query(..., alias="status"),
-    current_user: User = Depends(require_business),
+        *,
+        db: Session = Depends(get_db),
+        order_id: UUID,
+        new_status: str = Body(..., embed=True),
+        current_user: User = Depends(require_business),
 ) -> dict:
-    """
-    KDS status transition: pending → confirmed → preparing → ready → delivered.
-    Flutter Dashboard: active_orders_screen action buttons
-    """
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """Update order status (business only)"""
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
@@ -589,7 +608,7 @@ def update_order_status(
 
 
 # ============================================================
-# TABLE RESERVATIONS
+# TABLE RESERVATIONS — CUSTOMER
 # ============================================================
 
 @router.post(
@@ -598,84 +617,69 @@ def update_order_status(
     status_code=status.HTTP_201_CREATED,
 )
 def create_reservation(
-    *,
-    db: Session = Depends(get_db),
-    reservation_in: ReservationCreateRequest,
-    current_user: User = Depends(require_customer),
+        *,
+        db: Session = Depends(get_db),
+        reservation_in: ReservationCreateRequest,
+        current_user: User = Depends(require_customer),
 ) -> dict:
+    """
+    Create a table reservation.
+
+    BLUEPRINT v2.0 COMPLIANCE:
+    - Supports deposit option
+    """
+    # Resolve customer_name / customer_phone from profile if not supplied
+    reservation_data = reservation_in.model_dump()
+    if not reservation_data.get("customer_name") or not reservation_data.get("customer_phone"):
+        profile = getattr(current_user, "customer_profile", None)
+        if profile:
+            if not reservation_data.get("customer_name"):
+                reservation_data["customer_name"] = f"{profile.first_name or ''} {profile.last_name or ''}".strip() or "Customer"
+            if not reservation_data.get("customer_phone"):
+                reservation_data["customer_phone"] = current_user.phone or ""
+        else:
+            reservation_data["customer_name"] = reservation_data.get("customer_name") or "Customer"
+            reservation_data["customer_phone"] = reservation_data.get("customer_phone") or current_user.phone or ""
+
     reservation = food_service.make_reservation(
         db,
         current_user=current_user,
-        restaurant_id=reservation_in.restaurant_id,
-        reservation_date=reservation_in.reservation_date,
-        reservation_time=reservation_in.reservation_time,
-        number_of_guests=reservation_in.number_of_guests,
-        customer_name=reservation_in.customer_name,
-        customer_phone=reservation_in.customer_phone,
-        customer_email=reservation_in.customer_email,
-        seating_preference=reservation_in.seating_preference,
-        special_requests=reservation_in.special_requests,
-        occasion=reservation_in.occasion,
+        **reservation_data,
     )
     return {"success": True, "data": reservation}
 
 
 @router.get("/reservations/my", response_model=SuccessResponse[List[ReservationResponse]])
 def get_my_reservations(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_customer),
-    pagination: dict = Depends(get_pagination_params),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_customer),
+        pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    reservations = table_reservation_crud.get_customer_reservations(
-        db,
-        customer_id=current_user.id,
-        skip=pagination["skip"],
-        limit=pagination["limit"],
-    )
+    """Get customer's reservations"""
+    reservations = db.query(TableReservation).filter(
+        TableReservation.customer_id == current_user.id
+    ).order_by(
+        TableReservation.reservation_date.desc()
+    ).offset(pagination["skip"]).limit(pagination["limit"]).all()
+
     return {"success": True, "data": reservations}
 
 
-@router.post(
-    "/reservations/{reservation_id}/cancel",
-    response_model=SuccessResponse[ReservationResponse],
-)
-def cancel_reservation(
-    *,
-    db: Session = Depends(get_db),
-    reservation_id: UUID,
-    reason: Optional[str] = None,
-    current_user: User = Depends(require_customer),
-) -> dict:
-    reservation = table_reservation_crud.get(db, id=reservation_id)
-    if not reservation:
-        raise NotFoundException("Reservation")
-    if reservation.customer_id != current_user.id:
-        raise PermissionDeniedException()
-    if reservation.status in ["completed", "cancelled"]:
-        raise ValidationException("Cannot cancel a completed or already cancelled reservation")
+# ============================================================
+# TABLE RESERVATIONS — BUSINESS
+# ============================================================
 
-    reservation.status = "cancelled"
-    reservation.cancelled_at = datetime.utcnow()
-    reservation.cancellation_reason = reason
-    db.commit()
-    db.refresh(reservation)
-    return {"success": True, "data": reservation}
-
-
-@router.get(
-    "/reservations/restaurant/my",
-    response_model=SuccessResponse[List[ReservationResponse]],
-)
+@router.get("/my/reservations", response_model=SuccessResponse[List[ReservationResponse]])
 def get_restaurant_reservations(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
-    pagination: dict = Depends(get_pagination_params),
-    reservation_date: Optional[date] = Query(None),
-    res_status: Optional[str] = Query(None, alias="status"),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_business),
+        status: Optional[str] = Query(None),
+        pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """Get reservations for the authenticated restaurant"""
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
@@ -683,171 +687,108 @@ def get_restaurant_reservations(
     reservations = table_reservation_crud.get_restaurant_reservations(
         db,
         restaurant_id=restaurant.id,
-        reservation_date=reservation_date,
-        status=res_status,
+        status=status,
         skip=pagination["skip"],
         limit=pagination["limit"],
     )
     return {"success": True, "data": reservations}
 
 
-@router.post(
-    "/reservations/{reservation_id}/confirm",
-    response_model=SuccessResponse[ReservationResponse],
-)
-def confirm_reservation(
-    *,
-    db: Session = Depends(get_db),
-    reservation_id: UUID,
-    table_number: Optional[str] = None,
-    current_user: User = Depends(require_business),
-) -> dict:
-    reservation = table_reservation_crud.get(db, id=reservation_id)
-    if not reservation:
-        raise NotFoundException("Reservation")
-
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
-    restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
-    if not restaurant or reservation.restaurant_id != restaurant.id:
-        raise PermissionDeniedException()
-
-    reservation.status = "confirmed"
-    reservation.confirmed_at = datetime.utcnow()
-    if table_number:
-        reservation.table_number = table_number
-    db.commit()
-    db.refresh(reservation)
-    return {"success": True, "data": reservation}
-
-
 # ============================================================
-# PROMOTIONS  (business dashboard)
+# COOKING SERVICES (Catering, Private Chef, Classes)
 # ============================================================
 
-@router.get("/my/promotions", response_model=SuccessResponse[List[dict]])
-def get_my_promotions(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
-) -> dict:
-    """
-    List promotions/coupons for the authenticated restaurant.
-    Flutter Dashboard: promotions_screen
-    """
-    try:
-        from app.models.coupon import Coupon
-        from sqlalchemy import and_
-
-        business = business_crud.get_by_user_id(db, user_id=current_user.id)
-        restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
-        if not restaurant:
-            raise NotFoundException("Restaurant")
-
-        coupons = (
-            db.query(Coupon)
-            .filter(Coupon.business_id == business.id)
-            .order_by(Coupon.created_at.desc())
-            .all()
-        )
-        return {
-            "success": True,
-            "data": [
-                {
-                    "id": str(c.id),
-                    "title": c.title,
-                    "code": c.code,
-                    "discount": (
-                        f"{c.discount_value}%"
-                        if c.discount_type == "percentage"
-                        else f"₦{c.discount_value:,.0f} off"
-                    ),
-                    "discount_type": c.discount_type,
-                    "discount_value": float(c.discount_value),
-                    "is_active": c.is_active,
-                    "uses": c.usage_count or 0,
-                    "expires": c.expires_at.isoformat() if c.expires_at else None,
-                }
-                for c in coupons
-            ],
-        }
-    except ImportError:
-        return {"success": True, "data": []}
-
-
 @router.post(
-    "/my/promotions",
-    response_model=SuccessResponse[dict],
+    "/cooking-services",
+    response_model=SuccessResponse[CookingServiceResponse],
     status_code=status.HTTP_201_CREATED,
 )
-def create_promotion(
-    *,
-    db: Session = Depends(get_db),
-    title: str,
-    code: str,
-    discount_type: str,
-    discount_value: Decimal,
-    expires_at: Optional[datetime] = None,
-    current_user: User = Depends(require_business),
+def create_cooking_service(
+        *,
+        db: Session = Depends(get_db),
+        service_in: CookingServiceCreateRequest,
+        current_user: User = Depends(require_business),
 ) -> dict:
-    """Create a promotion/coupon. Flutter Dashboard: promotions_screen + button."""
-    try:
-        from app.models.coupon import Coupon
+    """Create a cooking service offering"""
+    business = _get_business(db, current_user.id)
+    restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
+    if not restaurant:
+        raise NotFoundException("Restaurant")
 
-        business = business_crud.get_by_user_id(db, user_id=current_user.id)
-        coupon = Coupon(
-            business_id=business.id,
-            title=title,
-            code=code.upper(),
-            discount_type=discount_type,
-            discount_value=discount_value,
-            expires_at=expires_at,
-            is_active=True,
-            usage_count=0,
+    data = service_in.model_dump()
+    data["restaurant_id"] = restaurant.id
+    service = cooking_service_crud.create_from_dict(db, obj_in=data)
+    return {"success": True, "data": service}
+
+
+@router.get("/cooking-services", response_model=SuccessResponse[List[CookingServiceResponse]])
+def list_cooking_services(
+        *,
+        db: Session = Depends(get_db),
+        service_type: Optional[str] = Query(None),
+        pagination: dict = Depends(get_pagination_params),
+) -> dict:
+    """List available cooking services"""
+    query = db.query(CookingService).filter(CookingService.is_active == True)
+
+    if service_type:
+        query = query.filter(CookingService.service_type == service_type)
+
+    services = query.offset(pagination["skip"]).limit(pagination["limit"]).all()
+    return {"success": True, "data": services}
+
+
+@router.post(
+    "/cooking-services/{service_id}/bookings",
+    response_model=SuccessResponse[CookingBookingResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def book_cooking_service(
+        *,
+        db: Session = Depends(get_db),
+        service_id: UUID,
+        booking_in: CookingBookingCreateRequest,
+        current_user: User = Depends(require_customer),
+) -> dict:
+    """
+    Book a cooking service.
+
+    BLUEPRINT v2.0 COMPLIANCE:
+    - Platform fee ₦100 on bookings
+    """
+    event_location = None
+    if booking_in.event_location:
+        event_location = (
+            booking_in.event_location.latitude,
+            booking_in.event_location.longitude,
         )
-        db.add(coupon)
-        db.commit()
-        db.refresh(coupon)
-        return {"success": True, "data": {"id": str(coupon.id), "code": coupon.code}}
-    except ImportError:
-        raise ValidationException("Coupons module not yet migrated")
 
-
-@router.patch("/my/promotions/{promotion_id}", response_model=SuccessResponse[dict])
-def toggle_promotion(
-    *,
-    db: Session = Depends(get_db),
-    promotion_id: UUID,
-    is_active: bool,
-    current_user: User = Depends(require_business),
-) -> dict:
-    """Toggle promotion active/inactive. Flutter Dashboard: promotions_screen switch."""
-    try:
-        from app.models.coupon import Coupon
-
-        business = business_crud.get_by_user_id(db, user_id=current_user.id)
-        coupon = db.query(Coupon).filter(
-            Coupon.id == promotion_id, Coupon.business_id == business.id
-        ).first()
-        if not coupon:
-            raise NotFoundException("Promotion")
-
-        coupon.is_active = is_active
-        db.commit()
-        return {"success": True, "data": {"id": str(coupon.id), "is_active": is_active}}
-    except ImportError:
-        raise ValidationException("Coupons module not yet migrated")
+    booking = food_service.create_cooking_booking(
+        db,
+        current_user=current_user,
+        service_id=service_id,
+        event_date=booking_in.event_date,
+        event_time=booking_in.event_time,
+        number_of_guests=booking_in.number_of_guests,
+        event_address=booking_in.event_address,
+        event_location=event_location,
+        menu_requirements=booking_in.menu_requirements,
+        dietary_restrictions=booking_in.dietary_restrictions,
+        special_requests=booking_in.special_requests,
+    )
+    return {"success": True, "data": booking}
 
 
 # ============================================================
-# ANALYTICS  (business dashboard)
+# ANALYTICS (BUSINESS)
 # ============================================================
 
 @router.get("/my/analytics", response_model=SuccessResponse[dict])
 def get_food_analytics(
-    *,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
-    period: str = Query("30d", regex="^(7d|30d|90d)$"),
+        *,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(require_business),
+        period: str = Query("30d", pattern="^(7d|30d|90d)$"),
 ) -> dict:
     """
     Food-specific revenue analytics.
@@ -855,16 +796,15 @@ def get_food_analytics(
     """
     from datetime import timedelta
     from sqlalchemy import func
+    from app.models.food_model import FoodOrderItem
 
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    business = _get_business(db, current_user.id)
     restaurant = restaurant_crud.get_by_business_id(db, business_id=business.id)
     if not restaurant:
         raise NotFoundException("Restaurant")
 
     days = int(period.replace("d", ""))
     since = datetime.utcnow() - timedelta(days=days)
-
-    from app.models.food_model import FoodOrder, FoodOrderItem, MenuItem
 
     # Revenue chart
     daily_revenue = (
@@ -899,50 +839,34 @@ def get_food_analytics(
         .all()
     )
 
-    max_orders = top_items_raw[0].total_orders if top_items_raw else 1
-
-    # Summary stats
-    total_orders = (
-        db.query(func.count(FoodOrder.id))
+    # Order type breakdown
+    order_type_breakdown = (
+        db.query(
+            FoodOrder.order_type,
+            func.count(FoodOrder.id).label("count"),
+        )
         .filter(
             FoodOrder.restaurant_id == restaurant.id,
             FoodOrder.created_at >= since,
         )
-        .scalar()
-        or 0
-    )
-
-    total_revenue = (
-        db.query(func.sum(FoodOrder.total_amount))
-        .filter(
-            FoodOrder.restaurant_id == restaurant.id,
-            FoodOrder.created_at >= since,
-            FoodOrder.payment_status == "paid",
-        )
-        .scalar()
-        or 0
+        .group_by(FoodOrder.order_type)
+        .all()
     )
 
     return {
         "success": True,
         "data": {
-            "period": period,
-            "total_orders": total_orders,
-            "total_revenue": float(total_revenue),
-            "avg_order_value": (
-                float(total_revenue) / total_orders if total_orders else 0
-            ),
             "revenue_chart": [
-                {"date": str(row.date), "amount": float(row.amount)}
-                for row in daily_revenue
+                {"date": str(r.date), "amount": float(r.amount)}
+                for r in daily_revenue
             ],
             "top_items": [
-                {
-                    "name": row.item_name,
-                    "orders": row.total_orders,
-                    "percentage": row.total_orders / max_orders,
-                }
-                for row in top_items_raw
+                {"name": r.item_name, "orders": r.total_orders}
+                for r in top_items_raw
+            ],
+            "order_type_breakdown": [
+                {"type": r.order_type, "count": r.count}
+                for r in order_type_breakdown
             ],
         },
     }

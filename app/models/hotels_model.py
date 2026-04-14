@@ -6,8 +6,9 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import enum
 
-from datetime import time as dt_time, date
+from datetime import time as dt_time
 from app.models.base_model import BaseModel
+
 
 # ============================================
 # ENUMS
@@ -22,6 +23,10 @@ class RoomStatusEnum(str, enum.Enum):
 
 
 class BookingStatusEnum(str, enum.Enum):
+    # FIX: Values changed from UPPERCASE to lowercase to match every other module.
+    # All other models (services, tickets, products, food) use lowercase enum values.
+    # Uppercase values made cross-module status comparisons and admin analytics impossible.
+    # MIGRATION REQUIRED — run spatial_and_enum_migration.sql before deploying.
     PENDING = "pending"
     CONFIRMED = "confirmed"
     CHECKED_IN = "checked_in"
@@ -31,8 +36,11 @@ class BookingStatusEnum(str, enum.Enum):
 
 
 class PaymentStatusEnum(str, enum.Enum):
+    # FIX: Same lowercase fix as BookingStatusEnum above.
     PENDING = "pending"
     PAID = "paid"
+    COD_PENDING = "cod_pending"
+    COD_COLLECTED = "cod_collected"
     FAILED = "failed"
     REFUNDED = "refunded"
 
@@ -60,18 +68,15 @@ class Hotel(BaseModel):
         nullable=False
     )
 
-    # Hotel Details
     star_rating = Column(Integer, nullable=True)
     total_rooms = Column(Integer, nullable=False)
 
-    # Check-in/out times
-    check_in_time = Column(Time, default=dt_time(14, 0))  # 2:00 PM
+    check_in_time = Column(Time, default=dt_time(14, 0))   # 2:00 PM
     check_out_time = Column(Time, default=dt_time(11, 0))  # 11:00 AM
 
-    # Facilities (stored as JSONB array)
-    facilities = Column(JSONB, default=list)  # ['pool', 'gym', 'spa', 'restaurant', 'parking', 'wifi']
+    # Facilities stored as JSONB array e.g. ['pool', 'gym', 'spa', 'wifi']
+    facilities = Column(JSONB, default=list)
 
-    # Policies
     policies = Column(Text, nullable=True)
     cancellation_policy = Column(Text, nullable=True)
 
@@ -113,27 +118,19 @@ class RoomType(BaseModel):
         index=True
     )
 
-    # Basic Info
-    name = Column(String(100), nullable=False)  # Single, Double, Suite
+    name = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
-
-    # Configuration
-    bed_configuration = Column(String(100), nullable=True)  # "1 King Bed", "2 Queen Beds"
+    bed_configuration = Column(String(100), nullable=True)
     max_occupancy = Column(Integer, nullable=False)
     size_sqm = Column(Numeric(6, 2), nullable=True)
-    floor_range = Column(String(50), nullable=True)  # "1-5", "10-15"
-    view_type = Column(String(50), nullable=True)  # sea, city, garden, mountain
+    floor_range = Column(String(50), nullable=True)
+    view_type = Column(String(50), nullable=True)
 
-    # Amenities (stored as JSONB array)
-    amenities = Column(JSONB, default=list)  # ['tv', 'minibar', 'safe', 'balcony']
+    # Amenities as JSONB array e.g. ['tv', 'minibar', 'safe', 'balcony']
+    amenities = Column(JSONB, default=list)
 
-    # Pricing
     base_price_per_night = Column(Numeric(10, 2), nullable=False)
-
-    # Media
-    images = Column(JSONB, default=list)  # Array of image URLs
-
-    # Inventory
+    images = Column(JSONB, default=list)
     total_rooms = Column(Integer, nullable=False)
 
     # Relationships
@@ -143,15 +140,12 @@ class RoomType(BaseModel):
         back_populates="room_type",
         cascade="all, delete-orphan"
     )
-    bookings = relationship(
-        "HotelBooking",
-        back_populates="room_type"
-    )
+    bookings = relationship("HotelBooking", back_populates="room_type")
 
     __table_args__ = (
         CheckConstraint('max_occupancy > 0', name='positive_max_occupancy'),
         CheckConstraint('base_price_per_night > 0', name='positive_price'),
-        CheckConstraint('total_rooms > 0', name='positive_total_rooms'),
+        CheckConstraint('total_rooms > 0', name='positive_room_type_total'),
     )
 
     def __repr__(self):
@@ -173,6 +167,15 @@ class Room(BaseModel):
         nullable=False,
         index=True
     )
+    # FIX: store hotel_id directly so room number uniqueness can be enforced
+    # at hotel scope, not just room_type scope (room "101" should be unique
+    # across the whole hotel, not just within a room type).
+    hotel_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("hotels.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
 
     room_number = Column(String(20), nullable=False)
     floor = Column(Integer, nullable=True)
@@ -182,16 +185,14 @@ class Room(BaseModel):
         nullable=False,
         index=True
     )
-
-    # Housekeeping
     last_cleaned = Column(DateTime(timezone=True), nullable=True)
     notes = Column(Text, nullable=True)
 
-    # Relationships
     room_type = relationship("RoomType", back_populates="rooms")
 
     __table_args__ = (
-        UniqueConstraint('room_type_id', 'room_number', name='unique_room_number_per_type'),
+        # FIX: scope uniqueness to hotel, not room_type
+        UniqueConstraint('hotel_id', 'room_number', name='unique_room_number_per_hotel'),
     )
 
     def __repr__(self):
@@ -226,22 +227,19 @@ class HotelBooking(BaseModel):
         index=True
     )
 
-    # Booking Details
     check_in_date = Column(Date, nullable=False, index=True)
     check_out_date = Column(Date, nullable=False, index=True)
     number_of_rooms = Column(Integer, default=1, nullable=False)
     number_of_guests = Column(Integer, nullable=False)
 
-    # Pricing
     base_price = Column(Numeric(10, 2), nullable=False)
     add_ons_price = Column(Numeric(10, 2), default=0.00)
     total_price = Column(Numeric(10, 2), nullable=False)
 
-    # Add-ons (stored as JSONB)
-    add_ons = Column(JSONB, default=list)  # [{'type': 'breakfast', 'price': 5000}, ...]
+    # Add-ons as JSONB e.g. [{'type': 'breakfast', 'quantity': 2, 'price': 5000}]
+    add_ons = Column(JSONB, default=list)
     special_requests = Column(Text, nullable=True)
 
-    # Status
     status = Column(
         Enum(BookingStatusEnum),
         default=BookingStatusEnum.PENDING,
@@ -255,16 +253,13 @@ class HotelBooking(BaseModel):
         index=True
     )
 
-    # Digital Check-in
     check_in_form_completed = Column(Boolean, default=False)
     id_uploaded = Column(Boolean, default=False)
     id_document_url = Column(Text, nullable=True)
 
-    # Actual check-in/out times
     actual_check_in = Column(DateTime(timezone=True), nullable=True)
     actual_check_out = Column(DateTime(timezone=True), nullable=True)
 
-    # Cancellation
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
     cancellation_reason = Column(Text, nullable=True)
 
@@ -305,7 +300,7 @@ class HotelService(BaseModel):
         index=True
     )
 
-    service_type = Column(String(100), nullable=False)  # room_service, housekeeping, maintenance, wake_up_call
+    service_type = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
 
     status = Column(
@@ -318,11 +313,9 @@ class HotelService(BaseModel):
     requested_at = Column(DateTime(timezone=True), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Staff assignment
     assigned_to = Column(String(200), nullable=True)
     notes = Column(Text, nullable=True)
 
-    # Relationships
     booking = relationship("HotelBooking", back_populates="services")
 
     def __repr__(self):

@@ -1,7 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import PostgresDsn, RedisDsn, field_validator, Field
+from pydantic import PostgresDsn, RedisDsn, field_validator
 from typing import List, Optional, Union
-import secrets
 
 
 class Settings(BaseSettings):
@@ -28,44 +27,45 @@ class Settings(BaseSettings):
     REDIS_URL: RedisDsn
     REDIS_CACHE_EXPIRE_SECONDS: int = 3600
 
-    # Security
-    SECRET_KEY: str = secrets.token_urlsafe(32)
+    # FIX: SECRET_KEY must NOT have a default — a new random value on every
+    # restart invalidates every JWT issued before the restart.
+    # Provide a stable, long value in .env (generate once with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(64))"  )
+    SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     PASSWORD_MIN_LENGTH: int = 8
 
-    # CORS - Accept string or list, will be parsed by validator
+    # CORS
     ALLOWED_ORIGINS: Union[str, List[str]] = "http://localhost:3000,http://localhost:19006"
 
-    # File Storage (MinIO/S3)
-    MINIO_ENDPOINT: str
-    MINIO_ACCESS_KEY: str
-    MINIO_SECRET_KEY: str
-    MINIO_BUCKET_NAME: str = "localy"
-    MINIO_USE_SSL: bool = False
+    # File Storage (Cloudinary)
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
 
-    # Email (Resend) - UPDATED
+    # Email (Resend)
     RESEND_API_KEY: str
     FROM_EMAIL: str = "noreply@localy.ng"
     FROM_NAME: str = "Localy"
 
-    # SMS (Termii - Nigerian SMS provider)
+    # SMS (Termii)
     TERMII_API_KEY: str
     TERMII_SENDER_ID: str = "Localy"
     TERMII_API_URL: str = "https://api.ng.termii.com/api"
 
-    # OAuth - Google & Apple - NEW
+    # OAuth
     GOOGLE_CLIENT_ID: str
     APPLE_APP_BUNDLE_ID: str
 
-    # Payment Gateway (Paystack)
+    # Payment (Paystack)
     PAYSTACK_SECRET_KEY: str
     PAYSTACK_PUBLIC_KEY: str
     PAYSTACK_CALLBACK_URL: Optional[str] = None
 
     # Location & Search
-    DEFAULT_LOCATION_LAT: float = 9.0765  # Abuja, Nigeria
+    DEFAULT_LOCATION_LAT: float = 9.0765   # Abuja, Nigeria
     DEFAULT_LOCATION_LNG: float = 7.3986
     DEFAULT_SEARCH_RADIUS_KM: float = 10.0
     MAX_SEARCH_RADIUS_KM: float = 50.0
@@ -98,11 +98,23 @@ class Settings(BaseSettings):
     # Wallet
     REFERRAL_BONUS_AMOUNT: float = 500.0
     WALLET_MIN_TOPUP: float = 500.0
-    WALLET_MAX_BALANCE: float = 1000000.0
-    WALLET_DAILY_FUNDING_LIMIT: float = 500000.0
+    WALLET_MAX_BALANCE: float = 10_000_000.0
+    WALLET_DAILY_FUNDING_LIMIT: float = 500_000.0
 
-    # Business Rules
-    LOCAL_GOVERNMENT_RESTRICTION: bool = True  # Users see only local businesses
+    # Monnify (virtual account / bank transfer top-ups)
+    MONNIFY_API_KEY: str = ""
+    MONNIFY_SECRET_KEY: str = ""
+    MONNIFY_CONTRACT_CODE: str = ""
+    MONNIFY_BASE_URL: str = "https://sandbox.monnify.com/api/v1"
+
+    # NOWPayments (crypto top-ups)
+    NOWPAYMENTS_API_KEY: str = ""
+    NOWPAYMENTS_IPN_SECRET: str = ""
+    NOWPAYMENTS_IPN_CALLBACK_URL: Optional[str] = None
+    NOWPAYMENTS_SANDBOX: str = "true"   # "true" = sandbox, "false" = production
+
+    # Business Rules (Blueprint)
+    LOCAL_GOVERNMENT_RESTRICTION: bool = True
     STORY_EXPIRE_HOURS: int = 24
     REEL_MAX_DURATION_SECONDS: int = 60
 
@@ -110,10 +122,13 @@ class Settings(BaseSettings):
     DEFAULT_PAGE_SIZE: int = 20
     MAX_PAGE_SIZE: int = 100
 
+    # ------------------------------------------------------------------ #
+    # Validators                                                           #
+    # ------------------------------------------------------------------ #
+
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def validate_database_url(cls, v: str) -> str:
-        """Ensure database URL is properly formatted"""
         if isinstance(v, str) and not v.startswith("postgresql"):
             raise ValueError("DATABASE_URL must start with 'postgresql'")
         return v
@@ -121,7 +136,6 @@ class Settings(BaseSettings):
     @field_validator("SECRET_KEY")
     @classmethod
     def validate_secret_key(cls, v: str) -> str:
-        """Ensure secret key is strong enough"""
         if len(v) < 32:
             raise ValueError("SECRET_KEY must be at least 32 characters")
         return v
@@ -129,47 +143,69 @@ class Settings(BaseSettings):
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v) -> List[str]:
-        """Parse CORS origins from comma-separated string or list"""
         if isinstance(v, str):
-            return [origin.strip() for origin in v.split(',') if origin.strip()]
+            return [o.strip() for o in v.split(",") if o.strip()]
         if isinstance(v, list):
             return v
         return ["http://localhost:3000"]
 
-    @field_validator("ALLOWED_IMAGE_TYPES", "ALLOWED_VIDEO_TYPES", "ALLOWED_DOCUMENT_TYPES", mode="before")
+    @field_validator(
+        "ALLOWED_IMAGE_TYPES", "ALLOWED_VIDEO_TYPES", "ALLOWED_DOCUMENT_TYPES",
+        mode="before",
+    )
     @classmethod
     def parse_file_types(cls, v) -> List[str]:
-        """Parse file types from comma-separated string or list"""
         if isinstance(v, str):
-            return [file_type.strip() for file_type in v.split(',') if file_type.strip()]
+            return [t.strip() for t in v.split(",") if t.strip()]
         if isinstance(v, list):
             return v
         return []
+
+    # ------------------------------------------------------------------ #
+    # Convenience helpers parsed from REDIS_URL                           #
+    # (used by cache.py which needs host/port/password/db individually)   #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def redis_host(self) -> str:
+        return self.REDIS_URL.host or "localhost"
+
+    @property
+    def redis_port(self) -> int:
+        return self.REDIS_URL.port or 6379
+
+    @property
+    def redis_password(self) -> Optional[str]:
+        return self.REDIS_URL.password
+
+    @property
+    def redis_db(self) -> int:
+        # Path is "/0", "/1", etc.
+        try:
+            return int((self.REDIS_URL.path or "/0").lstrip("/"))
+        except ValueError:
+            return 0
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
-        # Important: This prevents JSON parsing for complex types
-        env_parse_none_str="null"
+        env_parse_none_str="null",
+        extra="ignore",
     )
 
 
-# Singleton instance
+# Singleton
 settings = Settings()
 
 
-# Environment-specific configurations
 def is_production() -> bool:
-    """Check if running in production"""
     return settings.APP_ENV == "production"
 
 
 def is_development() -> bool:
-    """Check if running in development"""
     return settings.APP_ENV == "development"
 
 
 def is_testing() -> bool:
-    """Check if running tests"""
     return settings.APP_ENV == "testing"

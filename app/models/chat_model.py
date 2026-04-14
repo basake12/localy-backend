@@ -4,7 +4,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-from geoalchemy2 import Geography
 import enum
 
 from app.models.base_model import BaseModel
@@ -15,18 +14,20 @@ from app.models.base_model import BaseModel
 # ============================================
 
 class MessageTypeEnum(str, enum.Enum):
-    TEXT = "text"
-    IMAGE = "image"
-    FILE = "file"
+    TEXT     = "text"
+    IMAGE    = "image"
+    VOICE    = "voice"
+    FILE     = "file"
     LOCATION = "location"
-    SYSTEM = "system"       # Auto-generated (e.g. "John joined the chat")
-    TEMPLATE = "template"   # Quick-reply templates
+    SYSTEM   = "system"
+    TEMPLATE = "template"
 
 
 class ConversationTypeEnum(str, enum.Enum):
-    DIRECT = "direct"           # 1:1
-    BUSINESS = "business"       # Customer <-> Business
-    SUPPORT = "support"         # Customer <-> Platform support
+    DIRECT   = "direct"     # General 1:1
+    BUSINESS = "business"   # Customer ↔ Business (Blueprint §9.1)
+    RIDER    = "rider"      # Customer ↔ Rider — delivery-scoped only (Blueprint §9.2)
+    SUPPORT  = "support"    # Customer ↔ Platform support team (Blueprint §9.3)
 
 
 # ============================================
@@ -54,32 +55,29 @@ class Conversation(BaseModel):
         index=True
     )
 
-    # Context — links the chat to a specific order/booking if applicable
-    # e.g. customer messaging a restaurant about their food order
-    context_type = Column(String(50), nullable=True)   # food_order, hotel_booking, product_order, etc
-    context_id = Column(UUID(as_uuid=True), nullable=True)
+    # Context — links the chat to a specific order/booking/delivery if applicable
+    # For rider chats: context_type = "delivery", context_id = delivery.id
+    # For business chats: context_type = "food_order" | "hotel_booking" | etc.
+    # For support chats: context_type = "support_ticket", context_id = null
+    context_type = Column(String(50), nullable=True)
+    context_id   = Column(UUID(as_uuid=True), nullable=True)
 
-    # Metadata - REMOVED FOREIGN KEY to avoid circular dependency
-    # This is just a denormalized cache field for performance
-    last_message_id = Column(
-        UUID(as_uuid=True),
-        nullable=True,
-        index=True
-    )
-    last_message_at = Column(DateTime(timezone=True), nullable=True)
+    # Denormalised cache — no FK to avoid circular dependency
+    last_message_id      = Column(UUID(as_uuid=True), nullable=True, index=True)
+    last_message_at      = Column(DateTime(timezone=True), nullable=True)
     last_message_preview = Column(String(255), nullable=True)
 
     # Unread counts — denormalised for performance
     unread_count_user_one = Column(Integer, default=0)
     unread_count_user_two = Column(Integer, default=0)
 
-    # Mute / archive per user
-    is_muted_user_one = Column(Boolean, default=False)
-    is_muted_user_two = Column(Boolean, default=False)
+    # Per-user flags
+    is_muted_user_one    = Column(Boolean, default=False)
+    is_muted_user_two    = Column(Boolean, default=False)
     is_archived_user_one = Column(Boolean, default=False)
     is_archived_user_two = Column(Boolean, default=False)
 
-    # Active
+    # active = False when auto-closed (rider chat 1hr after delivery complete)
     is_active = Column(Boolean, default=True)
 
     # Relationships
@@ -92,8 +90,6 @@ class Conversation(BaseModel):
         order_by="Message.created_at.asc()",
         foreign_keys="Message.conversation_id"
     )
-    # Note: last_message relationship removed due to circular dependency
-    # Use application logic to fetch last message: conversation.messages[-1] if conversation.messages else None
 
     __table_args__ = (
         UniqueConstraint(
@@ -105,7 +101,7 @@ class Conversation(BaseModel):
     )
 
     def __repr__(self):
-        return f"<Conversation {self.id}>"
+        return f"<Conversation {self.id} type={self.conversation_type}>"
 
 
 # ============================================
@@ -131,15 +127,16 @@ class Message(BaseModel):
 
     # Content
     message_type = Column(String(20), nullable=False, default="text")
-    content = Column(Text, nullable=True)  # Text body or caption
+    content      = Column(Text, nullable=True)
 
     # Media payload (JSONB — flexible per type)
     media = Column(JSONB, nullable=True)
     # text     -> null
     # image    -> {"url": "...", "width": 800, "height": 600, "thumbnail_url": "..."}
-    # file     -> {"url": "...", "name": "doc.pdf", "size_bytes": 1024, "mime_type": "application/pdf"}
+    # voice    -> {"url": "...", "duration_seconds": 12}
+    # file     -> {"url": "...", "name": "doc.pdf", "size_bytes": 1024, "mime_type": "..."}
     # location -> {"latitude": 9.07, "longitude": 7.40, "address": "..."}
-    # template -> {"options": ["Yes", "No", "Maybe"], "selected": null}
+    # template -> {"options": ["Yes", "No"], "selected": null}
 
     # Threading
     reply_to_message_id = Column(
@@ -149,30 +146,34 @@ class Message(BaseModel):
     )
 
     # Read receipts
-    is_read = Column(Boolean, default=False)
-    read_at = Column(DateTime(timezone=True), nullable=True)
+    is_read  = Column(Boolean, default=False)
+    read_at  = Column(DateTime(timezone=True), nullable=True)
 
     # Delivery receipt
-    is_delivered = Column(Boolean, default=False)
-    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    is_delivered  = Column(Boolean, default=False)
+    delivered_at  = Column(DateTime(timezone=True), nullable=True)
 
     # Editing
     is_edited = Column(Boolean, default=False)
     edited_at = Column(DateTime(timezone=True), nullable=True)
 
     # Soft delete
-    is_deleted = Column(Boolean, default=False)
-    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    is_deleted    = Column(Boolean, default=False)
+    deleted_at    = Column(DateTime(timezone=True), nullable=True)
     deleted_by_id = Column(UUID(as_uuid=True), nullable=True)
 
-    # Reactions
+    # Reactions — [{"user_id": "uuid", "emoji": "👍", "reacted_at": "..."}]
     reactions = Column(JSONB, default=list)
-    # [{"user_id": "uuid", "emoji": "👍", "reacted_at": "2026-..."}]
 
     # Relationships
     conversation = relationship("Conversation", back_populates="messages")
-    sender = relationship("User", foreign_keys=[sender_id])
-    reply_to = relationship("Message", remote_side="Message.id", foreign_keys=[reply_to_message_id])
+    sender       = relationship("User", foreign_keys=[sender_id])
+    reply_to     = relationship(
+        "Message",
+        remote_side="Message.id",
+        foreign_keys=[reply_to_message_id],
+        uselist=False
+    )
 
     __table_args__ = (
         Index('ix_messages_conversation_created', 'conversation_id', 'created_at'),
@@ -183,7 +184,7 @@ class Message(BaseModel):
 
 
 # ============================================
-# ONLINE PRESENCE MODEL
+# ONLINE PRESENCE
 # ============================================
 
 class UserPresence(BaseModel):
@@ -193,17 +194,14 @@ class UserPresence(BaseModel):
     user_id = Column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
-        unique=True,
-        nullable=False,
-        index=True
+        unique=True, nullable=False, index=True
     )
 
-    is_online = Column(Boolean, default=False)
+    is_online    = Column(Boolean, default=False)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String(20), default="online")  # online, away, busy, offline
-    device_type = Column(String(20), nullable=True)  # web, mobile, desktop
+    status       = Column(String(20), default="online")  # online | away | busy | offline
+    device_type  = Column(String(20), nullable=True)     # web | mobile | desktop
 
-    # Relationships
     user = relationship("User", foreign_keys=[user_id])
 
     def __repr__(self):
@@ -211,8 +209,7 @@ class UserPresence(BaseModel):
 
 
 # ============================================
-# TYPING INDICATOR (ephemeral — stored in memory / Redis in prod)
-# For the DB-backed fallback we keep a short-lived row
+# TYPING INDICATOR (ephemeral — Redis in prod, DB fallback)
 # ============================================
 
 class TypingIndicator(BaseModel):
@@ -222,16 +219,13 @@ class TypingIndicator(BaseModel):
     conversation_id = Column(
         UUID(as_uuid=True),
         ForeignKey("conversations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True
+        nullable=False, index=True
     )
     user_id = Column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False
     )
-
-    # expires_at lets a background job (or query filter) auto-clean stale rows
     expires_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (

@@ -23,7 +23,8 @@ router = APIRouter()
 
 
 # ============================================
-# NOTIFICATION HISTORY
+# STATIC ROUTES  — must come before /{notification_id}
+# to prevent FastAPI treating string literals as UUID params
 # ============================================
 
 @router.get("", response_model=NotificationListOut)
@@ -36,9 +37,11 @@ def list_notifications(
     db:       Session    = Depends(get_db),
     user:     User       = Depends(get_current_active_user),
 ):
-    """Paginated notification history. Defaults to in-app bell feed."""
-    if channel is None:
-        channel = "in_app"   # default view is the notification bell
+    """
+    Paginated notification history.
+    Defaults to all channels if not specified (callers filter as needed).
+    Pass channel=in_app for the notification bell feed.
+    """
     return notification_history_svc.list_notifications(
         db, user_id=user.id,
         category=category, channel=channel,
@@ -46,30 +49,18 @@ def list_notifications(
     )
 
 
-@router.put("/{notification_id}/read", response_model=NotificationOut)
-def mark_read(
-    notification_id: UUID,
-    db:   Session = Depends(get_db),
-    user: User    = Depends(get_current_active_user),
-):
-    """Mark a single notification as read."""
-    return notification_history_svc.mark_read(db, user_id=user.id, notification_id=notification_id)
-
-
+# NOTE: /read-all MUST be declared before /{notification_id}/read
+# to prevent FastAPI matching "read-all" as a UUID value.
 @router.put("/read-all", status_code=200)
 def mark_all_read(
     category: str | None = Query(None),
     db:       Session    = Depends(get_db),
     user:     User       = Depends(get_current_active_user),
 ):
-    """Mark all in-app notifications as read. Optionally filter by category."""
+    """Mark all in-app notifications as read, optionally filtered by category."""
     count = notification_history_svc.mark_all_read(db, user_id=user.id, category=category)
     return {"success": True, "data": {"marked_read": count}}
 
-
-# ============================================
-# PREFERENCES
-# ============================================
 
 @router.get("/preferences", response_model=PreferencesOut)
 def get_preferences(
@@ -92,10 +83,6 @@ def toggle_preference(
     return {"success": True, "data": result}
 
 
-# ============================================
-# DEVICE TOKENS  (push registration)
-# ============================================
-
 @router.post("/device-tokens", response_model=DeviceTokenOut, status_code=201)
 def register_device_token(
     payload: DeviceTokenCreate,
@@ -104,7 +91,6 @@ def register_device_token(
 ):
     """
     Register (or refresh) a push notification device token.
-    Call on app foreground after obtaining FCM / APNs token.
     Idempotent — updates existing row if token already registered.
     """
     return device_token_service.register(
@@ -119,9 +105,25 @@ def register_device_token(
 
 @router.delete("/device-tokens/{token}", status_code=204)
 def unregister_device_token(
-    token:  str,
-    db:     Session = Depends(get_db),
-    user:   User    = Depends(get_current_active_user),
+    token: str,
+    db:    Session = Depends(get_db),
+    user:  User    = Depends(get_current_active_user),
 ):
-    """Deactivate a device token (e.g. on logout)."""
+    """Deactivate a device token on logout."""
     device_token_service.unregister(db, token=token)
+
+
+# ============================================
+# PARAMETERIZED ROUTES — must come AFTER static routes
+# ============================================
+
+@router.put("/{notification_id}/read", response_model=NotificationOut)
+def mark_read(
+    notification_id: UUID,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_active_user),
+):
+    """Mark a single notification as read."""
+    return notification_history_svc.mark_read(
+        db, user_id=user.id, notification_id=notification_id
+    )

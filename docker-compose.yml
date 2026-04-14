@@ -1,37 +1,71 @@
 version: '3.8'
 
+# ─────────────────────────────────────────────────────────────────────
+# Localy — docker-compose (development)
+#
+# SECURITY NOTES:
+#   • All secrets are read from .env.development — never hardcode them.
+#   • Redis is password-protected (set REDIS_PASSWORD in .env).
+#   • MinIO credentials come from .env (not the default minioadmin/minioadmin).
+#   • Flower is protected by basic auth (set FLOWER_USER / FLOWER_PASSWORD).
+#   • --reload is only for the dev backend container; production uses
+#     a proper gunicorn/uvicorn multi-worker command.
+# ─────────────────────────────────────────────────────────────────────
+
 services:
+
+  # ── PostgreSQL + PostGIS ──────────────────────────────────────
   postgres:
     image: postgis/postgis:15-3.3
     container_name: localy_postgres
     environment:
-      POSTGRES_USER: localy_user
-      POSTGRES_PASSWORD: localy_pass
-      POSTGRES_DB: localy_db
+      POSTGRES_USER:     ${POSTGRES_USER:-localy_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}          # required — no default
+      POSTGRES_DB:       ${POSTGRES_DB:-localy_db}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - localy_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-localy_user} -d ${POSTGRES_DB:-localy_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
 
+  # ── Redis ─────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: localy_redis
+    # FIX: require a password — read from .env.development
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     networks:
       - localy_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
+  # ── MinIO (S3-compatible object storage) ──────────────────────
   minio:
     image: minio/minio:latest
     container_name: localy_minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      # FIX: read credentials from .env — never use minioadmin/minioadmin
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -39,10 +73,20 @@ services:
       - minio_data:/data
     networks:
       - localy_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
 
+  # ── FastAPI backend ───────────────────────────────────────────
   backend:
     build: .
     container_name: localy_backend
+    # FIX: --reload is fine in dev; never use it in production.
+    # For production, use: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     env_file:
       - .env.development
@@ -51,49 +95,75 @@ services:
     volumes:
       - .:/app
     depends_on:
-      - postgres
-      - redis
-      - minio
+      postgres:
+        condition: service_healthy   # FIX: wait until postgres is actually ready
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     networks:
       - localy_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
 
+  # ── Celery worker ─────────────────────────────────────────────
   celery_worker:
     build: .
     container_name: localy_celery
-    command: celery -A app.tasks.celery_app worker --loglevel=info
+    command: celery -A app.tasks.celery_app.celery worker --loglevel=info --concurrency=4
     env_file:
       - .env.development
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     networks:
       - localy_network
+    restart: unless-stopped
 
+  # ── Celery beat (scheduler) ───────────────────────────────────
   celery_beat:
     build: .
     container_name: localy_celery_beat
-    command: celery -A app.tasks.celery_app beat --loglevel=info
+    command: celery -A app.tasks.celery_app.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
     env_file:
       - .env.development
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     networks:
       - localy_network
+    restart: unless-stopped
 
+  # ── Flower (Celery monitoring) ────────────────────────────────
   flower:
     build: .
     container_name: localy_flower
-    command: celery -A app.tasks.celery_app flower --port=5555
+    # FIX: add basic auth — Flower is publicly accessible without it
+    command: >
+      celery -A app.tasks.celery_app.celery flower
+      --port=5555
+      --basic_auth=${FLOWER_USER}:${FLOWER_PASSWORD}
     env_file:
       - .env.development
     ports:
       - "5555:5555"
     depends_on:
-      - redis
-      - celery_worker
+      redis:
+        condition: service_healthy
+      celery_worker:
+        condition: service_started
     networks:
       - localy_network
+    restart: unless-stopped
 
+# ─────────────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
   redis_data:

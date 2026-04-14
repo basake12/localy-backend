@@ -14,6 +14,12 @@ from app.models.base_model import BaseModel
 # ENUMS
 # ============================================
 
+class EventTypeEnum(str, enum.Enum):
+    """Top-level event type — distinguishes live events from transport schedules"""
+    EVENT = "event"
+    TRANSPORT = "transport"
+
+
 class EventCategoryEnum(str, enum.Enum):
     CONCERT = "concert"
     CONFERENCE = "conference"
@@ -25,6 +31,7 @@ class EventCategoryEnum(str, enum.Enum):
     NETWORKING = "networking"
     COMEDY = "comedy"
     RELIGIOUS = "religious"
+    PARTY = "party"          # Added per blueprint (parties/nightlife)
     OTHER = "other"
 
 
@@ -73,8 +80,18 @@ class TicketEvent(BaseModel):
         index=True
     )
 
-    # Event Type
-    event_type = Column(String(50), nullable=False)  # event, transport
+    # LGA scoping for location-based discovery.
+    # Stored as a plain string validated against ABUJA_LOCAL_GOVERNMENTS in constants.py.
+    # No FK needed — LGAs are managed as constants, not a DB table.
+    # nullable for transport routes that cross LGAs.
+    lga_name = Column(String(100), nullable=True, index=True)
+
+    # FIX: Use the typed Enum instead of a free-form String to get DB-level constraint.
+    event_type = Column(
+        Enum(EventTypeEnum),
+        nullable=False,
+        index=True
+    )
 
     # Basic Info
     name = Column(String(255), nullable=False, index=True)
@@ -101,16 +118,16 @@ class TicketEvent(BaseModel):
     # Location/Route
     venue_name = Column(String(255), nullable=True)
     venue_address = Column(Text, nullable=True)
-    venue_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    venue_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     # For Transport - Route
     origin_city = Column(String(100), nullable=True, index=True)
     origin_terminal = Column(String(255), nullable=True)
-    origin_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    origin_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     destination_city = Column(String(100), nullable=True, index=True)
     destination_terminal = Column(String(255), nullable=True)
-    destination_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    destination_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     # Capacity
     total_capacity = Column(Integer, nullable=False)
@@ -146,7 +163,7 @@ class TicketEvent(BaseModel):
     sales_start_date = Column(DateTime(timezone=True), nullable=True)
     sales_end_date = Column(DateTime(timezone=True), nullable=True)
 
-    # Stats
+    # Stats (denormalized for performance — updated by DB triggers or Celery tasks)
     total_tickets_sold = Column(Integer, default=0)
     total_revenue = Column(Numeric(12, 2), default=0.00)
     average_rating = Column(Numeric(3, 2), default=0.00)
@@ -268,7 +285,7 @@ class TicketBooking(BaseModel):
     # Booking Details
     quantity = Column(Integer, nullable=False)
 
-    # Pricing
+    # Pricing (snapshot at time of purchase — never read from tier after booking)
     unit_price = Column(Numeric(10, 2), nullable=False)
     service_charge = Column(Numeric(10, 2), default=0.00)
     total_amount = Column(Numeric(10, 2), nullable=False)
@@ -287,7 +304,7 @@ class TicketBooking(BaseModel):
 
     # Ticket Information
     booking_reference = Column(String(20), unique=True, nullable=False, index=True)
-    qr_code_url = Column(Text, nullable=True)  # URL to QR code image
+    qr_code_url = Column(Text, nullable=True)
 
     # Status
     status = Column(
@@ -306,7 +323,7 @@ class TicketBooking(BaseModel):
 
     # Check-in
     checked_in_at = Column(DateTime(timezone=True), nullable=True)
-    check_in_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    check_in_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     # Cancellation
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
@@ -320,6 +337,7 @@ class TicketBooking(BaseModel):
     event = relationship("TicketEvent", back_populates="bookings")
     tier = relationship("TicketTier", back_populates="bookings")
     customer = relationship("User", foreign_keys=[customer_id])
+    seat_maps = relationship("SeatMap", back_populates="booking")
 
     __table_args__ = (
         CheckConstraint('quantity > 0', name='positive_booking_quantity'),
@@ -331,7 +349,7 @@ class TicketBooking(BaseModel):
 
 
 # ============================================
-# SEAT MAP MODEL (Optional - for venues with specific seating)
+# SEAT MAP MODEL
 # ============================================
 
 class SeatMap(BaseModel):
@@ -359,7 +377,7 @@ class SeatMap(BaseModel):
 
     # Status
     is_available = Column(Boolean, default=True)
-    is_blocked = Column(Boolean, default=False)  # For maintenance/reserved
+    is_blocked = Column(Boolean, default=False)
 
     # Booking Reference (if booked)
     booking_id = Column(
@@ -371,7 +389,8 @@ class SeatMap(BaseModel):
     # Relationships
     event = relationship("TicketEvent")
     tier = relationship("TicketTier")
-    booking = relationship("TicketBooking")
+    # FIX: Added back_populates to complete the bidirectional relationship
+    booking = relationship("TicketBooking", back_populates="seat_maps")
 
     __table_args__ = (
         UniqueConstraint('event_id', 'seat_number', name='unique_event_seat'),

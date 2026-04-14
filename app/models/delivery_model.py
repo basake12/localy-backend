@@ -76,14 +76,14 @@ class Delivery(BaseModel):
 
     # Pickup Details
     pickup_address = Column(Text, nullable=False)
-    pickup_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False)
+    pickup_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=False)
     pickup_contact_name = Column(String(200), nullable=False)
     pickup_contact_phone = Column(String(20), nullable=False)
     pickup_instructions = Column(Text, nullable=True)
 
     # Dropoff Details
     dropoff_address = Column(Text, nullable=False)
-    dropoff_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False)
+    dropoff_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=False)
     dropoff_contact_name = Column(String(200), nullable=False)
     dropoff_contact_phone = Column(String(20), nullable=False)
     dropoff_instructions = Column(Text, nullable=True)
@@ -203,7 +203,7 @@ class DeliveryTracking(BaseModel):
     )
 
     # Location at time of update
-    location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=True)
     address = Column(Text, nullable=True)
 
     # Update Details
@@ -289,7 +289,7 @@ class DeliveryZone(BaseModel):
     local_government = Column(String(100), nullable=False, index=True)
 
     # Zone Center (for distance calculations)
-    center_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False)
+    center_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=False)
     radius_km = Column(Numeric(6, 2), nullable=False)
 
     # Pricing
@@ -328,8 +328,8 @@ class RiderShift(BaseModel):
     shift_end = Column(DateTime(timezone=True), nullable=True)
 
     # Start/End Locations
-    start_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
-    end_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    start_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=True)
+    end_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=True)
 
     # Shift Stats
     total_deliveries = Column(Integer, default=0)

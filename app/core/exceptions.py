@@ -30,10 +30,17 @@ class AuthenticationException(LocalyException):
 
 
 class InvalidCredentialsException(AuthenticationException):
-    """Invalid username or password"""
+    """Invalid username, password, or PIN.
 
-    def __init__(self):
-        super().__init__(detail="Invalid email or password")
+    FIX: Now accepts an optional detail string so callers can provide context:
+        raise InvalidCredentialsException("Incorrect PIN")
+        raise InvalidCredentialsException("Invalid email or password")
+        raise InvalidCredentialsException()  # uses default
+    Previously took no arguments → TypeError whenever auth_service passed a message.
+    """
+
+    def __init__(self, detail: str = "Invalid credentials"):
+        super().__init__(detail=detail)
 
 
 class TokenExpiredException(AuthenticationException):
@@ -260,3 +267,36 @@ class PaymentFailedException(LocalyException):
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=detail
         )
+
+
+class ServiceUnavailableException(LocalyException):
+    def __init__(self, service: str = "Service", detail: str = None):
+        super().__init__(
+            status_code=503,
+            detail=detail or f"{service} is currently unavailable. Please try again later.",
+        )
+
+
+class TokenDecodeError(LocalyException):
+    def __init__(self, detail: str = "Invalid or expired token"):
+        super().__init__(status_code=401, detail=detail)
+
+
+class ForbiddenException(LocalyException):
+    def __init__(self, detail: str = "You do not have permission to perform this action"):
+        super().__init__(status_code=403, detail=detail)
+
+
+class BadRequestException(LocalyException):
+    def __init__(self, detail: str = "Bad request"):
+        super().__init__(status_code=400, detail=detail)
+
+
+class ConflictException(LocalyException):
+    def __init__(self, detail: str = "Resource conflict"):
+        super().__init__(status_code=409, detail=detail)
+
+
+class UnprocessableEntityException(LocalyException):
+    def __init__(self, detail: str = "Unprocessable entity"):
+        super().__init__(status_code=422, detail=detail)

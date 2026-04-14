@@ -1,28 +1,33 @@
+from __future__ import annotations
+
+from typing import Literal, Optional, List
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
 from datetime import datetime
 from uuid import UUID
 
+from app.models.notifications_model import (
+    NotificationCategoryEnum,
+    NotificationChannelEnum,
+)
 
 # ============================================
 # NOTIFICATION — READ
 # ============================================
 
 class NotificationOut(BaseModel):
-    id:            UUID
-    channel:       str
-    category:      str
-    title:         str
-    body:          str
-    action_url:    Optional[str] = None
-    icon_url:      Optional[str] = None
-    status:        str
-    sent_at:       Optional[str] = None
-    read_at:       Optional[str] = None
-    created_at:    datetime
+    id:           UUID
+    channel:      str
+    category:     str
+    title:        str
+    body:         str
+    action_url:   Optional[str]      = None
+    icon_url:     Optional[str]      = None
+    status:       str
+    sent_at:      Optional[datetime] = None   # proper datetime, not str
+    read_at:      Optional[datetime] = None
+    created_at:   datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class NotificationListOut(BaseModel):
@@ -50,9 +55,23 @@ class PreferencesOut(BaseModel):
 
 class PreferenceToggle(BaseModel):
     """Toggle a single (category, channel) pair."""
-    category: str
-    channel:  str
+    category: str = Field(..., description="NotificationCategoryEnum value")
+    channel:  str = Field(..., description="NotificationChannelEnum value")
     enabled:  bool
+
+    @classmethod
+    def validate_category(cls, v: str) -> str:
+        valid = {e.value for e in NotificationCategoryEnum}
+        if v not in valid:
+            raise ValueError(f"category must be one of {sorted(valid)}")
+        return v
+
+    @classmethod
+    def validate_channel(cls, v: str) -> str:
+        valid = {e.value for e in NotificationChannelEnum}
+        if v not in valid:
+            raise ValueError(f"channel must be one of {sorted(valid)}")
+        return v
 
 
 # ============================================
@@ -60,10 +79,11 @@ class PreferenceToggle(BaseModel):
 # ============================================
 
 class DeviceTokenCreate(BaseModel):
-    token:       str  = Field(..., min_length=10)
-    platform:    str  = Field(..., enum=["ios", "android", "web"])
-    device_name: Optional[str] = None
-    app_version: Optional[str] = None
+    token:       str                                    = Field(..., min_length=10)
+    # Literal replaces the deprecated Field(enum=[...]) pattern from Pydantic v1
+    platform:    Literal["ios", "android", "web"]
+    device_name: Optional[str]                          = None
+    app_version: Optional[str]                          = None
 
 
 class DeviceTokenOut(BaseModel):
@@ -74,12 +94,11 @@ class DeviceTokenOut(BaseModel):
     is_active:   bool
     created_at:  datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 # ============================================
-# INTERNAL — used by NotificationService (not exposed)
+# INTERNAL — used by NotificationService (not exposed via API)
 # ============================================
 
 class NotificationPayload(BaseModel):
@@ -89,9 +108,9 @@ class NotificationPayload(BaseModel):
     """
     user_id:    UUID
     category:   str               # NotificationCategoryEnum value
-    title:      str
+    title:      str               = Field(..., max_length=200)
     body:       str
     action_url: Optional[str]     = None
     icon_url:   Optional[str]     = None
-    # Force specific channels (if None → all enabled channels for user+category)
+    # Force specific channels (None → all enabled channels for user+category)
     channels:   Optional[List[str]] = None

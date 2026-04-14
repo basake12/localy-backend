@@ -1,9 +1,9 @@
 from sqlalchemy import (
     Column, String, Numeric, Boolean, Enum,
-    ForeignKey, DateTime, Text
+    ForeignKey, DateTime
 )
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import UUID
 import enum
 
 from app.models.base_model import BaseModel
@@ -26,12 +26,19 @@ class BillingCycleEnum(str, enum.Enum):
     ANNUAL = "annual"
 
 
+class SubscriptionStatusEnum(str, enum.Enum):
+    ACTIVE = "active"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    PENDING = "pending"
+
+
 # ============================================
 # SUBSCRIPTION PLAN MODEL
 # ============================================
 
 class SubscriptionPlan(BaseModel):
-    """Available subscription plans"""
+    """Available subscription plans."""
 
     __tablename__ = "subscription_plans"
 
@@ -39,17 +46,18 @@ class SubscriptionPlan(BaseModel):
     name = Column(String(100), nullable=False)
     monthly_price = Column(Numeric(10, 2), nullable=False)
     annual_price = Column(Numeric(10, 2), nullable=False)
-    features = Column(Text, nullable=False)  # JSON stored as text
+    # JSONB for proper querying and indexing — stored as list of feature strings
+    features = Column(JSONB, nullable=False, default=list)
     is_active = Column(Boolean, default=True)
 
     # Relationships
     subscriptions = relationship(
         "Subscription",
         back_populates="plan",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
     )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<SubscriptionPlan {self.name}>"
 
 
@@ -58,15 +66,29 @@ class SubscriptionPlan(BaseModel):
 # ============================================
 
 class Subscription(BaseModel):
-    """User subscriptions"""
+    """User subscriptions."""
 
     __tablename__ = "subscriptions"
 
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    plan_id = Column(UUID(as_uuid=True), ForeignKey("subscription_plans.id"), nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("subscription_plans.id"),
+        nullable=False,
+    )
 
     billing_cycle = Column(Enum(BillingCycleEnum), nullable=False)
-    status = Column(String(50), default="active", index=True)
+    status = Column(
+        Enum(SubscriptionStatusEnum),
+        default=SubscriptionStatusEnum.ACTIVE,
+        nullable=False,
+        index=True,
+    )
 
     started_at = Column(DateTime(timezone=True), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
@@ -75,6 +97,7 @@ class Subscription(BaseModel):
 
     # Relationships
     plan = relationship("SubscriptionPlan", back_populates="subscriptions")
+    user = relationship("User", back_populates="subscriptions")
 
-    def __repr__(self):
-        return f"<Subscription {self.plan.name} - {self.status}>"
+    def __repr__(self) -> str:
+        return f"<Subscription {self.plan_id} - {self.status}>"

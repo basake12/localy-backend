@@ -1,14 +1,19 @@
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import and_, or_, func, desc
+from sqlalchemy import and_, or_, desc
 from uuid import UUID
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from app.crud.base_crud import CRUDBase
 from app.models.chat_model import (
     Conversation, Message, UserPresence, TypingIndicator
 )
 from app.core.exceptions import NotFoundException, ValidationException
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now — replaces deprecated datetime.utcnow()."""
+    return datetime.now(timezone.utc)
 
 
 # ============================================
@@ -25,10 +30,10 @@ class CRUDConversation(CRUDBase[Conversation, dict, dict]):
         context_id: Optional[UUID] = None
     ) -> tuple[Conversation, bool]:
         """
-        Idempotent: return existing conversation or create one.
+        Idempotent — return existing conversation or create one.
+        UUIDs are sorted so (A,B) and (B,A) resolve to the same row.
         Returns (conversation, created_flag).
         """
-        # Normalise order so we never get duplicate pairs
         uid_a, uid_b = sorted([str(user_one_id), str(user_two_id)])
 
         existing = db.query(Conversation).filter(
@@ -62,9 +67,10 @@ class CRUDConversation(CRUDBase[Conversation, dict, dict]):
         skip: int = 0, limit: int = 40
     ) -> List[Conversation]:
         """Latest-first list of conversations the user is part of."""
-        query = db.query(Conversation).options(
-            joinedload(Conversation.last_message)
-        ).filter(
+        # NOTE: removed joinedload(Conversation.last_message) — that relationship
+        # was intentionally removed from the model to prevent circular FK dependency.
+        # The last_message_preview denormalised column is used instead.
+        query = db.query(Conversation).filter(
             or_(
                 Conversation.user_one_id == user_id,
                 Conversation.user_two_id == user_id
@@ -72,23 +78,29 @@ class CRUDConversation(CRUDBase[Conversation, dict, dict]):
         )
 
         if not include_archived:
-            # Filter out archived for *this* user
             query = query.filter(
-                and_(
-                    # If user is user_one, check user_one archive flag; otherwise user_two
-                    or_(
-                        and_(Conversation.user_one_id == user_id, Conversation.is_archived_user_one == False),
-                        and_(Conversation.user_two_id == user_id, Conversation.is_archived_user_two == False)
+                or_(
+                    and_(
+                        Conversation.user_one_id == user_id,
+                        Conversation.is_archived_user_one == False  # noqa: E712
+                    ),
+                    and_(
+                        Conversation.user_two_id == user_id,
+                        Conversation.is_archived_user_two == False  # noqa: E712
                     )
                 )
             )
 
-        return query.order_by(
-            Conversation.last_message_at.desc().nullslast()
-        ).offset(skip).limit(limit).all()
+        return (
+            query
+            .order_by(Conversation.last_message_at.desc().nullslast())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
 
     def mark_read(self, db: Session, *, conversation_id: UUID, user_id: UUID) -> None:
-        """Zero out unread counter for the given user."""
+        """Zero out unread counter for the given user and mark all messages read."""
         convo = self.get(db, id=conversation_id)
         if not convo:
             return
@@ -98,14 +110,13 @@ class CRUDConversation(CRUDBase[Conversation, dict, dict]):
         else:
             convo.unread_count_user_two = 0
 
-        # Mark all messages as read
         db.query(Message).filter(
             and_(
                 Message.conversation_id == conversation_id,
                 Message.sender_id != user_id,
-                Message.is_read == False
+                Message.is_read == False  # noqa: E712
             )
-        ).update({"is_read": True, "read_at": datetime.utcnow()})
+        ).update({"is_read": True, "read_at": _utcnow()})
 
         db.commit()
 
@@ -118,10 +129,10 @@ class CRUDConversation(CRUDBase[Conversation, dict, dict]):
             convo.is_muted_user_one = not convo.is_muted_user_one
             db.commit()
             return convo.is_muted_user_one
-        else:
-            convo.is_muted_user_two = not convo.is_muted_user_two
-            db.commit()
-            return convo.is_muted_user_two
+
+        convo.is_muted_user_two = not convo.is_muted_user_two
+        db.commit()
+        return convo.is_muted_user_two
 
     def archive_toggle(self, db: Session, *, conversation_id: UUID, user_id: UUID) -> bool:
         convo = self.get(db, id=conversation_id)
@@ -132,14 +143,18 @@ class CRUDConversation(CRUDBase[Conversation, dict, dict]):
             convo.is_archived_user_one = not convo.is_archived_user_one
             db.commit()
             return convo.is_archived_user_one
-        else:
-            convo.is_archived_user_two = not convo.is_archived_user_two
-            db.commit()
-            return convo.is_archived_user_two
+
+        convo.is_archived_user_two = not convo.is_archived_user_two
+        db.commit()
+        return convo.is_archived_user_two
 
     def other_user_id(self, conversation: Conversation, current_user_id: UUID) -> UUID:
-        """Helper: given a conversation, return the *other* user's id."""
-        return conversation.user_two_id if conversation.user_one_id == current_user_id else conversation.user_one_id
+        """Return the other participant's id."""
+        return (
+            conversation.user_two_id
+            if conversation.user_one_id == current_user_id
+            else conversation.user_one_id
+        )
 
 
 # ============================================
@@ -154,23 +169,23 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
         sender_id: UUID,
         message_type: str = "text",
         content: Optional[str] = None,
-        media: Optional[Dict] = None,
+        media: Optional[dict] = None,
         reply_to_message_id: Optional[UUID] = None
     ) -> Message:
         # Validate conversation membership
         convo = conversation_crud.get(db, id=conversation_id)
         if not convo:
             raise NotFoundException("Conversation")
-
         if sender_id not in (convo.user_one_id, convo.user_two_id):
             raise ValidationException("You are not part of this conversation")
 
-        # Validate reply target if provided
+        # Validate reply target
         if reply_to_message_id:
             reply_msg = self.get(db, id=reply_to_message_id)
             if not reply_msg or reply_msg.conversation_id != conversation_id:
                 raise ValidationException("Reply target not in this conversation")
 
+        now = _utcnow()
         msg = Message(
             conversation_id=conversation_id,
             sender_id=sender_id,
@@ -180,14 +195,16 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
             reply_to_message_id=reply_to_message_id
         )
         db.add(msg)
-        db.flush()
+        db.flush()  # get msg.id without committing
 
         # ── update conversation metadata ──
-        convo.last_message_id = msg.id
-        convo.last_message_at = msg.created_at
-        convo.last_message_preview = (content or "")[:255] if message_type == "text" else f"[{message_type}]"
+        convo.last_message_id      = msg.id
+        convo.last_message_at      = now
+        convo.last_message_preview = (
+            (content or "")[:255] if message_type == "text" else f"[{message_type}]"
+        )
 
-        # Bump unread for the *other* user
+        # Bump unread counter for the other participant
         if convo.user_one_id == sender_id:
             convo.unread_count_user_two += 1
         else:
@@ -200,10 +217,13 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
     def get_messages(
         self, db: Session, *,
         conversation_id: UUID,
-        before_id: Optional[UUID] = None,   # cursor-based pagination
+        before_id: Optional[UUID] = None,
         limit: int = 40
     ) -> List[Message]:
-        """Newest-first page, optionally starting before a given message id."""
+        """
+        Cursor-based pagination — newest first.
+        Pass before_id to fetch the next page (messages older than that message).
+        """
         query = db.query(Message).options(
             joinedload(Message.sender)
         ).filter(
@@ -226,16 +246,19 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
         if msg.is_deleted:
             raise ValidationException("Already deleted")
 
-        msg.is_deleted = True
-        msg.deleted_at = datetime.utcnow()
+        msg.is_deleted    = True
+        msg.deleted_at    = _utcnow()
         msg.deleted_by_id = user_id
-        msg.content = None
-        msg.media = None
+        msg.content       = None
+        msg.media         = None
         db.commit()
         db.refresh(msg)
         return msg
 
-    def edit_message(self, db: Session, *, message_id: UUID, user_id: UUID, new_content: str) -> Message:
+    def edit_message(
+        self, db: Session, *,
+        message_id: UUID, user_id: UUID, new_content: str
+    ) -> Message:
         msg = self.get(db, id=message_id)
         if not msg:
             raise NotFoundException("Message")
@@ -246,32 +269,36 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
         if msg.message_type != "text":
             raise ValidationException("Can only edit text messages")
 
-        msg.content = new_content
+        msg.content   = new_content
         msg.is_edited = True
-        msg.edited_at = datetime.utcnow()
+        msg.edited_at = _utcnow()
         db.commit()
         db.refresh(msg)
         return msg
 
-    def add_reaction(self, db: Session, *, message_id: UUID, user_id: UUID, emoji: str) -> Message:
+    def add_reaction(
+        self, db: Session, *,
+        message_id: UUID, user_id: UUID, emoji: str
+    ) -> Message:
         msg = self.get(db, id=message_id)
         if not msg:
             raise NotFoundException("Message")
 
-        reactions: list = msg.reactions or []
+        reactions: list = list(msg.reactions or [])
 
-        # Toggle: remove if already reacted with same emoji, else add
+        # Toggle: remove if same emoji already present, else add
         existing_idx = next(
-            (i for i, r in enumerate(reactions) if r["user_id"] == str(user_id) and r["emoji"] == emoji),
+            (i for i, r in enumerate(reactions)
+             if r["user_id"] == str(user_id) and r["emoji"] == emoji),
             None
         )
         if existing_idx is not None:
             reactions.pop(existing_idx)
         else:
             reactions.append({
-                "user_id": str(user_id),
-                "emoji": emoji,
-                "reacted_at": datetime.utcnow().isoformat()
+                "user_id":    str(user_id),
+                "emoji":      emoji,
+                "reacted_at": _utcnow().isoformat()
             })
 
         msg.reactions = reactions
@@ -282,8 +309,8 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
     def mark_delivered(self, db: Session, *, message_id: UUID) -> None:
         msg = self.get(db, id=message_id)
         if msg and not msg.is_delivered:
-            msg.is_delivered = True
-            msg.delivered_at = datetime.utcnow()
+            msg.is_delivered  = True
+            msg.delivered_at  = _utcnow()
             db.commit()
 
 
@@ -294,7 +321,9 @@ class CRUDMessage(CRUDBase[Message, dict, dict]):
 class CRUDUserPresence(CRUDBase[UserPresence, dict, dict]):
 
     def get_or_create(self, db: Session, *, user_id: UUID) -> UserPresence:
-        presence = db.query(UserPresence).filter(UserPresence.user_id == user_id).first()
+        presence = db.query(UserPresence).filter(
+            UserPresence.user_id == user_id
+        ).first()
         if not presence:
             presence = UserPresence(user_id=user_id)
             db.add(presence)
@@ -307,10 +336,10 @@ class CRUDUserPresence(CRUDBase[UserPresence, dict, dict]):
         user_id: UUID, is_online: bool,
         status: str = "online", device_type: Optional[str] = None
     ) -> UserPresence:
-        presence = self.get_or_create(db, user_id=user_id)
-        presence.is_online = is_online
-        presence.status = status
-        presence.last_seen_at = datetime.utcnow()
+        presence              = self.get_or_create(db, user_id=user_id)
+        presence.is_online    = is_online
+        presence.status       = status
+        presence.last_seen_at = _utcnow()
         if device_type:
             presence.device_type = device_type
         db.commit()
@@ -327,7 +356,10 @@ class CRUDUserPresence(CRUDBase[UserPresence, dict, dict]):
 
 class CRUDTypingIndicator(CRUDBase[TypingIndicator, dict, dict]):
 
-    def start_typing(self, db: Session, *, conversation_id: UUID, user_id: UUID) -> None:
+    def start_typing(
+        self, db: Session, *, conversation_id: UUID, user_id: UUID
+    ) -> None:
+        from datetime import timedelta
         existing = db.query(TypingIndicator).filter(
             and_(
                 TypingIndicator.conversation_id == conversation_id,
@@ -335,7 +367,7 @@ class CRUDTypingIndicator(CRUDBase[TypingIndicator, dict, dict]):
             )
         ).first()
 
-        expires = datetime.utcnow() + timedelta(seconds=5)
+        expires = _utcnow() + timedelta(seconds=5)
 
         if existing:
             existing.expires_at = expires
@@ -347,7 +379,9 @@ class CRUDTypingIndicator(CRUDBase[TypingIndicator, dict, dict]):
             ))
         db.commit()
 
-    def stop_typing(self, db: Session, *, conversation_id: UUID, user_id: UUID) -> None:
+    def stop_typing(
+        self, db: Session, *, conversation_id: UUID, user_id: UUID
+    ) -> None:
         db.query(TypingIndicator).filter(
             and_(
                 TypingIndicator.conversation_id == conversation_id,
@@ -357,15 +391,15 @@ class CRUDTypingIndicator(CRUDBase[TypingIndicator, dict, dict]):
         db.commit()
 
     def cleanup_expired(self, db: Session) -> None:
-        """Purge rows whose expires_at < now.  Run on a schedule or per-request."""
+        """Purge stale rows. Run on a schedule (Celery beat) or per-request."""
         db.query(TypingIndicator).filter(
-            TypingIndicator.expires_at < datetime.utcnow()
+            TypingIndicator.expires_at < _utcnow()
         ).delete()
         db.commit()
 
 
 # Singletons
 conversation_crud = CRUDConversation(Conversation)
-message_crud = CRUDMessage(Message)
-presence_crud = CRUDUserPresence(UserPresence)
-typing_crud = CRUDTypingIndicator(TypingIndicator)
+message_crud      = CRUDMessage(Message)
+presence_crud     = CRUDUserPresence(UserPresence)
+typing_crud       = CRUDTypingIndicator(TypingIndicator)

@@ -11,6 +11,7 @@ from app.schemas.reviews_schema import (
     ReviewResponseCreate, ReviewResponseUpdate, ReviewResponseOut,
     ReviewFlagCreate,
     ReviewModerationUpdate,
+    REVIEWABLE_TYPES,
 )
 from app.services.review_service import (
     review_service,
@@ -23,46 +24,69 @@ router = APIRouter()
 
 
 # ============================================
+# REVIEWS — MY REVIEWS
+# NOTE: /mine MUST be declared before /{review_id} to prevent FastAPI
+#       from treating the literal string "mine" as a UUID parameter.
+# ============================================
+
+@router.get("/mine", response_model=list[ReviewOut])
+async def list_my_reviews(
+    reviewable_type: str | None = Query(None),
+    skip:  int = Query(0,  ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_active_user),
+):
+    """All reviews the current user has left, optionally filtered by entity type."""
+    return review_service.list_my_reviews(
+        db,
+        reviewer_id=user.id,
+        reviewable_type=reviewable_type,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# ============================================
 # REVIEWS — CRUD
 # ============================================
 
 @router.post("", response_model=ReviewOut, status_code=201)
-def create_review(
+async def create_review(
     payload: ReviewCreate,
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_active_user),
 ):
     """
-    Submit a review.  Requires a completed transaction (context_id) with the target entity.
+    Submit a review.  Requires a completed transaction (context_id) with the target.
     Rating breakdown keys are validated against the reviewable_type.
     """
-    review = review_service.create_review(db, reviewer=user, payload=payload)
-    return review
+    return review_service.create_review(db, reviewer=user, payload=payload)
 
 
 @router.get("/{review_id}", response_model=ReviewOut)
-def get_review(
+async def get_review(
     review_id: UUID,
     db: Session = Depends(get_db),
-    _:  User    = Depends(get_current_user),      # auth required, any status
+    _:  User    = Depends(get_current_user),
 ):
     """Fetch a single review by ID."""
     return review_service.get_review(db, review_id=review_id)
 
 
 @router.put("/{review_id}", response_model=ReviewOut)
-def update_review(
+async def update_review(
     review_id: UUID,
     payload:   ReviewUpdate,
     db:        Session = Depends(get_db),
     user:      User    = Depends(get_current_active_user),
 ):
-    """Update your own review."""
+    """Update your own review (only content fields; context/target are immutable)."""
     return review_service.update_review(db, reviewer=user, review_id=review_id, payload=payload)
 
 
 @router.delete("/{review_id}", status_code=204)
-def delete_review(
+async def delete_review(
     review_id: UUID,
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_active_user),
@@ -76,7 +100,7 @@ def delete_review(
 # ============================================
 
 @router.get("/entity/{reviewable_type}/{reviewable_id}", response_model=ReviewListOut)
-def list_reviews_for_entity(
+async def list_reviews_for_entity(
     reviewable_type: str,
     reviewable_id:   UUID,
     sort_by:  str = Query("created_at", enum=["created_at", "rating", "helpful_count"]),
@@ -87,8 +111,12 @@ def list_reviews_for_entity(
 ):
     """
     List + aggregate stats for a reviewable entity.
-    No auth required — public listing.
+    No auth required — public endpoint.
     """
+    if reviewable_type not in REVIEWABLE_TYPES:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail=f"Invalid reviewable_type: {reviewable_type}")
+
     return review_service.list_reviews(
         db,
         reviewable_type=reviewable_type,
@@ -101,33 +129,11 @@ def list_reviews_for_entity(
 
 
 # ============================================
-# REVIEWS — MY REVIEWS
-# ============================================
-
-@router.get("/mine", response_model=list[ReviewOut])
-def list_my_reviews(
-    reviewable_type: str | None = Query(None),
-    skip:  int = Query(0,  ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    db:   Session = Depends(get_db),
-    user: User    = Depends(get_current_active_user),
-):
-    """All reviews the current user has left."""
-    return review_service.list_my_reviews(
-        db,
-        reviewer_id=user.id,
-        reviewable_type=reviewable_type,
-        skip=skip,
-        limit=limit,
-    )
-
-
-# ============================================
 # REVIEWS — FLAG
 # ============================================
 
 @router.post("/{review_id}/flag", response_model=ReviewOut)
-def flag_review(
+async def flag_review(
     review_id: UUID,
     payload:   ReviewFlagCreate,
     db:   Session = Depends(get_db),
@@ -142,7 +148,7 @@ def flag_review(
 # ============================================
 
 @router.post("/{review_id}/vote", response_model=HelpfulVoteOut)
-def vote_helpful(
+async def vote_helpful(
     review_id: UUID,
     payload:   HelpfulVoteCreate,
     db:   Session = Depends(get_db),
@@ -150,7 +156,7 @@ def vote_helpful(
 ):
     """
     Toggle helpful / unhelpful vote on a review.
-    Posting the same value again removes the vote (toggle off).
+    Posting the same value again removes the vote (toggle).
     Cannot vote on your own reviews.
     """
     return helpful_vote_service.vote(db, voter=user, review_id=review_id, payload=payload)
@@ -161,29 +167,33 @@ def vote_helpful(
 # ============================================
 
 @router.post("/{review_id}/response", response_model=ReviewResponseOut, status_code=201)
-def create_response(
+async def create_response(
     review_id: UUID,
     payload:   ReviewResponseCreate,
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_active_user),
 ):
     """Business owner posts a reply to a review. One response per review."""
-    return review_response_service.create_response(db, review_id=review_id, responder=user, payload=payload)
+    return review_response_service.create_response(
+        db, review_id=review_id, responder=user, payload=payload
+    )
 
 
 @router.put("/{review_id}/response", response_model=ReviewResponseOut)
-def update_response(
+async def update_response(
     review_id: UUID,
     payload:   ReviewResponseUpdate,
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_active_user),
 ):
     """Update existing business response."""
-    return review_response_service.update_response(db, review_id=review_id, responder=user, payload=payload)
+    return review_response_service.update_response(
+        db, review_id=review_id, responder=user, payload=payload
+    )
 
 
 @router.delete("/{review_id}/response", status_code=204)
-def delete_response(
+async def delete_response(
     review_id: UUID,
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_active_user),
@@ -193,15 +203,17 @@ def delete_response(
 
 
 # ============================================
-# MODERATION  (admin)
+# MODERATION — admin only
 # ============================================
 
-@router.put("/admin/{review_id}/moderate", response_model=ReviewOut)
-def moderate_review(
+@router.put("/{review_id}/moderate", response_model=ReviewOut)
+async def moderate_review(
     review_id: UUID,
     payload:   ReviewModerationUpdate,
-    db:   Session = Depends(get_db),
-    admin: User   = Depends(require_admin),
+    db:    Session = Depends(get_db),
+    admin: User    = Depends(require_admin),
 ):
     """Approve or remove a flagged review. Admin only."""
-    return moderation_service.moderate(db, moderator=admin, review_id=review_id, payload=payload)
+    return moderation_service.moderate(
+        db, moderator=admin, review_id=review_id, payload=payload
+    )

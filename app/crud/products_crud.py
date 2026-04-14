@@ -50,10 +50,9 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             sort_by: str = "created_at",
             skip: int = 0,
             limit: int = 20
+            # lga_id intentionally omitted — Blueprint §3: no LGA filtering
     ) -> List[Product]:
-        # FIX: Use joinedload to prevent N+1 queries — loads vendor + business in 1 query
         query = db.query(Product).options(
-            joinedload(Product.vendor).joinedload(ProductVendor.business),
             joinedload(Product.variants)
         ).filter(Product.is_active == True)
 
@@ -91,12 +90,22 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
 
         if location:
             lat, lng = location
-            query = query.join(ProductVendor).join(Business).filter(
-                func.ST_DWithin(
-                    Business.location,
-                    func.ST_SetSRID(func.ST_MakePoint(lng, lat), 4326),
-                    radius_km * 1000
+            point = func.ST_SetSRID(func.ST_MakePoint(lng, lat), 4326)
+            query = query.join(Product.vendor).join(ProductVendor.business).options(
+                joinedload(Product.vendor).joinedload(ProductVendor.business)
+            ).filter(
+                or_(
+                    Business.location.is_(None),
+                    func.ST_DWithin(
+                        Business.location,
+                        point,
+                        radius_km * 1000
+                    )
                 )
+            )
+        else:
+            query = query.options(
+                joinedload(Product.vendor).joinedload(ProductVendor.business)
             )
 
         if sort_by == "price_asc":
@@ -155,9 +164,7 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             db.query(Product).filter(Product.id == product_id).update(
                 {Product.stock_quantity: Product.stock_quantity - quantity}
             )
-        # FIX: Removed db.commit() — caller owns the transaction
 
-    # FIX: Added restore_stock() — required by safe checkout flow
     def restore_stock(
             self, db: Session, *,
             product_id: UUID,
@@ -203,7 +210,6 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             Product.stock_quantity <= Product.low_stock_threshold
         ).scalar() or 0
 
-        # Revenue + order count from order items
         revenue_result = db.query(
             func.sum(OrderItem.total_price),
             func.count(func.distinct(OrderItem.order_id))
@@ -212,7 +218,6 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
         total_revenue = revenue_result[0] or Decimal('0.00')
         total_orders = revenue_result[1] or 0
 
-        # Top 5 products by sales
         top_products = db.query(
             Product.id,
             Product.name,
@@ -259,11 +264,32 @@ class CRUDCart(CRUDBase[CartItem, dict, dict]):
             joinedload(CartItem.variant)
         ).filter(CartItem.customer_id == customer_id).all()
 
+    def get_cart_item_with_relations(
+            self, db: Session, *, cart_item_id: UUID
+    ) -> Optional[CartItem]:
+        """
+        Reload a single cart item with product (+ vendor) and variant eagerly loaded.
+
+        Used after add/update operations so the router can compute item_total and
+        build a complete CartItemResponse dict without triggering lazy-load or a
+        detached-instance error. Always call this before building the response —
+        never pass a post-refresh CartItem directly to the serializer.
+        """
+        return db.query(CartItem).options(
+            joinedload(CartItem.product).joinedload(Product.vendor),
+            joinedload(CartItem.variant)
+        ).filter(CartItem.id == cart_item_id).first()
+
     def add_to_cart(
             self, db: Session, *,
             customer_id: UUID, product_id: UUID,
             variant_id: Optional[UUID] = None, quantity: int = 1
     ) -> CartItem:
+        """
+        Insert or increment a cart item. Returns the raw CartItem after commit.
+        Callers should follow up with get_cart_item_with_relations() to build the
+        full response — this method intentionally stays narrow (persist only).
+        """
         existing = db.query(CartItem).filter(and_(
             CartItem.customer_id == customer_id,
             CartItem.product_id == product_id,
@@ -288,6 +314,11 @@ class CRUDCart(CRUDBase[CartItem, dict, dict]):
         return cart_item
 
     def update_quantity(self, db: Session, *, cart_item_id: UUID, quantity: int) -> CartItem:
+        """
+        Update quantity. Returns raw CartItem after commit.
+        Callers should follow up with get_cart_item_with_relations() to build the
+        full response.
+        """
         cart_item = self.get(db, id=cart_item_id)
         if not cart_item:
             raise NotFoundException("Cart item")
@@ -337,7 +368,6 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
                 if not variant:
                     raise NotFoundException(f"Variant {variant_id}")
                 unit_price = variant.price
-                # FIX: Safe product_snapshot using explicit dict (not __dict__ which crashes)
                 product_snapshot = {
                     "id": str(product.id),
                     "name": product.name,
@@ -400,7 +430,6 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         for item_data in order_items_data:
             order_item = OrderItem(order_id=order.id, **item_data)
             db.add(order_item)
-            # FIX: reduce_stock no longer commits — all part of the same transaction
             product_crud.reduce_stock(
                 db,
                 product_id=item_data['product_id'],
@@ -408,7 +437,6 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
                 quantity=item_data['quantity']
             )
 
-        # FIX: Single commit for entire order creation — atomic
         db.commit()
         db.refresh(order)
         return order
@@ -482,7 +510,6 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         if order.order_status in ["delivered", "cancelled", "refunded"]:
             raise ValidationException(f"Cannot cancel order in '{order.order_status}' status")
 
-        # Restore stock for all items
         for item in order.items:
             product_crud.restore_stock(
                 db,

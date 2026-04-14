@@ -1,10 +1,36 @@
+"""
+app/schemas/hotels_schema.py
+
+Hotel module schemas per Blueprint v2.0 Section 11.1
+
+CHANGES:
+- Removed lga_id from search filters (replaced with location + radius)
+- Added BookingPaymentResponse for booking + payment data
+- Proper enum types for status fields
+"""
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional, List
 from datetime import date, time, datetime
 from decimal import Decimal
 from uuid import UUID
 
+from app.models.hotels_model import BookingStatusEnum, PaymentStatusEnum
 from app.schemas.common_schema import LocationSchema
+
+
+# ============================================
+# SHARED SUB-SCHEMAS
+# ============================================
+
+class AddOnItem(BaseModel):
+    """A single booking add-on"""
+    type: str = Field(..., description="e.g. breakfast, airport_transfer, spa")
+    quantity: int = Field(default=1, gt=0)
+    price: Optional[Decimal] = Field(None, ge=0)
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"type": "breakfast", "quantity": 2, "price": 5000}
+    })
 
 
 # ============================================
@@ -12,11 +38,10 @@ from app.schemas.common_schema import LocationSchema
 # ============================================
 
 class HotelCreateRequest(BaseModel):
-    """Create hotel request (admin/business)"""
     star_rating: Optional[int] = Field(None, ge=1, le=5)
     total_rooms: int = Field(..., gt=0)
     check_in_time: Optional[time] = time(14, 0)
-    check_out_time: Optional[time] = time(12, 0)
+    check_out_time: Optional[time] = time(11, 0)
     facilities: List[str] = Field(default_factory=list)
     policies: Optional[str] = None
     cancellation_policy: Optional[str] = None
@@ -26,7 +51,7 @@ class HotelCreateRequest(BaseModel):
             "star_rating": 4,
             "total_rooms": 50,
             "check_in_time": "14:00",
-            "check_out_time": "12:00",
+            "check_out_time": "11:00",
             "facilities": ["pool", "gym", "spa", "restaurant", "parking", "wifi"],
             "policies": "No smoking in rooms",
             "cancellation_policy": "Free cancellation up to 24 hours before check-in"
@@ -35,7 +60,6 @@ class HotelCreateRequest(BaseModel):
 
 
 class HotelResponse(BaseModel):
-    """Hotel response"""
     id: UUID
     business_id: UUID
     star_rating: Optional[int]
@@ -55,7 +79,6 @@ class HotelResponse(BaseModel):
 # ============================================
 
 class RoomTypeCreateRequest(BaseModel):
-    """Create room type request"""
     name: str = Field(..., min_length=2, max_length=100)
     description: Optional[str] = None
     bed_configuration: Optional[str] = None
@@ -86,7 +109,6 @@ class RoomTypeCreateRequest(BaseModel):
 
 
 class RoomTypeResponse(BaseModel):
-    """Room type response"""
     id: UUID
     hotel_id: UUID
     name: str
@@ -107,7 +129,6 @@ class RoomTypeResponse(BaseModel):
 
 
 class RoomTypeUpdateRequest(BaseModel):
-    """Update room type request"""
     name: Optional[str] = Field(None, min_length=2, max_length=100)
     description: Optional[str] = None
     base_price_per_night: Optional[Decimal] = Field(None, gt=0)
@@ -120,7 +141,6 @@ class RoomTypeUpdateRequest(BaseModel):
 # ============================================
 
 class BookingSearchRequest(BaseModel):
-    """Search available rooms"""
     check_in_date: date
     check_out_date: date
     number_of_guests: int = Field(..., gt=0)
@@ -131,13 +151,13 @@ class BookingSearchRequest(BaseModel):
     def validate_dates(cls, v, info):
         check_in = info.data.get('check_in_date')
         if check_in and v <= check_in:
-            raise ValueError('Check-out date must be after check-in date')
+            raise ValueError('check_out_date must be after check_in_date')
         return v
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "check_in_date": "2026-03-15",
-            "check_out_date": "2026-03-18",
+            "check_in_date": "2026-04-15",
+            "check_out_date": "2026-04-18",
             "number_of_guests": 2,
             "number_of_rooms": 1
         }
@@ -145,13 +165,12 @@ class BookingSearchRequest(BaseModel):
 
 
 class BookingCreateRequest(BaseModel):
-    """Create booking request"""
     room_type_id: UUID
     check_in_date: date
     check_out_date: date
     number_of_rooms: int = Field(default=1, gt=0)
     number_of_guests: int = Field(..., gt=0)
-    add_ons: List[dict] = Field(default_factory=list)
+    add_ons: List[AddOnItem] = Field(default_factory=list)
     special_requests: Optional[str] = None
 
     @field_validator('check_out_date')
@@ -159,19 +178,19 @@ class BookingCreateRequest(BaseModel):
     def validate_dates(cls, v, info):
         check_in = info.data.get('check_in_date')
         if check_in and v <= check_in:
-            raise ValueError('Check-out date must be after check-in date')
+            raise ValueError('check_out_date must be after check_in_date')
         return v
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "room_type_id": "123e4567-e89b-12d3-a456-426614174000",
-            "check_in_date": "2026-03-15",
-            "check_out_date": "2026-03-18",
+            "check_in_date": "2026-04-15",
+            "check_out_date": "2026-04-18",
             "number_of_rooms": 1,
             "number_of_guests": 2,
             "add_ons": [
-                {"type": "breakfast", "quantity": 2},
-                {"type": "airport_transfer", "quantity": 1}
+                {"type": "breakfast", "quantity": 2, "price": 5000},
+                {"type": "airport_transfer", "quantity": 1, "price": 15000}
             ],
             "special_requests": "High floor with city view preferred"
         }
@@ -179,7 +198,6 @@ class BookingCreateRequest(BaseModel):
 
 
 class BookingResponse(BaseModel):
-    """Booking response"""
     id: UUID
     hotel_id: UUID
     room_type_id: UUID
@@ -191,22 +209,21 @@ class BookingResponse(BaseModel):
     base_price: Decimal
     add_ons_price: Decimal
     total_price: Decimal
-    add_ons: List[dict]
+    add_ons: List[AddOnItem]
     special_requests: Optional[str]
-    status: str
-    payment_status: str
+    status: BookingStatusEnum
+    payment_status: PaymentStatusEnum
     check_in_form_completed: bool
     id_uploaded: bool
     created_at: datetime
 
-    # Nested data
     room_type: Optional[RoomTypeResponse] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class BookingListResponse(BaseModel):
-    """Simplified booking list response"""
+    """Simplified booking response for list views."""
     id: UUID
     hotel_name: str
     room_type_name: str
@@ -214,9 +231,40 @@ class BookingListResponse(BaseModel):
     check_out_date: date
     number_of_rooms: int
     total_price: Decimal
-    status: str
-    payment_status: str
+    status: BookingStatusEnum
+    payment_status: PaymentStatusEnum
     created_at: datetime
+
+
+class BookingPaymentResponse(BaseModel):
+    """
+    Response for booking creation with payment details.
+    
+    Includes booking record + transaction info + platform fee breakdown.
+    Per Blueprint Section 4.4: ₦100 platform fee for hotel bookings.
+    """
+    booking: BookingResponse
+    customer_transaction: dict  # WalletTransaction details
+    platform_fee: Decimal
+    total_paid: Decimal
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "booking": {
+                "id": "123e4567-e89b-12d3-a456-426614174000",
+                "total_price": 75000.00,
+                "status": "confirmed",
+                "payment_status": "paid",
+            },
+            "customer_transaction": {
+                "id": "987fcdeb-51a2-43d7-8c6f-123456789abc",
+                "amount": 75000.00,
+                "transaction_type": "debit",
+            },
+            "platform_fee": 100.00,
+            "total_paid": 75000.00,
+        }
+    })
 
 
 # ============================================
@@ -224,7 +272,6 @@ class BookingListResponse(BaseModel):
 # ============================================
 
 class ServiceRequestCreate(BaseModel):
-    """Create service request"""
     service_type: str = Field(..., min_length=2)
     description: Optional[str] = None
 
@@ -237,7 +284,6 @@ class ServiceRequestCreate(BaseModel):
 
 
 class ServiceRequestResponse(BaseModel):
-    """Service request response"""
     id: UUID
     booking_id: UUID
     service_type: str
@@ -254,13 +300,50 @@ class ServiceRequestResponse(BaseModel):
 # ============================================
 
 class HotelSearchFilters(BaseModel):
-    """Hotel search filters"""
-    location: Optional[LocationSchema] = None
-    radius_km: Optional[float] = Field(None, gt=0, le=50)
+    """
+    Hotel search filters - RADIUS-BASED ONLY.
+    
+    Per Blueprint Section 3: "Location model — Radius-based (default 5 km)
+    — no LGA dependency"
+    
+    LGA filtering has been removed completely.
+    """
+    # Primary: coordinate-based radius search
+    location: Optional[LocationSchema] = Field(
+        None,
+        description="User's location (lat/lng) - required for radius filtering"
+    )
+    radius_km: Optional[float] = Field(
+        None,
+        gt=0,
+        le=50,
+        description="Search radius in kilometers (default 5km, max 50km)"
+    )
+
+    # Content filters
     star_rating: Optional[int] = Field(None, ge=1, le=5)
     min_price: Optional[Decimal] = Field(None, ge=0)
     max_price: Optional[Decimal] = Field(None, ge=0)
-    facilities: Optional[List[str]] = None
+    facilities: Optional[List[str]] = Field(
+        None,
+        description="Required facilities (e.g. ['pool', 'gym', 'wifi'])"
+    )
+
+    # Availability check
     check_in_date: Optional[date] = None
     check_out_date: Optional[date] = None
     guests: Optional[int] = Field(None, gt=0)
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "location": {"latitude": 6.5244, "longitude": 3.3792},
+            "radius_km": 10.0,
+            "star_rating": 4,
+            "min_price": 20000,
+            "max_price": 100000,
+            "facilities": ["pool", "gym", "wifi"],
+            "check_in_date": "2026-04-15",
+            "check_out_date": "2026-04-18",
+            "guests": 2
+        }
+    })

@@ -1,3 +1,5 @@
+# app/schemas/products_schema.py
+
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
@@ -27,7 +29,6 @@ class VendorCreateRequest(BaseModel):
     })
 
 
-# FIX: Added VendorUpdateRequest (was missing — dashboard store settings had no update schema)
 class VendorUpdateRequest(BaseModel):
     store_name: Optional[str] = Field(None, min_length=3, max_length=255)
     store_description: Optional[str] = None
@@ -79,10 +80,10 @@ class ProductCreateRequest(BaseModel):
 
     @field_validator('sale_price')
     @classmethod
-    def validate_sale_price(cls, v, info):
-        base_price = info.data.get('base_price')
-        if v and base_price and v >= base_price:
-            raise ValueError('Sale price must be less than base price')
+    def sale_price_less_than_base(cls, v, info):
+        base = info.data.get('base_price')
+        if v and base and v >= base:
+            raise ValueError('sale_price must be less than base_price')
         return v
 
     model_config = ConfigDict(json_schema_extra={
@@ -98,7 +99,6 @@ class ProductCreateRequest(BaseModel):
     })
 
 
-# FIX: Added all missing update fields (category, subcategory, brand, videos were missing)
 class ProductUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=3, max_length=255)
     description: Optional[str] = None
@@ -117,7 +117,6 @@ class ProductUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
 
 
-# FIX: Added InventoryUpdateRequest for quick stock adjustments from dashboard
 class InventoryUpdateRequest(BaseModel):
     stock_quantity: int = Field(..., ge=0)
     low_stock_threshold: Optional[int] = Field(None, ge=0)
@@ -146,14 +145,12 @@ class ProductResponse(BaseModel):
     total_reviews: int
     is_active: bool
     created_at: datetime
-
     vendor: Optional[VendorResponse] = None
     in_stock: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
-# FIX: Added from_attributes=True and proper vendor_name handling
 class ProductListResponse(BaseModel):
     id: UUID
     name: str
@@ -190,7 +187,6 @@ class VariantCreateRequest(BaseModel):
     })
 
 
-# FIX: Added VariantUpdateRequest (variants couldn't be edited before)
 class VariantUpdateRequest(BaseModel):
     attributes: Optional[Dict[str, str]] = None
     price: Optional[Decimal] = Field(None, gt=0)
@@ -237,18 +233,33 @@ class CartItemResponse(BaseModel):
     variant: Optional[VariantResponse] = None
     item_total: Decimal
 
-    model_config = ConfigDict(from_attributes=True)
-
 
 class CartResponse(BaseModel):
     items: List[CartItemResponse]
     subtotal: Decimal
     total_items: int
 
+    model_config = ConfigDict(from_attributes=True)
+
 
 # ============================================
 # ORDER SCHEMAS
 # ============================================
+
+# FIX: Valid payment methods as a constant — validated both here and in service.
+# "wallet" is the only supported method currently (card top-up goes through
+# Paystack then wallet balance is used at checkout).
+VALID_PAYMENT_METHODS = {"wallet", "card"}
+
+# FIX: Valid order status values must match the DB enum exactly (all lowercase).
+# The crash `invalid input value for enum orderstatusenum: "PROCESSING"` is caused
+# by the service layer passing uppercase. These constants give a single source of
+# truth to reference from both the schema and the service/crud.
+VALID_ORDER_STATUSES = {"pending", "processing", "packed", "shipped", "delivered", "cancelled"}
+
+# FIX: Platform fee per blueprint §4.4 — ₦50 flat fee on every product order.
+PRODUCT_PLATFORM_FEE = Decimal("50")
+
 
 class OrderItemCreate(BaseModel):
     product_id: UUID
@@ -260,20 +271,41 @@ class OrderCreateRequest(BaseModel):
     items: List[OrderItemCreate]
     shipping_address: str = Field(..., min_length=10)
     shipping_location: Optional[LocationSchema] = None
-    recipient_name: str = Field(..., min_length=2, max_length=200)
-    recipient_phone: str = Field(..., min_length=10, max_length=20)
+    # Optional — resolved from CustomerProfile if not supplied.
+    # Provide them to override the profile values (e.g. ordering for someone else).
+    recipient_name: Optional[str] = Field(None, min_length=2, max_length=200)
+    recipient_phone: Optional[str] = Field(None, min_length=10, max_length=20)
     notes: Optional[str] = None
-    payment_method: str = "wallet"
-    # FIX: Added coupon_code to checkout (blueprint: promo codes at checkout)
+    payment_method: str = Field(default="wallet")
     coupon_code: Optional[str] = None
+
+    # FIX: Validate payment_method — previously accepted any garbage string,
+    # which would fail silently deep in the service rather than at input boundary.
+    @field_validator("payment_method")
+    @classmethod
+    def validate_payment_method(cls, v: str) -> str:
+        if v not in VALID_PAYMENT_METHODS:
+            raise ValueError(
+                f"payment_method must be one of: {', '.join(sorted(VALID_PAYMENT_METHODS))}"
+            )
+        return v
+
+    # FIX: Guard empty items list — service would process it silently
+    # and produce an order with ₦0 total and no items.
+    @field_validator("items")
+    @classmethod
+    def items_not_empty(cls, v: list) -> list:
+        if not v:
+            raise ValueError("Order must contain at least one item")
+        return v
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "items": [{"product_id": "123e4567-e89b-12d3-a456-426614174000", "quantity": 2}],
             "shipping_address": "123 Main Street, Garki, Abuja",
-            "recipient_name": "John Doe",
-            "recipient_phone": "+2348012345678",
-            "payment_method": "wallet"
+            "payment_method": "wallet",
+            # recipient_name and recipient_phone are optional —
+            # omit them to use the values from your profile
         }
     })
 
@@ -301,9 +333,16 @@ class OrderResponse(BaseModel):
     shipping_fee: Decimal
     tax: Decimal
     discount: Decimal
+    # FIX: Blueprint §4.4 — ₦50 flat fee on every product transaction.
+    # Must be visible in checkout summary before user confirms. Default to
+    # PRODUCT_PLATFORM_FEE so existing orders without the column still serialise.
+    platform_fee: Decimal = PRODUCT_PLATFORM_FEE
     total_amount: Decimal
     coupon_code: Optional[str]
     payment_method: Optional[str]
+    # FIX: Use Optional[str] with None default so that if the ORM returns
+    # a Python Enum object, Pydantic coerces it via __str__ on the .value.
+    # The real fix for enum serialisation is use_enum_values=True below.
     payment_status: str
     order_status: str
     tracking_number: Optional[str]
@@ -312,7 +351,11 @@ class OrderResponse(BaseModel):
     created_at: datetime
     items: List[OrderItemResponse]
 
-    model_config = ConfigDict(from_attributes=True)
+    # FIX: use_enum_values=True — when SQLAlchemy returns a Python Enum member
+    # (e.g. <OrderStatusEnum.processing: 'processing'>), Pydantic v2 will extract
+    # its .value ('processing') automatically instead of stringifying the whole
+    # object which produces "OrderStatusEnum.processing".
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
 class OrderListResponse(BaseModel):
@@ -323,8 +366,10 @@ class OrderListResponse(BaseModel):
     total_items: int
     created_at: datetime
 
+    # FIX: Same use_enum_values fix as OrderResponse.
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
-# FIX: Added OrderStatusUpdateRequest — vendor can now update order to any valid state
+
 class OrderStatusUpdateRequest(BaseModel):
     status: str = Field(..., description="New order status")
     tracking_number: Optional[str] = None
@@ -332,21 +377,53 @@ class OrderStatusUpdateRequest(BaseModel):
 
     @field_validator('status')
     @classmethod
-    def validate_status(cls, v):
-        valid = ["processing", "packed", "shipped", "delivered", "cancelled"]
-        if v not in valid:
-            raise ValueError(f"Status must be one of: {', '.join(valid)}")
+    def validate_status(cls, v: str) -> str:
+        # FIX: Normalise to lowercase before validation so "Processing" / "PROCESSING"
+        # are accepted from the client without crashing the DB enum insert.
+        v = v.lower().strip()
+        # "pending" excluded — that's the initial state set by the service on creation;
+        # a vendor cannot manually move an order back to pending.
+        vendor_allowed = {"processing", "packed", "shipped", "delivered", "cancelled"}
+        if v not in vendor_allowed:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(vendor_allowed))}"
+            )
         return v
 
 
-# FIX: Added ReturnRequest schema (blueprint: Returns & Refunds)
 class ReturnRequest(BaseModel):
     reason: str = Field(..., min_length=10, max_length=500)
-    items: List[UUID] = Field(..., description="List of order item IDs to return")
+    items: List[UUID] = Field(..., description="Order item IDs to return")
     photos: List[str] = Field(default_factory=list)
 
+    # FIX: Guard empty items list — a return with no items is meaningless.
+    @field_validator("items")
+    @classmethod
+    def items_not_empty(cls, v: list) -> list:
+        if not v:
+            raise ValueError("Return request must specify at least one item")
+        return v
 
-# FIX: Added WishlistResponse schema (model existed, schema was missing)
+
+class ReturnResponse(BaseModel):
+    """
+    Response returned after a return request is submitted.
+    Blueprint §11.4: in-app return/refund request flow.
+    """
+    id: UUID
+    order_id: UUID
+    reason: str
+    photos: List[str]
+    status: str  # "pending" | "approved" | "rejected"
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
+
+
+# ============================================
+# WISHLIST SCHEMAS
+# ============================================
+
 class WishlistItemResponse(BaseModel):
     id: UUID
     product_id: UUID
@@ -360,12 +437,22 @@ class WishlistResponse(BaseModel):
     items: List[WishlistItemResponse]
     total: int
 
+    model_config = ConfigDict(from_attributes=True)
+
 
 # ============================================
-# SEARCH & ANALYTICS SCHEMAS
+# SEARCH FILTERS
 # ============================================
 
 class ProductSearchFilters(BaseModel):
+    """
+    Filters for product discovery.
+
+    Blueprint §3.1: radius-based search ONLY — no LGA filtering anywhere.
+    lga_id has been removed. Location is resolved from user GPS + radius_km
+    (default 5 km per blueprint §3.1). Pass latitude/longitude inside the
+    location object.
+    """
     query: Optional[str] = None
     category: Optional[str] = None
     subcategory: Optional[str] = None
@@ -375,15 +462,43 @@ class ProductSearchFilters(BaseModel):
     in_stock_only: bool = False
     sort_by: Optional[str] = "created_at"
     location: Optional[LocationSchema] = None
-    radius_km: Optional[float] = Field(None, gt=0)
+    # FIX: Default is None (resolved in router as 5.0 per blueprint §3.1).
+    # Max cap stays at 50 km per blueprint slider maximum.
+    radius_km: Optional[float] = Field(None, gt=0, le=50)
+    # lga_id intentionally omitted — Blueprint §3: no LGA filtering
+
+    # FIX: Validate sort_by to prevent SQL injection via unsanitised column name.
+    @field_validator("sort_by")
+    @classmethod
+    def validate_sort_by(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return "created_at"
+        allowed = {"created_at", "base_price", "average_rating", "sales_count", "views_count"}
+        if v not in allowed:
+            raise ValueError(f"sort_by must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    # FIX: Validate price range — min must not exceed max.
+    @field_validator("max_price")
+    @classmethod
+    def max_gte_min(cls, v: Optional[Decimal], info) -> Optional[Decimal]:
+        min_p = info.data.get("min_price")
+        if v is not None and min_p is not None and v < min_p:
+            raise ValueError("max_price must be greater than or equal to min_price")
+        return v
 
 
-# FIX: Added VendorAnalyticsSummary for dashboard KPI cards
+# ============================================
+# ANALYTICS SCHEMAS
+# ============================================
+
 class TopProductSummary(BaseModel):
     product_id: UUID
     name: str
     sales_count: int
     revenue: Decimal
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class VendorAnalyticsSummary(BaseModel):
@@ -393,3 +508,5 @@ class VendorAnalyticsSummary(BaseModel):
     active_products: int
     low_stock_count: int
     top_products: List[TopProductSummary]
+
+    model_config = ConfigDict(from_attributes=True)

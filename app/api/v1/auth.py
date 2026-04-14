@@ -1,90 +1,76 @@
 """
 Authentication router for Localy.
 
-Endpoints
-─────────
-POST /auth/register/customer
-POST /auth/register/business
-POST /auth/register/rider
-POST /auth/register/admin       (admin-only)
+Blueprint v2.0 changes:
+- OAuth endpoints removed (/google, /apple)
+- PIN endpoints added
+- Biometric endpoints added
+- Registration updated for date_of_birth and terms_accepted
 
-POST /auth/login
-GET  /auth/me
+FIX: enable_biometric now enforces Blueprint rule:
+  "Biometric only available after PIN setup, never as a replacement"
+  A 403 is raised if the user has not set a PIN yet.
 
-POST /auth/verify-email         (token OTP sent to email)
-POST /auth/verify-phone         (OTP sent to phone)
-POST /auth/resend-otp           (re-send to email OR phone)
+FIX: verify_pin_endpoint — previously raised InvalidCredentialsException("Incorrect PIN")
+  which crashed with TypeError because InvalidCredentialsException.__init__ took no args.
+  Fixed in exceptions.py; the raise here now works correctly and is handled by
+  main.py's localy_exception_handler → clean 401 response.
 
-POST /auth/forgot-password      (send reset OTP — email or phone)
-POST /auth/verify-reset-otp     (validate OTP before allowing reset)
-POST /auth/reset-password       (set new password using verified OTP token)
-
-POST /auth/google               (Google ID token → JWT)
-POST /auth/apple                (Apple identity token → JWT)
-
-POST /auth/dev/verify-all       (dev-only: skip verification)
+FIX: change_pin_endpoint — auth_service.change_pin() raises InvalidCredentialsException
+  internally when the old PIN is wrong. Previously unhandled → 500. Now that
+  InvalidCredentialsException accepts a detail arg, FastAPI's exception handler
+  catches it and returns a proper 401.
 """
+import logging
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, status, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import Optional, Dict, Any
-from datetime import timedelta, datetime
-import secrets
 
+from app.config import settings
+from app.core.constants import UserType, UserStatus
 from app.core.database import get_db
-from app.core.security import (
-    create_access_token,
-    create_refresh_token,
-    generate_otp,
-    hash_password,
-    verify_password,
-)
 from app.core.exceptions import (
+    AlreadyExistsException,
     InvalidCredentialsException,
     NotFoundException,
     ValidationException,
-    AlreadyExistsException,
 )
-from app.core.constants import UserType, UserStatus
-from app.config import settings
+from app.crud.user_crud import user_crud
+from app.dependencies import get_current_user, get_current_user_optional
+from app.models.user_model import User
 from app.schemas.auth_schema import (
-    CustomerRegisterRequest,
-    BusinessRegisterRequest,
-    RiderRegisterRequest,
     AdminRegisterRequest,
+    BusinessRegisterRequest,
+    CustomerRegisterRequest,
+    ForgotPasswordRequest,
     LoginRequest,
+    PinLoginRequest,
+    RefreshTokenRequest,
+    RegisterRequest,
+    ResendOTPRequest,
+    ResetPasswordRequest,
+    RiderRegisterRequest,
+    SetupPinRequest,
+    VerifyPinRequest,
+    ChangePinRequest,
+    EnableBiometricRequest,
+    DisableBiometricRequest,
     VerifyEmailRequest,
     VerifyPhoneRequest,
-    ForgotPasswordRequest,
     VerifyResetOTPRequest,
-    ResetPasswordRequest,
-    GoogleAuthRequest,
-    AppleAuthRequest,
-    ResendOTPRequest,
 )
-from app.schemas.common_schema import SuccessResponse
-from app.crud.user_crud import user_crud
-from app.crud.wallet_crud import wallet_crud
-from app.dependencies import get_current_user, get_current_admin_user
-from app.models.user_model import User
-from app.core.email import email_service
-from app.core.sms import sms_service
-from app.core.oauth_service import google_oauth, apple_oauth
-import secrets as _s
-from app.schemas.auth_schema import RegisterRequest
-from app.core.security import decode_token, validate_password_strength
-from uuid import UUID
+from app.services.auth_service import auth_service
+from pydantic import BaseModel
 
-
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
+# ─── Serialisation helpers ────────────────────────────────────────────────────
 
 def _profile_data(user: User) -> Dict[str, Any]:
-    """Serialise user + type-specific profile into a flat dict."""
+    """Serialise user + type-specific profile."""
     data: Dict[str, Any] = {
         "id":                str(user.id),
         "email":             user.email,
@@ -93,20 +79,28 @@ def _profile_data(user: User) -> Dict[str, Any]:
         "status":            user.status.value,
         "is_email_verified": user.is_email_verified,
         "is_phone_verified": user.is_phone_verified,
+        "pin_set":           user.pin_hash is not None,
+        "biometric_enabled": user.biometric_enabled,
         "created_at":        user.created_at.isoformat() if user.created_at else None,
     }
 
     if user.user_type == UserType.CUSTOMER and user.customer_profile:
         p = user.customer_profile
-        data["profile"] = {
-            "first_name":      p.first_name,
-            "last_name":       p.last_name,
-            "profile_picture": p.profile_picture,
+        data["customer_profile"] = {
+            "id":               str(p.id),
+            "first_name":       p.first_name,
+            "last_name":        p.last_name,
+            "date_of_birth":    p.date_of_birth.isoformat() if p.date_of_birth else None,
+            "profile_picture":  p.profile_picture,
+            "bio":              p.bio,
+            "local_government": p.local_government,
+            "state":            p.state,
+            "country":          p.country or "Nigeria",
         }
-
     elif user.user_type == UserType.BUSINESS and user.business:
         b = user.business
-        data["profile"] = {
+        data["business_id"] = str(b.id)
+        data["business_profile"] = {
             "business_name":      b.business_name,
             "category":           b.category.value if b.category else None,
             "subcategory":        b.subcategory,
@@ -114,10 +108,10 @@ def _profile_data(user: User) -> Dict[str, Any]:
             "verification_badge": b.verification_badge.value if b.verification_badge else "none",
             "average_rating":     float(b.average_rating) if b.average_rating else 0.0,
         }
-
     elif user.user_type == UserType.RIDER and user.rider:
         r = user.rider
-        data["profile"] = {
+        data["rider_id"] = str(r.id)
+        data["rider_profile"] = {
             "first_name":     r.first_name,
             "last_name":      r.last_name,
             "vehicle_type":   r.vehicle_type,
@@ -125,9 +119,8 @@ def _profile_data(user: User) -> Dict[str, Any]:
             "is_online":      r.is_online,
             "average_rating": float(r.average_rating) if r.average_rating else 0.0,
         }
-
     elif user.user_type == UserType.ADMIN and user.admin:
-        data["profile"] = {
+        data["admin_profile"] = {
             "full_name": user.admin.full_name,
             "role":      user.admin.role,
         }
@@ -135,43 +128,25 @@ def _profile_data(user: User) -> Dict[str, Any]:
     return data
 
 
-def _tokens(user: User) -> Dict[str, Any]:
-    """Generate access + refresh tokens for a user."""
-    return {
-        "access_token":  create_access_token(subject=str(user.id)),
-        "refresh_token": create_refresh_token(subject=str(user.id)),
-        "token_type":    "bearer",
-        "expires_in":    settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-    }
+# ─── Unauthenticated OTP verify schemas ──────────────────────────────────────
+
+class VerifyEmailUnauthRequest(BaseModel):
+    """Supports both authenticated (JWT) and unauthenticated (identifier) verify."""
+    otp:        str
+    identifier: Optional[str] = None  # email — required when not authenticated
 
 
-def _get_user_name(user: User) -> str:
-    """Best-effort display name for notification templates."""
-    if user.customer_profile:
-        return user.customer_profile.first_name
-    if user.rider:
-        return user.rider.first_name
-    if user.business:
-        return user.business.business_name
-    if user.admin:
-        return user.admin.full_name
-    return user.email.split("@")[0]
+class VerifyPhoneUnauthRequest(BaseModel):
+    otp:        str
+    identifier: Optional[str] = None  # phone — required when not authenticated
 
 
-def _send_email_otp(user: User, otp: str):
-    """Fire email OTP (non-blocking — call from background task)."""
-    name = _get_user_name(user)
-    email_service.send_email_otp(user.email, name, otp)
+class ResendOTPUnauthRequest(BaseModel):
+    channel:    str = "both"
+    identifier: Optional[str] = None  # email or phone for unauthenticated resend
 
 
-def _send_phone_otp(user: User, otp: str):
-    """Fire SMS OTP (non-blocking — call from background task)."""
-    sms_service.send_otp(user.phone, otp)
-
-
-# ─────────────────────────────────────────────
-# REGISTRATION
-# ─────────────────────────────────────────────
+# ─── Registration ─────────────────────────────────────────────────────────────
 
 @router.post("/register/customer", status_code=status.HTTP_201_CREATED)
 def register_customer(
@@ -180,9 +155,6 @@ def register_customer(
     user_in: CustomerRegisterRequest,
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """Register as a customer. Sends OTP via chosen channel (email | phone | both)."""
-
-
     reg = RegisterRequest(
         user_type=UserType.CUSTOMER,
         email=user_in.email,
@@ -190,29 +162,24 @@ def register_customer(
         password=user_in.password,
         first_name=user_in.first_name,
         last_name=user_in.last_name,
+        date_of_birth=user_in.date_of_birth,
+        referral_code=user_in.referral_code,
         otp_channel=user_in.otp_channel,
+        terms_accepted=user_in.terms_accepted,
+        terms_version="v1.0",
     )
-
-    user = user_crud.create_user(db, obj_in=reg)
-    wallet_crud.create_wallet(db, user_id=user.id)
-
-    otp = user.phone_verification_otp  # generated in create_user
-
-    channel = user_in.otp_channel or "both"
-    if channel in ("email", "both"):
-        background_tasks.add_task(_send_email_otp, user, otp)
-    if channel in ("phone", "both"):
-        background_tasks.add_task(_send_phone_otp, user, otp)
-
+    user, channel = auth_service.register_user(
+        db, reg, background_tasks, otp_channel=user_in.otp_channel or "both"
+    )
     return {
         "success": True,
         "data": {
-            "user_id":   str(user.id),
-            "email":     user.email,
-            "phone":     user.phone,
-            "user_type": "customer",
+            "user_id":     str(user.id),
+            "email":       user.email,
+            "phone":       user.phone,
+            "user_type":   "customer",
             "otp_channel": channel,
-            "message": "Registration successful. Please verify your account using the OTP sent.",
+            "message":     "Registration successful. Please verify your account.",
         },
     }
 
@@ -224,9 +191,6 @@ def register_business(
     user_in: BusinessRegisterRequest,
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """Register as a business. Captures full business profile."""
-
-
     reg = RegisterRequest(
         user_type=UserType.BUSINESS,
         email=user_in.email,
@@ -248,18 +212,12 @@ def register_business(
         whatsapp=user_in.whatsapp,
         opening_hours=user_in.opening_hours,
         otp_channel=user_in.otp_channel,
+        terms_accepted=user_in.terms_accepted,
+        terms_version="v1.0",
     )
-
-    user = user_crud.create_user(db, obj_in=reg)
-    wallet_crud.create_wallet(db, user_id=user.id)
-
-    otp = user.phone_verification_otp
-    channel = user_in.otp_channel or "both"
-    if channel in ("email", "both"):
-        background_tasks.add_task(_send_email_otp, user, otp)
-    if channel in ("phone", "both"):
-        background_tasks.add_task(_send_phone_otp, user, otp)
-
+    user, channel = auth_service.register_user(
+        db, reg, background_tasks, otp_channel=user_in.otp_channel or "both"
+    )
     return {
         "success": True,
         "data": {
@@ -269,7 +227,7 @@ def register_business(
             "user_type":     "business",
             "business_name": user_in.business_name,
             "otp_channel":   channel,
-            "message": "Business registration successful. Please verify your account.",
+            "message":       "Business registration successful. Please verify your account.",
         },
     }
 
@@ -281,9 +239,6 @@ def register_rider(
     user_in: RiderRegisterRequest,
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """Register as a delivery rider."""
-
-
     reg = RegisterRequest(
         user_type=UserType.RIDER,
         email=user_in.email,
@@ -296,18 +251,12 @@ def register_rider(
         vehicle_color=user_in.vehicle_color,
         vehicle_model=user_in.vehicle_model,
         otp_channel=user_in.otp_channel,
+        terms_accepted=user_in.terms_accepted,
+        terms_version="v1.0",
     )
-
-    user = user_crud.create_user(db, obj_in=reg)
-    wallet_crud.create_wallet(db, user_id=user.id)
-
-    otp = user.phone_verification_otp
-    channel = user_in.otp_channel or "both"
-    if channel in ("email", "both"):
-        background_tasks.add_task(_send_email_otp, user, otp)
-    if channel in ("phone", "both"):
-        background_tasks.add_task(_send_phone_otp, user, otp)
-
+    user, channel = auth_service.register_user(
+        db, reg, background_tasks, otp_channel=user_in.otp_channel or "both"
+    )
     return {
         "success": True,
         "data": {
@@ -316,142 +265,327 @@ def register_rider(
             "phone":       user.phone,
             "user_type":   "rider",
             "otp_channel": channel,
-            "message": "Rider registration successful. Please verify your account.",
+            "message":     "Rider registration successful. Please verify your account.",
         },
     }
 
 
-@router.post("/register/admin", status_code=status.HTTP_201_CREATED)
-def register_admin(
-    *,
-    db: Session = Depends(get_db),
-    user_in: AdminRegisterRequest,
-    background_tasks: BackgroundTasks,
-    _: User = Depends(get_current_admin_user),  # super-admin only
-) -> dict:
-    reg = RegisterRequest(
-        user_type=UserType.ADMIN,
-        email=user_in.email,
-        phone=user_in.phone,
-        password=user_in.password,
-        full_name=user_in.full_name,
-        role=user_in.role,
-        otp_channel="email",
-    )
-
-    user = user_crud.create_user(db, obj_in=reg)
-    wallet_crud.create_wallet(db, user_id=user.id)
-
-    background_tasks.add_task(_send_email_otp, user, user.phone_verification_otp)
-
-    return {
-        "success": True,
-        "data": {
-            "user_id":   str(user.id),
-            "email":     user.email,
-            "user_type": "admin",
-            "message":   "Admin account created. Verification email sent.",
-        },
-    }
-
-
-# ─────────────────────────────────────────────
-# LOGIN
-# ─────────────────────────────────────────────
+# ─── Login ────────────────────────────────────────────────────────────────────
 
 @router.post("/login")
 def login(
     *,
     db: Session = Depends(get_db),
-    credentials: LoginRequest,
+    body: LoginRequest,
 ) -> dict:
-    """Authenticate with email + password. Returns JWT pair + profile."""
-    user = user_crud.authenticate(
-        db, email=credentials.email, password=credentials.password
+    user = auth_service.authenticate_user(
+        db, identifier=body.identifier, password=body.password
     )
-    if not user:
-        raise InvalidCredentialsException()
-
-    user = user_crud.get_with_profile(db, user_id=user.id)
-    user_crud.update_last_login(db, user=user)
-
     return {
         "success": True,
         "data": {
-            **_tokens(user),
-            "user": _profile_data(user),
+            **auth_service.issue_tokens(str(user.id)),
+            "user":    _profile_data(user),
+            "message": "Login successful.",
         },
     }
 
 
-# ─────────────────────────────────────────────
-# VERIFICATION
-# ─────────────────────────────────────────────
+# ─── PIN Management (Blueprint v2.0) ──────────────────────────────────────────
+
+@router.post("/setup-pin")
+def setup_pin(
+    *,
+    db: Session = Depends(get_db),
+    body: SetupPinRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """
+    Set up 4-digit PIN during onboarding.
+
+    Blueprint: "Set 4-digit transaction PIN (mandatory — enables wallet and payments)"
+    """
+    auth_service.setup_pin(db, user=current_user, pin=body.pin)
+    return {
+        "success": True,
+        "data": {"message": "PIN set successfully."},
+    }
+
+
+@router.post("/verify-pin")
+def verify_pin_endpoint(
+    *,
+    db: Session = Depends(get_db),
+    body: VerifyPinRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """
+    Verify PIN for wallet transactions.
+
+    Blueprint: "PIN is required for all wallet transactions, withdrawals,
+    and payments above ₦5,000"
+    """
+    is_valid = auth_service.verify_pin(db, user=current_user, pin=body.pin)
+    if not is_valid:
+        # InvalidCredentialsException is a LocalyException (HTTPException subclass).
+        # FastAPI's localy_exception_handler in main.py catches this and returns
+        # a structured 401 — no try/except needed here.
+        raise InvalidCredentialsException("Incorrect PIN.")
+
+    return {
+        "success": True,
+        "data": {"message": "PIN verified successfully."},
+    }
+
+
+@router.post("/change-pin")
+def change_pin_endpoint(
+    *,
+    db: Session = Depends(get_db),
+    body: ChangePinRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """
+    Change existing PIN.
+
+    auth_service.change_pin() raises InvalidCredentialsException("Incorrect PIN")
+    internally when the old PIN is wrong. With the fixed exception constructor
+    this propagates correctly and is handled by localy_exception_handler → 401.
+    """
+    auth_service.change_pin(
+        db, user=current_user, old_pin=body.old_pin, new_pin=body.new_pin
+    )
+    return {
+        "success": True,
+        "data": {"message": "PIN changed successfully."},
+    }
+
+
+@router.post("/pin-login")
+def pin_login(
+    *,
+    db: Session = Depends(get_db),
+    body: PinLoginRequest,
+) -> dict:
+    """
+    PIN login for quick access.
+
+    Blueprint: "PIN login (quick access after first session)"
+    """
+    user = auth_service.authenticate_with_pin(
+        db, identifier=body.identifier, pin=body.pin
+    )
+    return {
+        "success": True,
+        "data": {
+            **auth_service.issue_tokens(str(user.id)),
+            "user":    _profile_data(user),
+            "message": "Login successful.",
+        },
+    }
+
+
+@router.post("/request-pin-unlock")
+def request_pin_unlock_endpoint(
+    *,
+    db: Session = Depends(get_db),
+    body: dict,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Request SMS unlock code for locked PIN.
+
+    Blueprint: "5 wrong PIN attempts → 30-minute lockout → SMS unlock code"
+    """
+    identifier = body.get("identifier")
+    if not identifier:
+        raise ValidationException("Identifier required")
+
+    auth_service.request_pin_unlock(db, identifier=identifier, background_tasks=background_tasks)
+    return {
+        "success": True,
+        "data": {"message": "If that account exists, an unlock code has been sent via SMS."},
+    }
+
+
+@router.post("/unlock-pin")
+def unlock_pin_endpoint(
+    *,
+    db: Session = Depends(get_db),
+    body: dict,
+) -> dict:
+    """Unlock PIN using SMS OTP."""
+    identifier = body.get("identifier")
+    otp = body.get("otp")
+
+    if not identifier or not otp:
+        raise ValidationException("Identifier and OTP required")
+
+    auth_service.unlock_pin_with_otp(db, identifier=identifier, otp=otp)
+    return {
+        "success": True,
+        "data": {"message": "PIN unlocked successfully. You may now log in."},
+    }
+
+
+# ─── Biometric (Blueprint v2.0) ───────────────────────────────────────────────
+
+@router.post("/enable-biometric")
+def enable_biometric_endpoint(
+    *,
+    db: Session = Depends(get_db),
+    body: EnableBiometricRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """
+    Enable biometric authentication.
+
+    Blueprint: "Optional: enable biometric authentication (Face ID / fingerprint)
+    after PIN is set. Biometric only available after PIN setup, never as a
+    replacement — always falls back to PIN."
+
+    FIX: Enforce PIN-first rule. Biometric cannot be enabled without an
+    existing PIN hash on the account.
+    """
+    if not current_user.pin_hash:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must set up a PIN before enabling biometric authentication.",
+        )
+
+    auth_service.enable_biometric(db, user=current_user)
+    return {
+        "success": True,
+        "data": {"message": "Biometric authentication enabled."},
+    }
+
+
+@router.post("/disable-biometric")
+def disable_biometric_endpoint(
+    *,
+    db: Session = Depends(get_db),
+    body: DisableBiometricRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Disable biometric authentication."""
+    auth_service.disable_biometric(db, user=current_user)
+    return {
+        "success": True,
+        "data": {"message": "Biometric authentication disabled."},
+    }
+
+
+# ─── Token Refresh ────────────────────────────────────────────────────────────
+
+@router.post("/refresh")
+def refresh(*, body: RefreshTokenRequest) -> dict:
+    tokens = auth_service.refresh_access_token(body.refresh_token)
+    return {"success": True, "data": tokens}
+
+
+# ─── OTP Verification ─────────────────────────────────────────────────────────
 
 @router.post("/verify-email")
 def verify_email(
     *,
     db: Session = Depends(get_db),
-    body: VerifyEmailRequest,
-    current_user: User = Depends(get_current_user),
+    body: VerifyEmailUnauthRequest,
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ) -> dict:
-    """Verify email using the OTP sent to the user's email address."""
-    success = user_crud.verify_otp_code(
-        db, user=current_user, otp=body.otp, channel="email"
-    )
-    if not success:
-        raise ValidationException("Invalid or expired OTP")
+    """Verify email OTP — supports unauthenticated requests."""
+    user = current_user
+    if user is None:
+        if not body.identifier:
+            raise ValidationException("Provide either a Bearer token or an identifier")
+        user = user_crud.get_by_email(db, email=body.identifier)
+        if not user:
+            user = user_crud.get_by_phone(db, phone=body.identifier)
+        if not user:
+            raise ValidationException("Account not found")
 
-    return {"success": True, "data": {"message": "Email verified successfully."}}
+    auth_service.verify_otp(db, user=user, otp=body.otp, channel="email")
+
+    if user.is_email_verified and user.is_phone_verified:
+        if user.status == UserStatus.PENDING_VERIFICATION:
+            user.status = UserStatus.ACTIVE
+            db.commit()
+            db.refresh(user)
+
+    user_with_profile = user_crud.get_with_profile(db, user_id=user.id)
+    tokens = auth_service.issue_tokens(str(user.id))
+    return {
+        "success": True,
+        "data": {
+            **tokens,
+            "user":    _profile_data(user_with_profile),
+            "message": "Email verified successfully.",
+        },
+    }
 
 
 @router.post("/verify-phone")
 def verify_phone(
     *,
     db: Session = Depends(get_db),
-    body: VerifyPhoneRequest,
-    current_user: User = Depends(get_current_user),
+    body: VerifyPhoneUnauthRequest,
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ) -> dict:
-    """Verify phone using the OTP sent via SMS."""
-    success = user_crud.verify_otp_code(
-        db, user=current_user, otp=body.otp, channel="phone"
-    )
-    if not success:
-        raise ValidationException("Invalid or expired OTP")
+    """Verify phone OTP — supports unauthenticated requests."""
+    user = current_user
+    if user is None:
+        if not body.identifier:
+            raise ValidationException("Provide either a Bearer token or an identifier")
+        user = user_crud.get_by_phone(db, phone=body.identifier)
+        if not user:
+            user = user_crud.get_by_email(db, email=body.identifier)
+        if not user:
+            raise ValidationException("Account not found")
 
-    return {"success": True, "data": {"message": "Phone verified successfully."}}
+    auth_service.verify_otp(db, user=user, otp=body.otp, channel="phone")
+
+    if user.is_email_verified and user.is_phone_verified:
+        if user.status == UserStatus.PENDING_VERIFICATION:
+            user.status = UserStatus.ACTIVE
+            db.commit()
+            db.refresh(user)
+
+    user_with_profile = user_crud.get_with_profile(db, user_id=user.id)
+    tokens = auth_service.issue_tokens(str(user.id))
+    return {
+        "success": True,
+        "data": {
+            **tokens,
+            "user":    _profile_data(user_with_profile),
+            "message": "Phone verified successfully.",
+        },
+    }
 
 
 @router.post("/resend-otp")
 def resend_otp(
     *,
     db: Session = Depends(get_db),
-    body: ResendOTPRequest,
-    current_user: User = Depends(get_current_user),
+    body: ResendOTPUnauthRequest,
+    current_user: Optional[User] = Depends(get_current_user_optional),
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """
-    Re-generate and re-send OTP.
+    """Re-send OTP — works with or without auth token."""
+    user = current_user
+    if user is None:
+        if not body.identifier:
+            raise ValidationException("Provide either a Bearer token or an identifier")
+        user = user_crud.get_by_email(db, email=body.identifier)
+        if not user:
+            user = user_crud.get_by_phone(db, phone=body.identifier)
+        if not user:
+            raise ValidationException("Account not found")
 
-    body.channel: "email" | "phone" | "both"
-    """
-    otp = user_crud.regenerate_otp(db, user=current_user)
     channel = body.channel or "both"
-
-    if channel in ("email", "both"):
-        background_tasks.add_task(_send_email_otp, current_user, otp)
-    if channel in ("phone", "both"):
-        background_tasks.add_task(_send_phone_otp, current_user, otp)
-
-    return {
-        "success": True,
-        "data": {"message": f"OTP resent via {channel}."},
-    }
+    auth_service.resend_otp(db, user=user, channel=channel, background_tasks=background_tasks)
+    return {"success": True, "data": {"message": f"OTP resent via {channel}."}}
 
 
-# ─────────────────────────────────────────────
-# FORGOT / RESET PASSWORD
-# ─────────────────────────────────────────────
+# ─── Forgot / Reset Password ──────────────────────────────────────────────────
 
 @router.post("/forgot-password")
 def forgot_password(
@@ -460,40 +594,16 @@ def forgot_password(
     body: ForgotPasswordRequest,
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """
-    Initiate password reset.
-
-    Accepts email OR phone. Sends a 6-digit OTP via the
-    specified channel (email | phone | both).
-    Always returns 200 to prevent email/phone enumeration.
-    """
-    user: Optional[User] = None
-
-    if body.email:
-        user = user_crud.get_by_email(db, email=body.email)
-    elif body.phone:
-        user = user_crud.get_by_phone(db, phone=body.phone)
-
-    if user:
-        otp = user_crud.set_password_reset_otp(db, user=user)
-        channel = body.channel or ("email" if body.email else "phone")
-
-        if channel in ("email", "both") and user.email:
-            name = _get_user_name(user)
-            background_tasks.add_task(
-                email_service.send_password_reset_otp, user.email, name, otp
-            )
-        if channel in ("phone", "both") and user.phone:
-            background_tasks.add_task(
-                sms_service.send_password_reset, user.phone, otp
-            )
-
-    # Always return success to prevent enumeration attacks
+    auth_service.initiate_password_reset(
+        db,
+        email=body.email,
+        phone=body.phone,
+        channel=body.channel or ("email" if body.email else "phone"),
+        background_tasks=background_tasks,
+    )
     return {
         "success": True,
-        "data": {
-            "message": "If that account exists, a reset OTP has been sent."
-        },
+        "data": {"message": "If that account exists, a reset OTP has been sent."},
     }
 
 
@@ -503,29 +613,9 @@ def verify_reset_otp(
     db: Session = Depends(get_db),
     body: VerifyResetOTPRequest,
 ) -> dict:
-    """
-    Validate the password-reset OTP.
-    Returns a short-lived reset_token to be used in /reset-password.
-    """
-    user: Optional[User] = None
-
-    if body.email:
-        user = user_crud.get_by_email(db, email=body.email)
-    elif body.phone:
-        user = user_crud.get_by_phone(db, phone=body.phone)
-
-    if not user:
-        raise ValidationException("Invalid request")
-
-    if not user_crud.check_password_reset_otp(db, user=user, otp=body.otp):
-        raise ValidationException("Invalid or expired OTP")
-
-    # Issue a short-lived token (15 min) scoped to password reset
-    reset_token = create_access_token(
-        subject=str(user.id),
-        expires_delta=timedelta(minutes=15),
+    reset_token = auth_service.verify_reset_otp_and_issue_token(
+        db, email=body.email, phone=body.phone, otp=body.otp
     )
-
     return {
         "success": True,
         "data": {
@@ -541,166 +631,27 @@ def reset_password(
     db: Session = Depends(get_db),
     body: ResetPasswordRequest,
 ) -> dict:
-    """
-    Set a new password.
-    Requires the reset_token from /verify-reset-otp.
-    """
-    try:
-        payload  = decode_token(body.reset_token)
-        user_id  = UUID(payload["sub"])
-    except Exception:
-        raise ValidationException("Invalid or expired reset token")
-
-    user = user_crud.get(db, id=user_id)
-    if not user:
-        raise NotFoundException("User")
-
-    if not validate_password_strength(body.new_password):
-        raise ValidationException(
-            "Password must be at least 8 characters and include uppercase, "
-            "lowercase, and a digit."
-        )
-
-    user.password_hash = hash_password(body.new_password)
-    # Clear any lingering reset OTP
-    user.password_reset_otp     = None
-    user.password_reset_expires = None
-    db.commit()
-
+    auth_service.reset_password(
+        db, reset_token=body.reset_token, new_password=body.new_password
+    )
     return {
         "success": True,
         "data": {"message": "Password reset successfully. Please log in."},
     }
 
 
-# ─────────────────────────────────────────────
-# GOOGLE OAUTH
-# ─────────────────────────────────────────────
-
-@router.post("/google")
-async def auth_google(
-    *,
-    db: Session = Depends(get_db),
-    body: GoogleAuthRequest,
-) -> dict:
-    """
-    Authenticate via Google Sign-In.
-
-    Client sends the Google ID token obtained from the google_sign_in package.
-    Backend verifies it and either logs in the existing user or creates a new one.
-    """
-    user_info = await google_oauth.verify_id_token(body.id_token)
-    if not user_info:
-        raise InvalidCredentialsException("Invalid Google token")
-
-    # Look for existing user
-    user = user_crud.get_by_email(db, email=user_info.email)
-
-    if not user:
-        # Auto-register as customer (can be changed via profile later)
-
-        reg = RegisterRequest(
-            user_type=UserType.CUSTOMER,
-            email=user_info.email,
-            phone=body.phone or f"+000{_s.token_hex(4)}",  # placeholder — must be updated
-            password=_s.token_urlsafe(24),                  # random password
-            first_name=(user_info.name or "").split()[0] or "User",
-            last_name=" ".join((user_info.name or "").split()[1:]) or "",
-            oauth_provider="google",
-            oauth_provider_id=user_info.provider_id,
-        )
-        user = user_crud.create_oauth_user(db, obj_in=reg, avatar=user_info.avatar_url)
-        wallet_crud.create_wallet(db, user_id=user.id)
-    else:
-        # Link Google account if not already linked
-        user_crud.link_oauth(db, user=user, provider="google", provider_id=user_info.provider_id)
-
-    user = user_crud.get_with_profile(db, user_id=user.id)
-    user_crud.update_last_login(db, user=user)
-
-    return {
-        "success": True,
-        "data": {
-            **_tokens(user),
-            "user": _profile_data(user),
-            "is_new_user": not bool(user.is_email_verified),
-        },
-    }
-
-
-# ─────────────────────────────────────────────
-# APPLE SIGN-IN
-# ─────────────────────────────────────────────
-
-@router.post("/apple")
-async def auth_apple(
-    *,
-    db: Session = Depends(get_db),
-    body: AppleAuthRequest,
-) -> dict:
-    """
-    Authenticate via Apple Sign-In.
-
-    Client sends Apple identity_token + optional full_name (only on first sign-in).
-    """
-    user_info = await apple_oauth.verify_identity_token(
-        body.identity_token, full_name=body.full_name
-    )
-    if not user_info:
-        raise InvalidCredentialsException("Invalid Apple token")
-
-    user = user_crud.get_by_email(db, email=user_info.email)
-
-    if not user:
-
-        import secrets as _s
-
-        name_parts = (user_info.name or "").split()
-        reg = RegisterRequest(
-            user_type=UserType.CUSTOMER,
-            email=user_info.email,
-            phone=body.phone or f"+000{_s.token_hex(4)}",
-            password=_s.token_urlsafe(24),
-            first_name=name_parts[0] if name_parts else "User",
-            last_name=" ".join(name_parts[1:]) if len(name_parts) > 1 else "",
-            oauth_provider="apple",
-            oauth_provider_id=user_info.provider_id,
-        )
-        user = user_crud.create_oauth_user(db, obj_in=reg, avatar=None)
-        wallet_crud.create_wallet(db, user_id=user.id)
-    else:
-        user_crud.link_oauth(db, user=user, provider="apple", provider_id=user_info.provider_id)
-
-    user = user_crud.get_with_profile(db, user_id=user.id)
-    user_crud.update_last_login(db, user=user)
-
-    return {
-        "success": True,
-        "data": {
-            **_tokens(user),
-            "user": _profile_data(user),
-            "is_new_user": not bool(user.is_email_verified),
-        },
-    }
-
-
-# ─────────────────────────────────────────────
-# CURRENT USER INFO
-# ─────────────────────────────────────────────
+# ─── Current User ─────────────────────────────────────────────────────────────
 
 @router.get("/me")
 def get_me(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """Return full profile of the authenticated user."""
     user = user_crud.get_with_profile(db, user_id=current_user.id)
     return {"success": True, "data": _profile_data(user)}
 
 
-# ─────────────────────────────────────────────
-# DEV ONLY
-# ─────────────────────────────────────────────
+# ─── Dev Only ─────────────────────────────────────────────────────────────────
 
 @router.post("/dev/verify-all")
 def dev_verify_all(
@@ -708,9 +659,8 @@ def dev_verify_all(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """DEV ONLY — instantly verify email + phone and activate account."""
     if settings.APP_ENV == "production":
-        raise NotFoundException("Endpoint")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
     current_user.is_email_verified = True
     current_user.is_phone_verified = True
@@ -718,11 +668,12 @@ def dev_verify_all(
     db.commit()
     db.refresh(current_user)
 
+    tokens = auth_service.issue_tokens(str(current_user.id))
     return {
         "success": True,
         "data": {
-            "message":  "Verified and activated.",
-            "user_id":  str(current_user.id),
-            "email":    current_user.email,
+            **tokens,
+            "user":    _profile_data(current_user),
+            "message": "Verified and activated.",
         },
     }

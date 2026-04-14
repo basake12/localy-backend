@@ -42,33 +42,43 @@ class DeliveryCreateRequest(BaseModel):
 
     # Payment
     payment_method: str = "wallet"
-    cod_amount: Decimal = Field(default=0.00, ge=0)
+    cod_amount: Decimal = Field(default=Decimal("0.00"), ge=0)
 
-    @field_validator('order_type')
+    @field_validator("order_type")
     @classmethod
-    def validate_order_type(cls, v):
+    def validate_order_type(cls, v: str) -> str:
         valid_types = ["product", "food", "parcel", "document", "prescription"]
         if v not in valid_types:
-            raise ValueError(f'Invalid order type. Must be one of: {valid_types}')
+            raise ValueError(f"Invalid order type. Must be one of: {valid_types}")
         return v
 
-    model_config = ConfigDict(json_schema_extra={
-        "example": {
-            "order_type": "product",
-            "pickup_address": "TechHub Store, Wuse 2, Abuja",
-            "pickup_location": {"latitude": 9.0765, "longitude": 7.3986},
-            "pickup_contact_name": "Store Manager",
-            "pickup_contact_phone": "+2348012345678",
-            "dropoff_address": "123 Main St, Garki, Abuja",
-            "dropoff_location": {"latitude": 9.0574, "longitude": 7.4898},
-            "dropoff_contact_name": "John Doe",
-            "dropoff_contact_phone": "+2348087654321",
-            "package_description": "2 boxes of electronics",
-            "package_weight_kg": 5.5,
-            "is_fragile": True,
-            "payment_method": "wallet"
+    @field_validator("payment_method")
+    @classmethod
+    def validate_payment_method(cls, v: str) -> str:
+        valid_methods = ["wallet", "cod", "business_account"]
+        if v not in valid_methods:
+            raise ValueError(f"Invalid payment method. Must be one of: {valid_methods}")
+        return v
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "order_type": "product",
+                "pickup_address": "TechHub Store, Wuse 2, Abuja",
+                "pickup_location": {"latitude": 9.0765, "longitude": 7.3986},
+                "pickup_contact_name": "Store Manager",
+                "pickup_contact_phone": "+2348012345678",
+                "dropoff_address": "123 Main St, Garki, Abuja",
+                "dropoff_location": {"latitude": 9.0574, "longitude": 7.4898},
+                "dropoff_contact_name": "John Doe",
+                "dropoff_contact_phone": "+2348087654321",
+                "package_description": "2 boxes of electronics",
+                "package_weight_kg": 5.5,
+                "is_fragile": True,
+                "payment_method": "wallet",
+            }
         }
-    })
+    )
 
 
 class DeliveryResponse(BaseModel):
@@ -110,7 +120,7 @@ class DeliveryResponse(BaseModel):
 
 
 class DeliveryListResponse(BaseModel):
-    """Simplified delivery list"""
+    """Simplified delivery list item"""
     id: UUID
     tracking_code: str
     order_type: str
@@ -119,22 +129,25 @@ class DeliveryListResponse(BaseModel):
     status: str
     created_at: datetime
 
+    # FIX: was missing — caused ORM serialization to crash
+    model_config = ConfigDict(from_attributes=True)
+
 
 class DeliveryTrackingResponse(BaseModel):
     """Tracking update response"""
     id: UUID
     delivery_id: UUID
     status: str
-    location: Optional[Dict[str, float]]
-    address: Optional[str]
-    notes: Optional[str]
+    location: Optional[Dict[str, float]] = None
+    address: Optional[str] = None
+    notes: Optional[str] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class DeliveryDetailsResponse(BaseModel):
-    """Full delivery details with tracking"""
+    """Full delivery details with tracking history"""
     delivery: DeliveryResponse
     tracking_updates: List[DeliveryTrackingResponse]
     rider_info: Optional[Dict[str, Any]] = None
@@ -189,7 +202,7 @@ class RiderEarningsResponse(BaseModel):
 # ============================================
 
 class AssignRiderRequest(BaseModel):
-    """Admin assign rider to delivery"""
+    """Admin: manually assign rider to delivery"""
     rider_id: UUID
     delivery_id: UUID
 
@@ -223,11 +236,11 @@ class DeliveryZoneResponse(BaseModel):
 
 
 # ============================================
-# SEARCH FILTERS
+# SEARCH / FILTER SCHEMAS
 # ============================================
 
 class DeliverySearchFilters(BaseModel):
-    """Delivery search filters"""
+    """Delivery search / list filters"""
     status: Optional[str] = None
     order_type: Optional[str] = None
     date_from: Optional[datetime] = None
@@ -242,3 +255,44 @@ class RiderSearchFilters(BaseModel):
     radius_km: Optional[float] = Field(None, gt=0)
     vehicle_type: Optional[str] = None
     min_rating: Optional[Decimal] = Field(None, ge=0, le=5)
+
+
+# ============================================
+# QUOTE SCHEMA
+# ============================================
+
+class DeliveryQuoteRequest(BaseModel):
+    """Request a price quote before creating a delivery"""
+    pickup_location: LocationSchema
+    dropoff_location: LocationSchema
+    order_type: str
+
+    @field_validator("order_type")
+    @classmethod
+    def validate_order_type(cls, v: str) -> str:
+        valid_types = ["product", "food", "parcel", "document", "prescription"]
+        if v not in valid_types:
+            raise ValueError(f"Invalid order type. Must be one of: {valid_types}")
+        return v
+
+
+class DeliveryQuoteResponse(BaseModel):
+    """Price quote response"""
+    distance_km: Decimal
+    base_fee: Decimal
+    distance_fee: Decimal
+    total_fee: Decimal
+    estimated_duration_minutes: int
+
+# Alias for backward-compatible imports
+DeliveryOut = DeliveryResponse
+
+
+class EarningsSummaryOut(BaseModel):
+    total_earnings: float = 0.0
+    today_earnings: float = 0.0
+    week_earnings: float = 0.0
+    month_earnings: float = 0.0
+    total_deliveries: int = 0
+    completed_deliveries: int = 0
+    pending_payout: float = 0.0

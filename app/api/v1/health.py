@@ -2,8 +2,9 @@ from fastapi import APIRouter, Depends, Query, status, Body
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
+from pydantic import BaseModel, Field
 
 from app.core.database import get_db
 from app.dependencies import (
@@ -34,29 +35,85 @@ from app.crud.health_crud import (
 )
 from app.crud.business_crud import business_crud
 from app.models.user_model import User
+from app.models.health_model import (
+    LabResult, Consultation as ConsultModel,
+    DoctorSpecializationEnum
+)
 from app.core.exceptions import (
     NotFoundException, PermissionDeniedException, ValidationException
 )
 from geoalchemy2.elements import WKTElement
-from app.models.health_model import LabResult
 from sqlalchemy import func
-from app.models.health_model import Consultation as ConsultModel
-from app.models.health_model import DoctorSpecializationEnum
+import uuid as _uuid
 
 router = APIRouter()
 
+# ────────────────────────────────────────────
+# SHARED UTC HELPER
+# ────────────────────────────────────────────
+
+_UTC = timezone.utc
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now."""
+    return datetime.now(_UTC)
+
+
+# ────────────────────────────────────────────
+# INLINE REQUEST SCHEMAS FOR SIMPLE PAYLOADS
+# ────────────────────────────────────────────
+
+class PharmacySearchRequest(BaseModel):
+    query: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    radius_km: float = 20.0
+    city: Optional[str] = None
+    offers_delivery: Optional[bool] = None
+    offers_prescription_fulfillment: Optional[bool] = None
+
+
+class RatingRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+    review: Optional[str] = None
+
+
+class CancelRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+# FIX: mutable fields for PUT /pharmacies/products/{id} must come from body
+class PharmacyProductUpdateRequest(BaseModel):
+    price: Optional[Decimal] = Field(None, gt=0)
+    stock_quantity: Optional[int] = Field(None, ge=0)
+    is_available: Optional[bool] = None
+
 
 # ============================================
-# DOCTOR SEARCH & DISCOVERY (PUBLIC)
+# DOCTOR DISCOVERY (PUBLIC)
+# NOTE: Static sub-paths (/specializations, /my, /availability/my,
+#       /consultations/my) MUST be registered BEFORE /doctors/{doctor_id}
+#       to prevent FastAPI from routing them as path-param matches.
 # ============================================
 
-@router.post("/doctors/search", response_model=SuccessResponse[List[dict]])
+@router.get("/doctors/specializations", response_model=SuccessResponse[List[str]])
+def get_specializations() -> dict:
+    """List all supported doctor specializations."""
+    return {"success": True, "data": [s.value for s in DoctorSpecializationEnum]}
+
+
+@router.post(
+    "/doctors/search",
+    response_model=SuccessResponse[List[dict]]
+)
 def search_doctors(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     filters: DoctorSearchFilters,
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
-    """Search doctors by specialization, location, availability, fee"""
+    """Search doctors by specialization, location, availability, fee."""
     location = None
     if filters.location:
         location = (filters.location.latitude, filters.location.longitude)
@@ -80,61 +137,45 @@ def search_doctors(
 
 
 @router.get("/doctors/{doctor_id}", response_model=SuccessResponse[dict])
-def get_doctor_details(*, db: Session = Depends(get_db), doctor_id: UUID) -> dict:
-    """Get doctor profile with qualifications"""
+def get_doctor_details(
+    *, db: Session = Depends(get_db), doctor_id: UUID
+) -> dict:
     doctor = doctor_crud.get(db, id=doctor_id)
     if not doctor:
         raise NotFoundException("Doctor")
     return {"success": True, "data": doctor}
 
 
-@router.get("/doctors/{doctor_id}/slots", response_model=SuccessResponse[List[dict]])
+@router.get(
+    "/doctors/{doctor_id}/slots",
+    response_model=SuccessResponse[List[dict]]
+)
 def get_doctor_available_slots(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     doctor_id: UUID,
     target_date: date = Query(...)
 ) -> dict:
-    """Get available time slots for a doctor on a given date"""
-    slots = doctor_availability_crud.get_available_slots(db, doctor_id=doctor_id, target_date=target_date)
+    """Return available booking slots for a doctor on a given date."""
+    slots = doctor_availability_crud.get_available_slots(
+        db, doctor_id=doctor_id, target_date=target_date
+    )
     return {"success": True, "data": slots}
-
-
-@router.get("/doctors/specializations", response_model=SuccessResponse[List[str]])
-def get_specializations() -> dict:
-
-    return {"success": True, "data": [s.value for s in DoctorSpecializationEnum]}
 
 
 # ============================================
 # DOCTOR MANAGEMENT (BUSINESS)
+# Static paths first, then parameterised.
 # ============================================
 
-@router.post("/doctors", response_model=SuccessResponse[DoctorResponse], status_code=status.HTTP_201_CREATED)
-def create_doctor(
+@router.get(
+    "/doctors/my/profile",
+    response_model=SuccessResponse[DoctorResponse]
+)
+def get_my_doctor_profile(
     *, db: Session = Depends(get_db),
-    doctor_in: DoctorCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
-    if not business:
-        raise NotFoundException("Business")
-    if business.category != "health":
-        raise ValidationException("Only health category businesses can create doctor profiles")
-
-    data = doctor_in.model_dump()
-    data["business_id"] = business.id
-
-    if doctor_in.hospital_location:
-        data["hospital_location"] = WKTElement(
-            f"POINT({doctor_in.hospital_location.longitude} {doctor_in.hospital_location.latitude})", srid=4326
-        )
-
-    doctor = doctor_crud.create_from_dict(db, obj_in=data)
-    return {"success": True, "data": doctor}
-
-
-@router.get("/doctors/my", response_model=SuccessResponse[DoctorResponse])
-def get_my_doctor_profile(*, db: Session = Depends(get_db), current_user: User = Depends(require_business)) -> dict:
     business = business_crud.get_by_user_id(db, user_id=current_user.id)
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
@@ -142,9 +183,47 @@ def get_my_doctor_profile(*, db: Session = Depends(get_db), current_user: User =
     return {"success": True, "data": doctor}
 
 
-@router.post("/doctors/availability", response_model=SuccessResponse[DoctorAvailabilityResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/doctors",
+    response_model=SuccessResponse[DoctorResponse],
+    status_code=status.HTTP_201_CREATED
+)
+def create_doctor(
+    *,
+    db: Session = Depends(get_db),
+    doctor_in: DoctorCreateRequest,
+    current_user: User = Depends(require_business)
+) -> dict:
+    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    if not business:
+        raise NotFoundException("Business")
+    if business.category != "health":
+        raise ValidationException(
+            "Only health category businesses can create doctor profiles"
+        )
+
+    data = doctor_in.model_dump()
+    data["business_id"] = business.id
+
+    if doctor_in.hospital_location:
+        data["hospital_location"] = WKTElement(
+            f"POINT({doctor_in.hospital_location.longitude} "
+            f"{doctor_in.hospital_location.latitude})",
+            srid=4326
+        )
+
+    doctor = doctor_crud.create_from_dict(db, obj_in=data)
+    return {"success": True, "data": doctor}
+
+
+@router.post(
+    "/doctors/availability",
+    response_model=SuccessResponse[DoctorAvailabilityResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def add_availability(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     avail_in: DoctorAvailabilityCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
@@ -159,8 +238,14 @@ def add_availability(
     return {"success": True, "data": avail}
 
 
-@router.get("/doctors/availability/my", response_model=SuccessResponse[List[DoctorAvailabilityResponse]])
-def get_my_availabilities(*, db: Session = Depends(get_db), current_user: User = Depends(require_business)) -> dict:
+@router.get(
+    "/doctors/availability/my",
+    response_model=SuccessResponse[List[DoctorAvailabilityResponse]]
+)
+def get_my_availabilities(
+    *, db: Session = Depends(get_db),
+    current_user: User = Depends(require_business)
+) -> dict:
     business = business_crud.get_by_user_id(db, user_id=current_user.id)
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
@@ -171,7 +256,8 @@ def get_my_availabilities(*, db: Session = Depends(get_db), current_user: User =
 
 @router.put("/doctors/online-status")
 def update_online_status(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     is_online: bool = Query(...),
     is_available_for_instant: bool = Query(default=False),
     current_user: User = Depends(require_business)
@@ -180,17 +266,32 @@ def update_online_status(
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
-    doctor_crud.set_online_status(db, doctor_id=doctor.id, is_online=is_online, is_available_for_instant=is_available_for_instant)
-    return {"success": True, "data": {"is_online": is_online, "is_available_for_instant": is_available_for_instant}}
+    doctor_crud.set_online_status(
+        db,
+        doctor_id=doctor.id,
+        is_online=is_online,
+        is_available_for_instant=is_available_for_instant
+    )
+    return {
+        "success": True,
+        "data": {
+            "is_online": is_online,
+            "is_available_for_instant": is_available_for_instant
+        }
+    }
 
 
 # ============================================
-# DOCTOR'S CONSULTATION DASHBOARD (BUSINESS)
+# DOCTOR CONSULTATION DASHBOARD (BUSINESS)
 # ============================================
 
-@router.get("/doctors/consultations/my", response_model=SuccessResponse[List[ConsultationResponse]])
-def get_my_consultations(
-    *, db: Session = Depends(get_db),
+@router.get(
+    "/doctors/consultations/dashboard",
+    response_model=SuccessResponse[List[ConsultationResponse]]
+)
+def get_doctor_consultations(
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
     target_date: Optional[date] = Query(None),
     consultation_status: Optional[str] = Query(None),
@@ -202,14 +303,26 @@ def get_my_consultations(
         raise NotFoundException("Doctor profile")
 
     consultations = consultation_crud.get_doctor_consultations(
-        db, doctor_id=doctor.id, target_date=target_date,
-        status=consultation_status, skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        doctor_id=doctor.id,
+        target_date=target_date,
+        status=consultation_status,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": consultations}
 
 
-@router.post("/consultations/{consultation_id}/start", response_model=SuccessResponse[ConsultationResponse])
-def start_consultation(*, db: Session = Depends(get_db), consultation_id: UUID, current_user: User = Depends(require_business)) -> dict:
+@router.post(
+    "/consultations/{consultation_id}/start",
+    response_model=SuccessResponse[ConsultationResponse]
+)
+def start_consultation(
+    *,
+    db: Session = Depends(get_db),
+    consultation_id: UUID,
+    current_user: User = Depends(require_business)
+) -> dict:
     consultation = consultation_crud.get(db, id=consultation_id)
     if not consultation:
         raise NotFoundException("Consultation")
@@ -220,11 +333,10 @@ def start_consultation(*, db: Session = Depends(get_db), consultation_id: UUID, 
         raise PermissionDeniedException()
 
     consultation.status = "in_progress"
-    consultation.started_at = datetime.utcnow()
-    # Generate a meeting room ID for video/chat
+    consultation.started_at = _utcnow()  # FIX: was datetime.utcnow()
+
     if consultation.consultation_type in ["video", "chat"]:
-        import uuid
-        consultation.room_id = str(uuid.uuid4())
+        consultation.room_id = str(_uuid.uuid4())
         consultation.meeting_url = f"/health/rooms/{consultation.room_id}"
 
     db.commit()
@@ -232,8 +344,16 @@ def start_consultation(*, db: Session = Depends(get_db), consultation_id: UUID, 
     return {"success": True, "data": consultation}
 
 
-@router.post("/consultations/{consultation_id}/end", response_model=SuccessResponse[ConsultationResponse])
-def end_consultation(*, db: Session = Depends(get_db), consultation_id: UUID, current_user: User = Depends(require_business)) -> dict:
+@router.post(
+    "/consultations/{consultation_id}/end",
+    response_model=SuccessResponse[ConsultationResponse]
+)
+def end_consultation(
+    *,
+    db: Session = Depends(get_db),
+    consultation_id: UUID,
+    current_user: User = Depends(require_business)
+) -> dict:
     consultation = consultation_crud.get(db, id=consultation_id)
     if not consultation:
         raise NotFoundException("Consultation")
@@ -247,15 +367,19 @@ def end_consultation(*, db: Session = Depends(get_db), consultation_id: UUID, cu
         raise ValidationException("Consultation is not in progress")
 
     consultation.status = "completed"
-    consultation.ended_at = datetime.utcnow()
+    consultation.ended_at = _utcnow()  # FIX: was datetime.utcnow()
     db.commit()
     db.refresh(consultation)
     return {"success": True, "data": consultation}
 
 
-@router.post("/consultations/{consultation_id}/notes", response_model=SuccessResponse[ConsultationResponse])
+@router.post(
+    "/consultations/{consultation_id}/notes",
+    response_model=SuccessResponse[ConsultationResponse]
+)
 def add_consultation_notes(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     consultation_id: UUID,
     notes: ConsultationNoteRequest,
     current_user: User = Depends(require_business)
@@ -286,12 +410,17 @@ def add_consultation_notes(
 
 
 # ============================================
-# PRESCRIPTION MANAGEMENT (DOCTOR / BUSINESS)
+# PRESCRIPTIONS (DOCTOR / BUSINESS)
 # ============================================
 
-@router.post("/prescriptions", response_model=SuccessResponse[PrescriptionResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/prescriptions",
+    response_model=SuccessResponse[PrescriptionResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def issue_prescription(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     prescription_in: PrescriptionCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
@@ -300,7 +429,9 @@ def issue_prescription(
     if not doctor:
         raise NotFoundException("Doctor profile")
 
-    consultation = consultation_crud.get(db, id=prescription_in.consultation_id)
+    consultation = consultation_crud.get(
+        db, id=prescription_in.consultation_id
+    )
     if not consultation or consultation.doctor_id != doctor.id:
         raise PermissionDeniedException()
 
@@ -317,18 +448,24 @@ def issue_prescription(
 
 
 # ============================================
-# CONSULTATIONS & PRESCRIPTIONS (CUSTOMER)
+# CONSULTATIONS (CUSTOMER)
 # ============================================
 
-@router.post("/consultations", response_model=SuccessResponse[ConsultationResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/consultations",
+    response_model=SuccessResponse[ConsultationResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def book_consultation(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     consult_in: ConsultationCreateRequest,
     current_user: User = Depends(require_customer)
 ) -> dict:
-    """Book consultation – validates slot, charges wallet"""
+    """Book consultation — validates slot, charges wallet."""
     consultation = health_service.book_consultation_and_pay(
-        db, current_user=current_user,
+        db,
+        current_user=current_user,
         doctor_id=consult_in.doctor_id,
         consultation_type=consult_in.consultation_type,
         consultation_date=consult_in.consultation_date,
@@ -347,24 +484,34 @@ def book_consultation(
     return {"success": True, "data": consultation}
 
 
-@router.get("/consultations/my", response_model=SuccessResponse[List[ConsultationResponse]])
+@router.get(
+    "/consultations/customer",
+    response_model=SuccessResponse[List[ConsultationResponse]]
+)
 def get_my_consultations_customer(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_customer),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     consultations = consultation_crud.get_patient_consultations(
-        db, patient_id=current_user.id,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        patient_id=current_user.id,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": consultations}
 
 
-@router.post("/consultations/{consultation_id}/cancel", response_model=SuccessResponse[ConsultationResponse])
+@router.post(
+    "/consultations/{consultation_id}/cancel",
+    response_model=SuccessResponse[ConsultationResponse]
+)
 def cancel_consultation(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     consultation_id: UUID,
-    reason: Optional[str] = Query(None),
+    body: CancelRequest,
     current_user: User = Depends(require_customer)
 ) -> dict:
     consultation = consultation_crud.get(db, id=consultation_id)
@@ -376,8 +523,8 @@ def cancel_consultation(
         raise ValidationException("Cannot cancel this consultation")
 
     consultation.status = "cancelled"
-    consultation.cancelled_at = datetime.utcnow()
-    consultation.cancellation_reason = reason
+    consultation.cancelled_at = _utcnow()  # FIX: was datetime.utcnow()
+    consultation.cancellation_reason = body.reason
     db.commit()
     db.refresh(consultation)
     return {"success": True, "data": consultation}
@@ -385,10 +532,10 @@ def cancel_consultation(
 
 @router.post("/consultations/{consultation_id}/rate")
 def rate_consultation(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     consultation_id: UUID,
-    rating: int = Query(..., ge=1, le=5),
-    review: Optional[str] = Query(None),
+    body: RatingRequest,
     current_user: User = Depends(require_customer)
 ) -> dict:
     consultation = consultation_crud.get(db, id=consultation_id)
@@ -399,77 +546,97 @@ def rate_consultation(
     if consultation.status != "completed":
         raise ValidationException("Can only rate completed consultations")
 
-    consultation.rating = rating
-    consultation.review = review
-
-    # Update doctor average rating
+    consultation.rating = body.rating
+    consultation.review = body.review
 
     doctor = doctor_crud.get(db, id=consultation.doctor_id)
     avg = db.query(func.avg(ConsultModel.rating)).filter(
         ConsultModel.doctor_id == consultation.doctor_id,
         ConsultModel.rating.isnot(None)
     ).scalar()
-    doctor.average_rating = round(avg, 2) if avg else 0
-    doctor.total_reviews = db.query(func.count(ConsultModel.id)).filter(
+    count = db.query(func.count(ConsultModel.id)).filter(
         ConsultModel.doctor_id == consultation.doctor_id,
         ConsultModel.rating.isnot(None)
     ).scalar()
+    if doctor:
+        doctor.average_rating = round(avg, 2) if avg else 0
+        doctor.total_reviews = count
 
     db.commit()
-    return {"success": True, "data": {"rating": rating, "review": review}}
+    return {"success": True, "data": {"rating": body.rating, "review": body.review}}
 
 
-@router.get("/prescriptions/my", response_model=SuccessResponse[List[PrescriptionResponse]])
+@router.get(
+    "/prescriptions/my",
+    response_model=SuccessResponse[List[PrescriptionResponse]]
+)
 def get_my_prescriptions(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_customer),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     prescriptions = prescription_crud.get_patient_prescriptions(
-        db, patient_id=current_user.id,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        patient_id=current_user.id,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": prescriptions}
 
 
 # ============================================
-# PHARMACY SEARCH (PUBLIC)
+# PHARMACY — PUBLIC
 # ============================================
 
-@router.post("/pharmacies/search", response_model=SuccessResponse[List[PharmacyResponse]])
+@router.post(
+    "/pharmacies/search",
+    response_model=SuccessResponse[List[PharmacyResponse]]
+)
 def search_pharmacies(
-    *, db: Session = Depends(get_db),
-    query: Optional[str] = Query(None),
-    location: Optional[str] = Query(None),  # "lat,lng"
-    radius_km: float = Query(default=20.0),
-    city: Optional[str] = Query(None),
-    offers_delivery: Optional[bool] = Query(None),
+    *,
+    db: Session = Depends(get_db),
+    filters: PharmacySearchRequest,
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     loc = None
-    if location:
-        parts = location.split(",")
-        loc = (float(parts[0]), float(parts[1]))
+    if filters.lat is not None and filters.lng is not None:
+        loc = (filters.lat, filters.lng)
 
     pharmacies = pharmacy_crud.search_pharmacies(
-        db, query_text=query, location=loc, radius_km=radius_km,
-        city=city, offers_delivery=offers_delivery,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        query_text=filters.query,
+        location=loc,
+        radius_km=filters.radius_km,
+        city=filters.city,
+        offers_delivery=filters.offers_delivery,
+        offers_prescription_fulfillment=filters.offers_prescription_fulfillment,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": pharmacies}
 
 
-@router.get("/pharmacies/{pharmacy_id}", response_model=SuccessResponse[dict])
-def get_pharmacy_details(*, db: Session = Depends(get_db), pharmacy_id: UUID) -> dict:
+@router.get(
+    "/pharmacies/{pharmacy_id}",
+    response_model=SuccessResponse[dict]
+)
+def get_pharmacy_details(
+    *, db: Session = Depends(get_db), pharmacy_id: UUID
+) -> dict:
     pharmacy = pharmacy_crud.get(db, id=pharmacy_id)
     if not pharmacy:
         raise NotFoundException("Pharmacy")
     return {"success": True, "data": pharmacy}
 
 
-@router.get("/pharmacies/{pharmacy_id}/products", response_model=SuccessResponse[List[PharmacyProductResponse]])
+@router.get(
+    "/pharmacies/{pharmacy_id}/products",
+    response_model=SuccessResponse[List[PharmacyProductResponse]]
+)
 def get_pharmacy_products(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     pharmacy_id: UUID,
     category: Optional[str] = Query(None),
     query: Optional[str] = Query(None),
@@ -477,39 +644,57 @@ def get_pharmacy_products(
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     products = pharmacy_product_crud.get_by_pharmacy(
-        db, pharmacy_id=pharmacy_id, category=category,
-        query_text=query, in_stock_only=in_stock_only,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        pharmacy_id=pharmacy_id,
+        category=category,
+        query_text=query,
+        in_stock_only=in_stock_only,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": products}
 
 
 # ============================================
-# PHARMACY MANAGEMENT (BUSINESS)
+# PHARMACY — BUSINESS
 # ============================================
 
-@router.post("/pharmacies", response_model=SuccessResponse[PharmacyResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/pharmacies",
+    response_model=SuccessResponse[PharmacyResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def create_pharmacy(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     pharmacy_in: PharmacyCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
     business = business_crud.get_by_user_id(db, user_id=current_user.id)
     if not business or business.category != "health":
-        raise ValidationException("Only health category businesses can create pharmacies")
+        raise ValidationException(
+            "Only health category businesses can create pharmacies"
+        )
 
     data = pharmacy_in.model_dump()
     data["business_id"] = business.id
     data["location"] = WKTElement(
-        f"POINT({pharmacy_in.location.longitude} {pharmacy_in.location.latitude})", srid=4326
+        f"POINT({pharmacy_in.location.longitude} "
+        f"{pharmacy_in.location.latitude})",
+        srid=4326
     )
     pharmacy = pharmacy_crud.create_from_dict(db, obj_in=data)
     return {"success": True, "data": pharmacy}
 
 
-@router.post("/pharmacies/products", response_model=SuccessResponse[PharmacyProductResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/pharmacies/products",
+    response_model=SuccessResponse[PharmacyProductResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def add_pharmacy_product(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     product_in: PharmacyProductCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
@@ -524,13 +709,16 @@ def add_pharmacy_product(
     return {"success": True, "data": product}
 
 
-@router.put("/pharmacies/products/{product_id}", response_model=SuccessResponse[PharmacyProductResponse])
+@router.put(
+    "/pharmacies/products/{product_id}",
+    response_model=SuccessResponse[PharmacyProductResponse]
+)
 def update_pharmacy_product(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     product_id: UUID,
-    price: Optional[Decimal] = None,
-    stock_quantity: Optional[int] = None,
-    is_available: Optional[bool] = None,
+    # FIX: mutable fields must come from request body, not query params
+    update_in: PharmacyProductUpdateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
     business = business_crud.get_by_user_id(db, user_id=current_user.id)
@@ -542,18 +730,18 @@ def update_pharmacy_product(
     if not product or product.pharmacy_id != pharmacy.id:
         raise NotFoundException("Product")
 
-    update = {}
-    if price is not None: update["price"] = price
-    if stock_quantity is not None: update["stock_quantity"] = stock_quantity
-    if is_available is not None: update["is_available"] = is_available
-
+    update: dict = update_in.model_dump(exclude_none=True)
     product = pharmacy_product_crud.update(db, db_obj=product, obj_in=update)
     return {"success": True, "data": product}
 
 
-@router.get("/pharmacies/orders/my", response_model=SuccessResponse[List[PharmacyOrderResponse]])
+@router.get(
+    "/pharmacies/orders/business",
+    response_model=SuccessResponse[List[PharmacyOrderResponse]]
+)
 def get_pharmacy_orders_business(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
     order_status: Optional[str] = Query(None),
     pagination: dict = Depends(get_pagination_params)
@@ -564,16 +752,21 @@ def get_pharmacy_orders_business(
         raise NotFoundException("Pharmacy")
 
     orders = pharmacy_order_crud.get_pharmacy_orders(
-        db, pharmacy_id=pharmacy.id, status=order_status,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        pharmacy_id=pharmacy.id,
+        status=order_status,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": orders}
 
 
 @router.post("/pharmacies/orders/{order_id}/preparing")
 def mark_order_preparing(
-    *, db: Session = Depends(get_db),
-    order_id: UUID, current_user: User = Depends(require_business)
+    *,
+    db: Session = Depends(get_db),
+    order_id: UUID,
+    current_user: User = Depends(require_business)
 ) -> dict:
     order = pharmacy_order_crud.get(db, id=order_id)
     if not order:
@@ -585,34 +778,45 @@ def mark_order_preparing(
 
 @router.post("/pharmacies/orders/{order_id}/ready")
 def mark_order_ready(
-    *, db: Session = Depends(get_db),
-    order_id: UUID, current_user: User = Depends(require_business)
+    *,
+    db: Session = Depends(get_db),
+    order_id: UUID,
+    current_user: User = Depends(require_business)
 ) -> dict:
     order = pharmacy_order_crud.get(db, id=order_id)
     if not order:
         raise NotFoundException("Order")
     order.status = "ready"
-    order.prepared_at = datetime.utcnow()
+    order.prepared_at = _utcnow()  # FIX: was datetime.utcnow()
     db.commit()
     return {"success": True, "data": {"status": "ready"}}
 
 
 # ============================================
-# PHARMACY ORDERS (CUSTOMER)
+# PHARMACY ORDERS — CUSTOMER
 # ============================================
 
-@router.post("/pharmacies/orders", response_model=SuccessResponse[PharmacyOrderResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/pharmacies/orders",
+    response_model=SuccessResponse[PharmacyOrderResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def place_pharmacy_order(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     order_in: PharmacyOrderCreateRequest,
     current_user: User = Depends(require_customer)
 ) -> dict:
     loc = None
     if order_in.delivery_location:
-        loc = {"latitude": order_in.delivery_location.latitude, "longitude": order_in.delivery_location.longitude}
+        loc = {
+            "latitude": order_in.delivery_location.latitude,
+            "longitude": order_in.delivery_location.longitude
+        }
 
     order = health_service.place_pharmacy_order_and_pay(
-        db, current_user=current_user,
+        db,
+        current_user=current_user,
         pharmacy_id=order_in.pharmacy_id,
         items=order_in.items,
         order_type=order_in.order_type,
@@ -627,26 +831,36 @@ def place_pharmacy_order(
     return {"success": True, "data": order}
 
 
-@router.get("/pharmacies/orders/my", response_model=SuccessResponse[List[PharmacyOrderResponse]])
+@router.get(
+    "/pharmacies/orders/customer",
+    response_model=SuccessResponse[List[PharmacyOrderResponse]]
+)
 def get_my_pharmacy_orders(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_customer),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     orders = pharmacy_order_crud.get_customer_orders(
-        db, customer_id=current_user.id,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        customer_id=current_user.id,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": orders}
 
 
 # ============================================
-# LAB SEARCH (PUBLIC)
+# LAB — PUBLIC
 # ============================================
 
-@router.post("/labs/search", response_model=SuccessResponse[List[LabCenterResponse]])
+@router.post(
+    "/labs/search",
+    response_model=SuccessResponse[List[LabCenterResponse]]
+)
 def search_labs(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     filters: LabCenterSearchFilters,
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
@@ -655,56 +869,81 @@ def search_labs(
         location = (filters.location.latitude, filters.location.longitude)
 
     labs = lab_center_crud.search_lab_centers(
-        db, query_text=filters.query, location=location,
+        db,
+        query_text=filters.query,
+        location=location,
         radius_km=filters.radius_km or 20.0,
-        city=filters.city, offers_home_collection=filters.offers_home_collection,
+        city=filters.city,
+        offers_home_collection=filters.offers_home_collection,
         is_verified=filters.is_verified,
-        skip=pagination["skip"], limit=pagination["limit"]
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": labs}
 
 
-@router.get("/labs/{lab_center_id}/tests", response_model=SuccessResponse[List[LabTestResponse]])
+@router.get(
+    "/labs/{lab_center_id}/tests",
+    response_model=SuccessResponse[List[LabTestResponse]]
+)
 def get_lab_tests(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     lab_center_id: UUID,
     category: Optional[str] = Query(None),
     query: Optional[str] = Query(None),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     tests = lab_test_crud.get_by_lab_center(
-        db, lab_center_id=lab_center_id, category=category,
-        query_text=query, skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        lab_center_id=lab_center_id,
+        category=category,
+        query_text=query,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": tests}
 
 
 # ============================================
-# LAB CENTER MANAGEMENT (BUSINESS)
+# LAB — BUSINESS
 # ============================================
 
-@router.post("/labs", response_model=SuccessResponse[LabCenterResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/labs",
+    response_model=SuccessResponse[LabCenterResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def create_lab_center(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     lab_in: LabCenterCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
     business = business_crud.get_by_user_id(db, user_id=current_user.id)
     if not business or business.category != "health":
-        raise ValidationException("Only health category businesses can create lab centers")
+        raise ValidationException(
+            "Only health category businesses can create lab centers"
+        )
 
     data = lab_in.model_dump()
     data["business_id"] = business.id
     data["location"] = WKTElement(
-        f"POINT({lab_in.location.longitude} {lab_in.location.latitude})", srid=4326
+        f"POINT({lab_in.location.longitude} {lab_in.location.latitude})",
+        srid=4326
     )
     lab = lab_center_crud.create_from_dict(db, obj_in=data)
     return {"success": True, "data": lab}
 
 
-@router.post("/labs/tests", response_model=SuccessResponse[LabTestResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/labs/tests",
+    response_model=SuccessResponse[LabTestResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def add_lab_test(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     test_in: LabTestCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
@@ -719,9 +958,13 @@ def add_lab_test(
     return {"success": True, "data": test}
 
 
-@router.get("/labs/bookings/my", response_model=SuccessResponse[List[LabBookingResponse]])
+@router.get(
+    "/labs/bookings/business",
+    response_model=SuccessResponse[List[LabBookingResponse]]
+)
 def get_lab_bookings_business(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
     target_date: Optional[date] = Query(None),
     booking_status: Optional[str] = Query(None),
@@ -733,29 +976,40 @@ def get_lab_bookings_business(
         raise NotFoundException("Lab center")
 
     bookings = lab_booking_crud.get_lab_bookings(
-        db, lab_center_id=lab.id, status=booking_status,
-        target_date=target_date, skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        lab_center_id=lab.id,
+        status=booking_status,
+        target_date=target_date,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": bookings}
 
 
 @router.post("/labs/bookings/{booking_id}/sample-collected")
 def mark_sample_collected(
-    *, db: Session = Depends(get_db),
-    booking_id: UUID, current_user: User = Depends(require_business)
+    *,
+    db: Session = Depends(get_db),
+    booking_id: UUID,
+    current_user: User = Depends(require_business)
 ) -> dict:
     booking = lab_booking_crud.get(db, id=booking_id)
     if not booking:
         raise NotFoundException("Booking")
     booking.status = "sample_collected"
-    booking.sample_collected_at = datetime.utcnow()
+    booking.sample_collected_at = _utcnow()  # FIX: was datetime.utcnow()
     db.commit()
     return {"success": True, "data": {"status": "sample_collected"}}
 
 
-@router.post("/labs/results", response_model=SuccessResponse[LabResultResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/labs/results",
+    response_model=SuccessResponse[LabResultResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def upload_lab_result(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     booking_id: UUID = Body(...),
     results: List[dict] = Body(...),
     summary: Optional[str] = Body(None),
@@ -765,16 +1019,24 @@ def upload_lab_result(
     current_user: User = Depends(require_business)
 ) -> dict:
     result = lab_result_crud.create_result(
-        db, booking_id=booking_id, results=results,
-        summary=summary, overall_status=overall_status,
-        technician_name=technician_name, report_url=report_url
+        db,
+        booking_id=booking_id,
+        results=results,
+        summary=summary,
+        overall_status=overall_status,
+        technician_name=technician_name,
+        report_url=report_url
     )
     return {"success": True, "data": result}
 
 
-@router.post("/labs/results/{result_id}/release", response_model=SuccessResponse[LabResultResponse])
+@router.post(
+    "/labs/results/{result_id}/release",
+    response_model=SuccessResponse[LabResultResponse]
+)
 def release_lab_result(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     result_id: UUID,
     current_user: User = Depends(require_business)
 ) -> dict:
@@ -783,21 +1045,30 @@ def release_lab_result(
 
 
 # ============================================
-# LAB BOOKINGS & RESULTS (CUSTOMER)
+# LAB BOOKINGS — CUSTOMER
 # ============================================
 
-@router.post("/labs/bookings", response_model=SuccessResponse[LabBookingResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/labs/bookings",
+    response_model=SuccessResponse[LabBookingResponse],
+    status_code=status.HTTP_201_CREATED
+)
 def book_lab_test(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     booking_in: LabBookingCreateRequest,
     current_user: User = Depends(require_customer)
 ) -> dict:
     loc = None
     if booking_in.home_location:
-        loc = {"latitude": booking_in.home_location.latitude, "longitude": booking_in.home_location.longitude}
+        loc = {
+            "latitude": booking_in.home_location.latitude,
+            "longitude": booking_in.home_location.longitude
+        }
 
     booking = health_service.book_lab_and_pay(
-        db, current_user=current_user,
+        db,
+        current_user=current_user,
         lab_center_id=booking_in.lab_center_id,
         test_ids=booking_in.test_ids,
         appointment_date=booking_in.appointment_date,
@@ -817,22 +1088,32 @@ def book_lab_test(
     return {"success": True, "data": booking}
 
 
-@router.get("/labs/bookings/my", response_model=SuccessResponse[List[LabBookingResponse]])
+@router.get(
+    "/labs/bookings/customer",
+    response_model=SuccessResponse[List[LabBookingResponse]]
+)
 def get_my_lab_bookings(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_customer),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
     bookings = lab_booking_crud.get_customer_bookings(
-        db, customer_id=current_user.id,
-        skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        customer_id=current_user.id,
+        skip=pagination["skip"],
+        limit=pagination["limit"]
     )
     return {"success": True, "data": bookings}
 
 
-@router.get("/labs/bookings/{booking_id}/result", response_model=SuccessResponse[LabResultResponse])
+@router.get(
+    "/labs/bookings/{booking_id}/result",
+    response_model=SuccessResponse[LabResultResponse]
+)
 def get_my_lab_result(
-    *, db: Session = Depends(get_db),
+    *,
+    db: Session = Depends(get_db),
     booking_id: UUID,
     current_user: User = Depends(require_customer)
 ) -> dict:
@@ -840,8 +1121,9 @@ def get_my_lab_result(
     if not booking or booking.customer_id != current_user.id:
         raise NotFoundException("Booking")
 
-
-    result = db.query(LabResult).filter(LabResult.booking_id == booking_id).first()
+    result = db.query(LabResult).filter(
+        LabResult.booking_id == booking_id
+    ).first()
     if not result or not result.is_released:
         raise ValidationException("Results are not yet available")
 

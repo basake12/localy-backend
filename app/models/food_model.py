@@ -54,6 +54,14 @@ class ReservationStatusEnum(str, enum.Enum):
     NO_SHOW = "no_show"
 
 
+class CookingServiceStatusEnum(str, enum.Enum):
+    """Status enum for cooking service bookings."""
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
 # ============================================
 # RESTAURANT MODEL
 # ============================================
@@ -97,6 +105,12 @@ class Restaurant(BaseModel):
     # Preparation Time
     average_preparation_time_minutes = Column(Integer, default=30)
 
+    # NEW: Blueprint v2.0 — Virtual Tour Support
+    virtual_tour_url = Column(Text, nullable=True)
+
+    # NEW: Blueprint v2.0 — Real-Time Wait Times
+    real_time_wait_minutes = Column(Integer, nullable=True)
+
     # Features
     features = Column(JSONB, default=list)  # ["parking", "wifi", "outdoor_seating", "live_music"]
 
@@ -123,6 +137,11 @@ class Restaurant(BaseModel):
     food_orders = relationship(
         "FoodOrder",
         back_populates="restaurant"
+    )
+    cooking_services = relationship(
+        "CookingService",
+        back_populates="restaurant",
+        cascade="all, delete-orphan"
     )
 
     def __repr__(self):
@@ -198,6 +217,9 @@ class MenuItem(BaseModel):
     is_spicy = Column(Boolean, default=False)
     spice_level = Column(Integer, nullable=True)  # 1-5
 
+    # NEW: Blueprint v2.0 — Halal Dietary Filter
+    is_halal = Column(Boolean, default=False)
+
     # Allergens
     allergens = Column(JSONB, default=list)  # ["nuts", "dairy", "shellfish"]
 
@@ -213,10 +235,6 @@ class MenuItem(BaseModel):
 
     # Customization Options
     modifiers = Column(JSONB, default=list)
-    # Example: [
-    #   {"name": "Size", "options": [{"value": "Small", "price": 0}, {"value": "Large", "price": 500}], "required": true},
-    #   {"name": "Extra Toppings", "options": [{"value": "Cheese", "price": 200}], "required": false}
-    # ]
 
     # Stats
     display_order = Column(Integer, default=0)
@@ -231,11 +249,38 @@ class MenuItem(BaseModel):
 
     __table_args__ = (
         CheckConstraint('price > 0', name='positive_menu_price'),
-        CheckConstraint('spice_level >= 1 AND spice_level <= 5', name='valid_spice_level'),
+        CheckConstraint(
+            'spice_level IS NULL OR (spice_level >= 1 AND spice_level <= 5)',
+            name='valid_spice_level'
+        ),
     )
 
     def __repr__(self):
         return f"<MenuItem {self.name}>"
+
+    def to_snapshot(self) -> dict:
+        """
+        Return a safe serialisable snapshot of this item for order history.
+        Uses explicit fields instead of __dict__ to avoid SQLAlchemy internals.
+        """
+        return {
+            "id": str(self.id),
+            "name": self.name,
+            "description": self.description,
+            "price": float(self.price),
+            "discount_price": float(self.discount_price) if self.discount_price else None,
+            "preparation_time_minutes": self.preparation_time_minutes,
+            "calories": self.calories,
+            "is_vegetarian": self.is_vegetarian,
+            "is_vegan": self.is_vegan,
+            "is_gluten_free": self.is_gluten_free,
+            "is_halal": self.is_halal,
+            "is_spicy": self.is_spicy,
+            "spice_level": self.spice_level,
+            "allergens": self.allergens or [],
+            "image_url": self.image_url,
+            "images": self.images or [],
+        }
 
 
 # ============================================
@@ -243,7 +288,7 @@ class MenuItem(BaseModel):
 # ============================================
 
 class TableReservation(BaseModel):
-    """Restaurant table reservations"""
+    """Table reservations for dine-in"""
 
     __tablename__ = "table_reservations"
 
@@ -268,7 +313,7 @@ class TableReservation(BaseModel):
     # Contact Info
     customer_name = Column(String(200), nullable=False)
     customer_phone = Column(String(20), nullable=False)
-    customer_email = Column(String(255), nullable=True)
+    customer_email = Column(String(200), nullable=True)
 
     # Preferences
     seating_preference = Column(String(100), nullable=True)  # window, outdoor, quiet
@@ -283,15 +328,20 @@ class TableReservation(BaseModel):
         index=True
     )
 
-    # Table Assignment
+    # Assignment
     table_number = Column(String(20), nullable=True)
 
     # Confirmation
-    confirmed_at = Column(DateTime(timezone=True), nullable=True)
-    confirmation_code = Column(String(20), unique=True, nullable=True)
+    confirmation_code = Column(String(20), nullable=True, unique=True, index=True)
 
-    # Arrival
-    arrived_at = Column(DateTime(timezone=True), nullable=True)
+    # NEW: Blueprint v2.0 — Deposit Option
+    deposit_amount = Column(Numeric(10, 2), default=0.00)
+    deposit_paid = Column(Boolean, default=False)
+    deposit_payment_reference = Column(String(100), nullable=True)
+
+    # Timing
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    seated_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     # Cancellation
@@ -303,11 +353,12 @@ class TableReservation(BaseModel):
     customer = relationship("User", foreign_keys=[customer_id])
 
     __table_args__ = (
-        CheckConstraint('number_of_guests > 0', name='positive_guests'),
+        CheckConstraint('number_of_guests > 0', name='positive_guest_count'),
+        CheckConstraint('deposit_amount >= 0', name='non_negative_deposit'),
     )
 
     def __repr__(self):
-        return f"<TableReservation {self.id} - {self.status}>"
+        return f"<TableReservation {self.confirmation_code}>"
 
 
 # ============================================
@@ -337,8 +388,20 @@ class FoodOrder(BaseModel):
 
     # Delivery Details (if applicable)
     delivery_address = Column(Text, nullable=True)
-    delivery_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    delivery_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
     delivery_instructions = Column(Text, nullable=True)
+
+    # NEW: Blueprint v2.0 — Scheduled Delivery
+    scheduled_delivery_time = Column(DateTime(timezone=True), nullable=True)
+
+    # NEW: Blueprint v2.0 — Group Orders
+    group_order_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("food_orders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True
+    )
+    is_group_order_host = Column(Boolean, default=False)
 
     # Contact Info
     customer_name = Column(String(200), nullable=False)
@@ -348,6 +411,10 @@ class FoodOrder(BaseModel):
     subtotal = Column(Numeric(10, 2), nullable=False)
     delivery_fee = Column(Numeric(10, 2), default=0.00)
     service_charge = Column(Numeric(10, 2), default=0.00)
+
+    # NEW: Blueprint v2.0 — Platform Fee (₦50 flat fee)
+    platform_fee = Column(Numeric(10, 2), default=50.00)
+
     tax = Column(Numeric(10, 2), default=0.00)
     discount = Column(Numeric(10, 2), default=0.00)
     tip = Column(Numeric(10, 2), default=0.00)
@@ -355,7 +422,7 @@ class FoodOrder(BaseModel):
 
     # Payment
     payment_method = Column(String(50), nullable=True)
-    payment_status = Column(String(50), default="pending", nullable=False)
+    payment_status = Column(String(50), default="pending", nullable=False, index=True)
     payment_reference = Column(String(100), nullable=True)
 
     # Status
@@ -378,7 +445,12 @@ class FoodOrder(BaseModel):
     special_instructions = Column(Text, nullable=True)
 
     # Delivery Assignment
-    delivery_id = Column(UUID(as_uuid=True), nullable=True)  # Links to deliveries table
+    delivery_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("deliveries.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True
+    )
 
     # Rating
     rating = Column(Integer, nullable=True)
@@ -396,10 +468,19 @@ class FoodOrder(BaseModel):
         back_populates="order",
         cascade="all, delete-orphan"
     )
+    group_order_members = relationship(
+        "FoodOrder",
+        foreign_keys=[group_order_id],
+        remote_side=[group_order_id]
+    )
 
     __table_args__ = (
         CheckConstraint('total_amount >= 0', name='non_negative_food_total'),
-        CheckConstraint('rating >= 1 AND rating <= 5', name='valid_food_rating'),
+        CheckConstraint('platform_fee >= 0', name='non_negative_platform_fee'),
+        CheckConstraint(
+            'rating IS NULL OR (rating >= 1 AND rating <= 5)',
+            name='valid_food_rating'
+        ),
     )
 
     def __repr__(self):
@@ -432,14 +513,12 @@ class FoodOrderItem(BaseModel):
     unit_price = Column(Numeric(10, 2), nullable=False)
     total_price = Column(Numeric(10, 2), nullable=False)
 
-    # Item Snapshot (store details at time of order)
+    # Item Snapshot — safe dict via MenuItem.to_snapshot(), never raw __dict__
     item_name = Column(String(200), nullable=False)
     item_snapshot = Column(JSONB, nullable=False)
 
     # Customizations
     selected_modifiers = Column(JSONB, default=list)
-    # Example: [{"name": "Size", "value": "Large", "price": 500}]
-
     special_instructions = Column(Text, nullable=True)
 
     # Relationships
@@ -459,7 +538,7 @@ class FoodOrderItem(BaseModel):
 # ============================================
 
 class CookingService(BaseModel):
-    """Private cooking services (catering, home chef)"""
+    """Private cooking services (catering, home chef, meal prep)"""
 
     __tablename__ = "cooking_services"
 
@@ -479,7 +558,7 @@ class CookingService(BaseModel):
     price_per_person = Column(Numeric(10, 2), nullable=True)
 
     # Service Type
-    service_type = Column(String(50), nullable=False)  # catering, private_chef, meal_prep
+    service_type = Column(String(50), nullable=False)  # catering, private_chef, meal_prep, cooking_class
 
     # Capacity
     min_guests = Column(Integer, default=1)
@@ -495,7 +574,7 @@ class CookingService(BaseModel):
     is_active = Column(Boolean, default=True)
 
     # Relationships
-    restaurant = relationship("Restaurant")
+    restaurant = relationship("Restaurant", back_populates="cooking_services")
     bookings = relationship(
         "CookingBooking",
         back_populates="service",
@@ -535,24 +614,36 @@ class CookingBooking(BaseModel):
 
     # Location
     event_address = Column(Text, nullable=False)
-    event_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    event_location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=True)
 
     # Pricing
     base_price = Column(Numeric(10, 2), nullable=False)
     total_price = Column(Numeric(10, 2), nullable=False)
 
-    # Menu/Requirements
+    # NEW: Blueprint v2.0 — Platform Fee (₦100 for bookings)
+    platform_fee = Column(Numeric(10, 2), default=100.00)
+
+    # Menu / Requirements
     menu_requirements = Column(Text, nullable=True)
     dietary_restrictions = Column(JSONB, default=list)
     special_requests = Column(Text, nullable=True)
 
     # Status
-    status = Column(String(50), default="pending", nullable=False)
+    status = Column(
+        Enum(CookingServiceStatusEnum),
+        default=CookingServiceStatusEnum.PENDING,
+        nullable=False,
+        index=True
+    )
     payment_status = Column(String(50), default="pending", nullable=False)
 
     # Relationships
     service = relationship("CookingService", back_populates="bookings")
     customer = relationship("User", foreign_keys=[customer_id])
+
+    __table_args__ = (
+        CheckConstraint('platform_fee >= 0', name='non_negative_cooking_platform_fee'),
+    )
 
     def __repr__(self):
         return f"<CookingBooking {self.id}>"

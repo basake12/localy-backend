@@ -1,13 +1,11 @@
 from typing import Optional, List, Dict
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import and_, func, case, distinct
-from sqlalchemy.dialects.postgresql import array_agg
+from sqlalchemy import and_, func, update as sqla_update
 from uuid import UUID
-from decimal import Decimal
 
 from app.models.reviews_model import (
     Review, ReviewHelpfulVote, ReviewResponse,
-    ReviewStatusEnum, ReviewableTypeEnum
+    ReviewStatusEnum,
 )
 from app.core.exceptions import (
     NotFoundException,
@@ -37,17 +35,20 @@ class CRUDReview:
         )
 
     def get_by_context(
-        self, db: Session, *, reviewer_id: UUID,
-        reviewable_type: str, reviewable_id: UUID, context_id: UUID
+        self, db: Session, *,
+        reviewer_id: UUID,
+        reviewable_type: str,
+        reviewable_id: UUID,
+        context_id: UUID,
     ) -> Optional[Review]:
         """Check if this reviewer already left a review for this transaction."""
         return (
             db.query(Review)
             .filter(
-                Review.reviewer_id   == reviewer_id,
+                Review.reviewer_id     == reviewer_id,
                 Review.reviewable_type == reviewable_type,
-                Review.reviewable_id == reviewable_id,
-                Review.context_id    == context_id,
+                Review.reviewable_id   == reviewable_id,
+                Review.context_id      == context_id,
             )
             .first()
         )
@@ -59,7 +60,7 @@ class CRUDReview:
         reviewable_type: str,
         reviewable_id: UUID,
         status: Optional[str] = ReviewStatusEnum.APPROVED,
-        sort_by: str = "created_at",       # created_at | rating | helpful_count
+        sort_by: str = "created_at",   # created_at | rating | helpful_count
         sort_dir: str = "desc",
         skip: int = 0,
         limit: int = 20,
@@ -78,7 +79,12 @@ class CRUDReview:
         if status:
             query = query.filter(Review.status == status)
 
-        order_col = getattr(Review, sort_by, Review.created_at)
+        sort_col_map = {
+            "created_at":   Review.created_at,
+            "rating":       Review.rating,
+            "helpful_count": Review.helpful_count,
+        }
+        order_col = sort_col_map.get(sort_by, Review.created_at)
         order = order_col.desc() if sort_dir == "desc" else order_col.asc()
 
         return query.order_by(order).offset(skip).limit(limit).all()
@@ -123,21 +129,12 @@ class CRUDReview:
         reviewable_id: UUID,
     ) -> Dict:
         """
-        Returns {average_rating, total_reviews, distribution, rating_breakdown_avg}
+        Returns {average_rating, total_reviews, distribution, rating_breakdown_avg}.
         Only counts APPROVED reviews.
         """
-        base = db.query(Review).filter(
-            Review.reviewable_type == reviewable_type,
-            Review.reviewable_id   == reviewable_id,
-            Review.status          == ReviewStatusEnum.APPROVED,
-        )
-
         # Distribution: count per star 1-5
-        distribution_row = (
-            db.query(
-                Review.rating,
-                func.count(Review.id).label("cnt"),
-            )
+        distribution_rows = (
+            db.query(Review.rating, func.count(Review.id).label("cnt"))
             .filter(
                 Review.reviewable_type == reviewable_type,
                 Review.reviewable_id   == reviewable_id,
@@ -147,34 +144,49 @@ class CRUDReview:
             .all()
         )
         distribution = {str(i): 0 for i in range(1, 6)}
-        for row in distribution_row:
+        for row in distribution_rows:
             distribution[str(row.rating)] = row.cnt
 
         # Avg overall
-        agg = base.with_entities(
-            func.avg(Review.rating).label("avg_rating"),
-            func.count(Review.id).label("total"),
-        ).one()
+        agg = (
+            db.query(
+                func.avg(Review.rating).label("avg_rating"),
+                func.count(Review.id).label("total"),
+            )
+            .filter(
+                Review.reviewable_type == reviewable_type,
+                Review.reviewable_id   == reviewable_id,
+                Review.status          == ReviewStatusEnum.APPROVED,
+            )
+            .one()
+        )
 
         avg_rating = float(agg.avg_rating) if agg.avg_rating else 0.0
         total      = agg.total or 0
 
-        # Breakdown avg — pull all reviews and compute in Python (JSONB keys are dynamic)
+        # Breakdown avg — computed in Python (JSONB keys are dynamic per entity type)
         breakdown_avg: Optional[Dict[str, float]] = None
         if total > 0:
-            reviews = base.with_entities(Review.rating_breakdown).all()
-            breakdown_sums: Dict[str, float] = {}
-            breakdown_counts: Dict[str, int] = {}
+            reviews = (
+                db.query(Review.rating_breakdown)
+                .filter(
+                    Review.reviewable_type == reviewable_type,
+                    Review.reviewable_id   == reviewable_id,
+                    Review.status          == ReviewStatusEnum.APPROVED,
+                )
+                .all()
+            )
+            sums: Dict[str, float] = {}
+            counts: Dict[str, int] = {}
             for (rb,) in reviews:
                 if not rb:
                     continue
                 for k, v in rb.items():
-                    breakdown_sums[k]   = breakdown_sums.get(k, 0.0) + v
-                    breakdown_counts[k] = breakdown_counts.get(k, 0) + 1
-            if breakdown_sums:
+                    sums[k]   = sums.get(k, 0.0) + v
+                    counts[k] = counts.get(k, 0) + 1
+            if sums:
                 breakdown_avg = {
-                    k: round(breakdown_sums[k] / breakdown_counts[k], 2)
-                    for k in breakdown_sums
+                    k: round(sums[k] / counts[k], 2) for k in sums
                 }
 
         return {
@@ -195,14 +207,13 @@ class CRUDReview:
 
     def update(self, db: Session, *, review: Review, update_data: dict) -> Review:
         for k, v in update_data.items():
-            if v is not None:
-                setattr(review, k, v)
+            setattr(review, k, v)
         db.flush()
         db.refresh(review)
         return review
 
     def delete(self, db: Session, *, review: Review) -> None:
-        """Soft-delete: set status to REMOVED, preserve data for stats history."""
+        """Soft-delete: set status to REMOVED, preserve data for history."""
         review.status = ReviewStatusEnum.REMOVED
         db.flush()
 
@@ -215,10 +226,18 @@ class CRUDReview:
         db.flush()
         return review
 
-    def moderate(self, db: Session, *, review: Review, status: str, moderator_id: UUID) -> Review:
-        review.status        = status
-        review.is_flagged    = (status == ReviewStatusEnum.FLAGGED)
-        review.moderated_by_id = moderator_id
+    def moderate(
+        self, db: Session, *,
+        review: Review,
+        status: str,
+        moderator_id: UUID,
+        moderator_note: Optional[str] = None,
+    ) -> Review:
+        review.status           = status
+        review.is_flagged       = (status == ReviewStatusEnum.FLAGGED)
+        review.moderated_by_id  = moderator_id
+        if moderator_note is not None:
+            review.flag_reason = moderator_note
         db.flush()
         return review
 
@@ -241,44 +260,66 @@ class CRUDHelpfulVote:
 
     def upsert(
         self, db: Session, *,
-        review: Review,
+        review_id: UUID,
         voter_id: UUID,
         is_helpful: bool,
-    ) -> ReviewHelpfulVote:
-        existing = self.get(db, review_id=review.id, voter_id=voter_id)
+    ) -> Optional[ReviewHelpfulVote]:
+        """
+        Toggle vote atomically using SQL-level increments to avoid race conditions.
+        Returns None when vote is removed (toggled off).
+        """
+        existing = self.get(db, review_id=review_id, voter_id=voter_id)
 
         if existing:
-            # Undo old vote on counts
-            if existing.is_helpful:
-                review.helpful_count -= 1
-            else:
-                review.unhelpful_count -= 1
-
             if existing.is_helpful == is_helpful:
-                # Toggle off — remove vote entirely
+                # Toggle off — remove the vote and decrement atomically
                 db.delete(existing)
+                db.execute(
+                    sqla_update(Review)
+                    .where(Review.id == review_id)
+                    .values(
+                        helpful_count=(
+                            Review.helpful_count - (1 if is_helpful else 0)
+                        ),
+                        unhelpful_count=(
+                            Review.unhelpful_count - (0 if is_helpful else 1)
+                        ),
+                    )
+                )
                 db.flush()
-                db.refresh(review)
                 return None  # vote removed
 
-            existing.is_helpful = is_helpful
-            vote = existing
-        else:
-            vote = ReviewHelpfulVote(
-                review_id  = review.id,
-                voter_id   = voter_id,
-                is_helpful = is_helpful,
+            # Changing vote direction: swap counts atomically
+            delta_helpful   = (1 if is_helpful else -1)
+            delta_unhelpful = (-1 if is_helpful else 1)
+            db.execute(
+                sqla_update(Review)
+                .where(Review.id == review_id)
+                .values(
+                    helpful_count=Review.helpful_count + delta_helpful,
+                    unhelpful_count=Review.unhelpful_count + delta_unhelpful,
+                )
             )
-            db.add(vote)
+            existing.is_helpful = is_helpful
+            db.flush()
+            return existing
 
-        # Apply new vote on counts
-        if is_helpful:
-            review.helpful_count += 1
-        else:
-            review.unhelpful_count += 1
-
+        # New vote — atomic increment
+        vote = ReviewHelpfulVote(
+            review_id=review_id,
+            voter_id=voter_id,
+            is_helpful=is_helpful,
+        )
+        db.add(vote)
+        db.execute(
+            sqla_update(Review)
+            .where(Review.id == review_id)
+            .values(
+                helpful_count=Review.helpful_count + (1 if is_helpful else 0),
+                unhelpful_count=Review.unhelpful_count + (0 if is_helpful else 1),
+            )
+        )
         db.flush()
-        db.refresh(review)
         return vote
 
 
@@ -296,11 +337,16 @@ class CRUDReviewResponse:
             .first()
         )
 
-    def create(self, db: Session, *, review_id: UUID, responder_id: UUID, body: str) -> ReviewResponse:
+    def create(
+        self, db: Session, *,
+        review_id: UUID,
+        responder_id: UUID,
+        body: str,
+    ) -> ReviewResponse:
         resp = ReviewResponse(
-            review_id    = review_id,
-            responder_id = responder_id,
-            body         = body,
+            review_id=review_id,
+            responder_id=responder_id,
+            body=body,
         )
         db.add(resp)
         db.flush()
@@ -322,6 +368,6 @@ class CRUDReviewResponse:
 # SINGLETONS
 # ============================================
 
-review_crud         = CRUDReview()
-helpful_vote_crud   = CRUDHelpfulVote()
+review_crud          = CRUDReview()
+helpful_vote_crud    = CRUDHelpfulVote()
 review_response_crud = CRUDReviewResponse()

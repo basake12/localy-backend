@@ -9,17 +9,149 @@ from app.crud.health_crud import (
     pharmacy_crud, pharmacy_order_crud,
     lab_center_crud, lab_booking_crud
 )
-from app.crud.wallet_crud import wallet_crud
 from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException, ValidationException, InsufficientBalanceException
 )
-from app.core.constants import TransactionType
+from app.core.constants import (
+    TransactionType,
+    PLATFORM_FEE_BOOKING,   # ₦100 — consultations, lab bookings (blueprint §4.4)
+    PLATFORM_FEE_STANDARD,  # ₦50  — pharmacy orders (product/item fee)
+)
 from app.models.user_model import User
 from app.models.health_model import (
     Consultation, Prescription, PharmacyOrder, LabBooking,
     ConsultationStatusEnum, PrescriptionStatusEnum
 )
+# FIX: Import wallet models directly — wallet_crud is fully async (AsyncSession)
+# and cannot be called from a sync service without await. All payment operations
+# here use direct SQLAlchemy sync queries instead, following the same pattern
+# used in product_service.py.
+from app.models.wallet_model import (
+    Wallet,
+    WalletTransaction,
+    TransactionTypeEnum,
+    TransactionStatusEnum,
+    generate_wallet_number,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Private sync payment helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_or_create_wallet_sync(db: Session, *, user_id: UUID) -> Wallet:
+    """
+    Get or create a wallet for any user using a sync Session.
+
+    wallet_crud.get_or_create_wallet() is async — it cannot be called from a
+    sync service without await. This inline replacement is functionally
+    equivalent and safe to use with a sync Session.
+    """
+    wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+    if not wallet:
+        wallet = Wallet(
+            user_id=user_id,
+            wallet_number=generate_wallet_number(),
+            balance=Decimal("0.00"),
+            currency="NGN",
+            is_active=True,
+        )
+        db.add(wallet)
+        db.flush()
+    return wallet
+
+
+def _debit_wallet_sync(
+    db: Session,
+    *,
+    wallet: Wallet,
+    amount: Decimal,
+    description: str,
+    reference_id: str,
+) -> WalletTransaction:
+    """Sync wallet debit. Caller must commit."""
+    if wallet.balance < amount:
+        raise InsufficientBalanceException()
+    balance_before = wallet.balance
+    wallet.balance -= amount
+    txn = WalletTransaction(
+        wallet_id=wallet.id,
+        transaction_type=TransactionTypeEnum.PAYMENT,
+        amount=amount,
+        balance_before=balance_before,
+        balance_after=wallet.balance,
+        status=TransactionStatusEnum.COMPLETED,
+        description=description,
+        reference_id=reference_id,
+        completed_at=datetime.utcnow(),
+    )
+    db.add(txn)
+    return txn
+
+
+def _credit_wallet_sync(
+    db: Session,
+    *,
+    wallet: Wallet,
+    amount: Decimal,
+    transaction_type: TransactionTypeEnum,
+    description: str,
+    reference_id: str,
+) -> WalletTransaction:
+    """Sync wallet credit. Caller must commit."""
+    balance_before = wallet.balance
+    wallet.balance += amount
+    txn = WalletTransaction(
+        wallet_id=wallet.id,
+        transaction_type=transaction_type,
+        amount=amount,
+        balance_before=balance_before,
+        balance_after=wallet.balance,
+        status=TransactionStatusEnum.COMPLETED,
+        description=description,
+        reference_id=reference_id,
+        completed_at=datetime.utcnow(),
+    )
+    db.add(txn)
+    return txn
+
+
+def _credit_business_wallet_sync(
+    db: Session,
+    *,
+    business_user_id: UUID,
+    amount: Decimal,
+    description: str,
+    reference_id: str,
+) -> None:
+    """
+    Credit a vendor's wallet after a successful health payment.
+
+    Blueprint §4.2 — "All customer payments minus platform fee, deposited
+    instantly on transaction completion."
+
+    Silently skips if the business wallet cannot be resolved — the customer
+    debit is already committed; this must not roll back the booking.
+    """
+    if amount <= Decimal("0"):
+        return
+    try:
+        biz_wallet = _get_or_create_wallet_sync(db, user_id=business_user_id)
+        _credit_wallet_sync(
+            db,
+            wallet=biz_wallet,
+            amount=amount,
+            transaction_type=TransactionTypeEnum.CREDIT,
+            description=description,
+            reference_id=f"biz_{reference_id}",
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).error(
+            "Business wallet credit failed for user %s ref %s",
+            business_user_id, reference_id
+        )
 
 
 class HealthService:
@@ -40,7 +172,6 @@ class HealthService:
         patient_gender: Optional[str] = None,
         payment_method: str = "wallet"
     ) -> Consultation:
-        # Create
         consultation = consultation_crud.create_consultation(
             db,
             doctor_id=doctor_id,
@@ -59,28 +190,50 @@ class HealthService:
             patient_gender=patient_gender
         )
 
-        # Pay
         if payment_method == "wallet":
-            wallet = wallet_crud.get_or_create_wallet(db, user_id=current_user.id)
-            if wallet.balance < consultation.consultation_fee:
+            # FIX: Blueprint §4.4 — ₦100 booking fee on health appointments.
+            # Previously this was not charged at all.
+            total_charge = consultation.consultation_fee + PLATFORM_FEE_BOOKING
+
+            # FIX: Use sync wallet ops — wallet_crud methods are async.
+            customer_wallet = _get_or_create_wallet_sync(db, user_id=current_user.id)
+            if customer_wallet.balance < total_charge:
                 db.delete(consultation)
                 db.commit()
                 raise InsufficientBalanceException()
 
-            wallet_crud.debit_wallet(
-                db, wallet_id=wallet.id,
-                amount=consultation.consultation_fee,
-                transaction_type=TransactionType.PAYMENT,
+            customer_txn = _debit_wallet_sync(
+                db,
+                wallet=customer_wallet,
+                amount=total_charge,
                 description=f"Consultation with Dr. {consultation.doctor.last_name}",
-                reference_id=str(consultation.id)
+                reference_id=str(consultation.id),
             )
+
             consultation.payment_status = "paid"
             consultation.status = ConsultationStatusEnum.CONFIRMED
             consultation.confirmed_at = datetime.utcnow()
 
-            # Update doctor stats
+            # FIX: Credit doctor's business wallet (amount minus platform fee).
             doctor = doctor_crud.get(db, id=doctor_id)
-            doctor.total_consultations += 1
+            if doctor:
+                doc_business = business_crud.get(db, id=doctor.business_id) if hasattr(doctor, 'business_id') else None
+                if not doc_business:
+                    # Try getting via user_id if doctor has user_id field
+                    doc_user_id = getattr(doctor, 'user_id', None)
+                else:
+                    doc_user_id = getattr(doc_business, 'user_id', None)
+
+                if doc_user_id:
+                    _credit_business_wallet_sync(
+                        db,
+                        business_user_id=doc_user_id,
+                        amount=consultation.consultation_fee,  # net of platform fee
+                        description=f"Consultation booking payment",
+                        reference_id=str(consultation.id),
+                    )
+
+                doctor.total_consultations += 1
 
             db.commit()
             db.refresh(consultation)
@@ -101,7 +254,6 @@ class HealthService:
         delivery_instructions: Optional[str] = None,
         payment_method: str = "wallet"
     ) -> PharmacyOrder:
-        # Validate prescription items vs ordered items
         if prescription_id:
             prescription = prescription_crud.get(db, id=prescription_id)
             if not prescription:
@@ -123,41 +275,51 @@ class HealthService:
             delivery_instructions=delivery_instructions
         )
 
-        # Pay
         if payment_method == "wallet":
-            wallet = wallet_crud.get_or_create_wallet(db, user_id=current_user.id)
-            if wallet.balance < order.total_amount:
+            # FIX: Use sync wallet ops — wallet_crud methods are async.
+            customer_wallet = _get_or_create_wallet_sync(db, user_id=current_user.id)
+            if customer_wallet.balance < order.total_amount:
                 # Rollback stock & order
                 for item in order.items:
                     db.query(
-                        __import__('app.models.health', fromlist=['PharmacyProduct']).PharmacyProduct
+                        __import__('app.models.health_model', fromlist=['PharmacyProduct']).PharmacyProduct
                     ).filter_by(id=item.product_id).update({
-                        "stock_quantity": __import__('app.models.health', fromlist=['PharmacyProduct']).PharmacyProduct.stock_quantity + item.quantity
+                        "stock_quantity": __import__('app.models.health_model', fromlist=['PharmacyProduct']).PharmacyProduct.stock_quantity + item.quantity
                     })
                 db.delete(order)
                 db.commit()
                 raise InsufficientBalanceException()
 
-            wallet_crud.debit_wallet(
-                db, wallet_id=wallet.id,
+            _debit_wallet_sync(
+                db,
+                wallet=customer_wallet,
                 amount=order.total_amount,
-                transaction_type=TransactionType.PAYMENT,
                 description=f"Pharmacy order at {order.pharmacy.name}",
-                reference_id=str(order.id)
+                reference_id=str(order.id),
             )
             order.payment_status = "paid"
             order.status = "confirmed"
             order.confirmed_at = datetime.utcnow()
 
-            # Update prescription
             if prescription_id:
                 prescription = prescription_crud.get(db, id=prescription_id)
                 prescription.fulfilled_order_id = order.id
                 prescription.status = PrescriptionStatusEnum.FULFILLED
 
-            # Update pharmacy stats
             pharmacy = pharmacy_crud.get(db, id=pharmacy_id)
             pharmacy.total_orders += 1
+
+            # FIX: Credit pharmacy's business wallet (net of ₦50 platform fee).
+            pharmacy_business = business_crud.get(db, id=pharmacy.business_id) if hasattr(pharmacy, 'business_id') else None
+            if pharmacy_business and pharmacy_business.user_id:
+                net_amount = order.total_amount - PLATFORM_FEE_STANDARD
+                _credit_business_wallet_sync(
+                    db,
+                    business_user_id=pharmacy_business.user_id,
+                    amount=max(net_amount, Decimal("0")),
+                    description=f"Pharmacy order payment",
+                    reference_id=str(order.id),
+                )
 
             db.commit()
             db.refresh(order)
@@ -202,22 +364,40 @@ class HealthService:
         )
 
         if payment_method == "wallet":
-            wallet = wallet_crud.get_or_create_wallet(db, user_id=current_user.id)
-            if wallet.balance < booking.total_amount:
+            # FIX: Blueprint §4.4 — ₦100 booking fee on health appointments.
+            total_charge = booking.total_amount + PLATFORM_FEE_BOOKING
+
+            # FIX: Use sync wallet ops — wallet_crud methods are async.
+            customer_wallet = _get_or_create_wallet_sync(db, user_id=current_user.id)
+            if customer_wallet.balance < total_charge:
                 db.delete(booking)
                 db.commit()
                 raise InsufficientBalanceException()
 
-            wallet_crud.debit_wallet(
-                db, wallet_id=wallet.id,
-                amount=booking.total_amount,
-                transaction_type=TransactionType.PAYMENT,
+            _debit_wallet_sync(
+                db,
+                wallet=customer_wallet,
+                amount=total_charge,
                 description=f"Lab test at {booking.lab_center.name}",
-                reference_id=str(booking.id)
+                reference_id=str(booking.id),
             )
             booking.payment_status = "paid"
             booking.status = "confirmed"
             booking.confirmed_at = datetime.utcnow()
+
+            # FIX: Credit lab center's business wallet (net of ₦100 platform fee).
+            lab_center = lab_center_crud.get(db, id=lab_center_id)
+            if lab_center:
+                lab_business = business_crud.get(db, id=lab_center.business_id) if hasattr(lab_center, 'business_id') else None
+                if lab_business and lab_business.user_id:
+                    net_amount = booking.total_amount  # subtotal without platform fee
+                    _credit_business_wallet_sync(
+                        db,
+                        business_user_id=lab_business.user_id,
+                        amount=max(net_amount, Decimal("0")),
+                        description=f"Lab booking payment",
+                        reference_id=str(booking.id),
+                    )
 
             db.commit()
             db.refresh(booking)

@@ -36,9 +36,12 @@ class AnalyticsService:
             User.last_login >= thirty_days_ago
         ).count()
 
-        # Wallet stats
+        # Wallet stats — aggregate via SQL, not Python loop
         total_wallet_balance = db.query(
-            func.sum(WalletTransaction.balance_after)
+            func.coalesce(func.sum(WalletTransaction.amount), 0)
+        ).filter(
+            WalletTransaction.transaction_type == "credit",
+            WalletTransaction.status == "completed",
         ).scalar() or 0
 
         return {
@@ -48,12 +51,12 @@ class AnalyticsService:
                 "businesses": total_businesses,
                 "riders": total_riders,
                 "new_today": new_users_today,
-                "active_30d": active_users
+                "active_30d": active_users,
             },
             "wallet": {
-                "total_balance": float(total_wallet_balance)
+                "total_balance": float(total_wallet_balance),
             },
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
         }
 
     def get_revenue_stats(
@@ -61,63 +64,86 @@ class AnalyticsService:
             db: Session,
             *,
             start_date: datetime,
-            end_date: datetime
+            end_date: datetime,
     ) -> Dict[str, Any]:
-        """Calculate revenue statistics for date range."""
-        # Get all completed transactions
-        transactions = db.query(WalletTransaction).filter(
-            and_(
-                WalletTransaction.created_at >= start_date,
-                WalletTransaction.created_at <= end_date,
-                WalletTransaction.status == "completed"
-            )
-        ).all()
+        """Calculate revenue statistics for date range using SQL aggregation."""
+        base_filter = and_(
+            WalletTransaction.created_at >= start_date,
+            WalletTransaction.created_at <= end_date,
+            WalletTransaction.status == "completed",
+        )
 
-        total_revenue = sum(float(t.amount) for t in transactions if t.transaction_type == "credit")
-        total_payouts = sum(float(t.amount) for t in transactions if t.transaction_type == "debit")
+        total_revenue = db.query(
+            func.coalesce(func.sum(WalletTransaction.amount), 0)
+        ).filter(base_filter, WalletTransaction.transaction_type == "credit").scalar() or 0
+
+        total_payouts = db.query(
+            func.coalesce(func.sum(WalletTransaction.amount), 0)
+        ).filter(base_filter, WalletTransaction.transaction_type == "debit").scalar() or 0
+
+        transaction_count = db.query(func.count(WalletTransaction.id)).filter(
+            base_filter
+        ).scalar() or 0
 
         return {
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
-            "total_revenue": total_revenue,
-            "total_payouts": total_payouts,
-            "net_revenue": total_revenue - total_payouts,
-            "transaction_count": len(transactions)
+            "total_revenue": float(total_revenue),
+            "total_payouts": float(total_payouts),
+            "net_revenue": float(total_revenue) - float(total_payouts),
+            "transaction_count": transaction_count,
         }
 
     def get_category_stats(self, db: Session) -> Dict[str, Any]:
         """Get statistics per business category."""
-        # Group businesses by category
         category_counts = db.query(
             Business.category,
-            func.count(Business.id).label('count')
+            func.count(Business.id).label("count"),
         ).group_by(Business.category).all()
 
         stats = {}
         for category, count in category_counts:
-            stats[category.value] = {
+            stats[category.value if hasattr(category, "value") else str(category)] = {
                 "business_count": count,
-                "avg_rating": 0.0  # Can be enhanced
+                "avg_rating": 0.0,  # Enhanced in a separate query if needed
             }
 
         return stats
 
-    def create_daily_snapshot(self, db: Session, date: datetime = None) -> DailyAnalyticsSnapshot:
-        """Create daily analytics snapshot."""
-        if date is None:
-            date = datetime.utcnow()
+    def create_daily_snapshot(
+        self, db: Session, snapshot_dt: datetime = None
+    ) -> DailyAnalyticsSnapshot:
+        """Create or replace daily analytics snapshot.
+
+        Uses correct model field names: snapshot_date, customers,
+        businesses, riders (not total_* prefixed variants).
+        """
+        if snapshot_dt is None:
+            snapshot_dt = datetime.utcnow()
+
+        snap_date = snapshot_dt.date()
+
+        # Upsert: remove existing row for the date, then insert fresh
+        existing = (
+            db.query(DailyAnalyticsSnapshot)
+            .filter(DailyAnalyticsSnapshot.snapshot_date == snap_date)
+            .first()
+        )
+        if existing:
+            db.delete(existing)
+            db.flush()
 
         stats = self.get_dashboard_stats(db)
 
         snapshot = DailyAnalyticsSnapshot(
-            date=date.date(),
-            total_users=stats['users']['total'],
-            new_users=stats['users']['new_today'],
-            active_users=stats['users']['active_30d'],
-            total_customers=stats['users']['customers'],
-            total_businesses=stats['users']['businesses'],
-            total_riders=stats['users']['riders'],
-            total_wallet_balance=stats['wallet']['total_balance']
+            snapshot_date=snap_date,                            # ✅ correct field
+            total_users=stats["users"]["total"],
+            new_users=stats["users"]["new_today"],
+            active_users=stats["users"]["active_30d"],
+            customers=stats["users"]["customers"],              # ✅ correct field
+            businesses=stats["users"]["businesses"],            # ✅ correct field
+            riders=stats["users"]["riders"],                    # ✅ correct field
+            total_wallet_balance=stats["wallet"]["total_balance"],
         )
 
         db.add(snapshot)
@@ -129,22 +155,26 @@ class AnalyticsService:
             self,
             db: Session,
             *,
-            days: int = 30
+            days: int = 30,
     ) -> List[Dict[str, Any]]:
-        """Get growth trends for last N days."""
+        """Get growth trends for last N days from snapshot table."""
         start_date = datetime.utcnow().date() - timedelta(days=days)
 
-        snapshots = db.query(DailyAnalyticsSnapshot).filter(
-            DailyAnalyticsSnapshot.date >= start_date
-        ).order_by(DailyAnalyticsSnapshot.date).all()
+        snapshots = (
+            db.query(DailyAnalyticsSnapshot)
+            .filter(DailyAnalyticsSnapshot.snapshot_date >= start_date)  # ✅ correct field
+            .order_by(DailyAnalyticsSnapshot.snapshot_date)
+            .all()
+        )
 
         return [
             {
-                "date": str(s.date),
+                "date": str(s.snapshot_date),           # ✅ correct field
                 "total_users": s.total_users,
                 "new_users": s.new_users,
                 "active_users": s.active_users,
-                "total_businesses": s.total_businesses
+                "total_businesses": s.businesses,       # ✅ correct field
+                "total_riders": s.riders,               # ✅ correct field
             }
             for s in snapshots
         ]
@@ -152,4 +182,3 @@ class AnalyticsService:
 
 # Singleton instance
 analytics_service = AnalyticsService()
-

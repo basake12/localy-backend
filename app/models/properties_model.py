@@ -184,7 +184,7 @@ class Property(BaseModel):
     state = Column(String(100), nullable=False, index=True)
     local_government = Column(String(100), nullable=True)
     postal_code = Column(String(20), nullable=True)
-    location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False, index=True)
+    location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=True), nullable=False)
 
     # Property Details
     bedrooms = Column(Integer, nullable=True)

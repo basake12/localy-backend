@@ -5,31 +5,32 @@ Handles OTP delivery, password reset, and transactional emails.
 Install: pip install resend
 Docs:    https://resend.com/docs
 """
+import html
+import logging
+
 import resend
-from typing import Optional
+
 from app.config import settings
 
+log = logging.getLogger(__name__)
 
-# ============================================
-# INITIALISE RESEND
-# ============================================
+# ─── Initialise Resend ────────────────────────────────────────────────────────
 
 resend.api_key = settings.RESEND_API_KEY
 _FROM = f"Localy <{settings.FROM_EMAIL}>"   # e.g. "Localy <noreply@localy.ng>"
 
 
-# ============================================
-# HTML LAYOUT HELPER
-# ============================================
+# ─── HTML Layout Helper ───────────────────────────────────────────────────────
 
 def _wrap(content: str, title: str = "Localy") -> str:
     """Wrap content in a branded Localy HTML email layout."""
+    safe_title = html.escape(title)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{title}</title>
+  <title>{safe_title}</title>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
@@ -78,17 +79,17 @@ def _wrap(content: str, title: str = "Localy") -> str:
 </html>"""
 
 
-# ============================================
-# EMAIL TEMPLATES
-# ============================================
+# ─── Email Templates ──────────────────────────────────────────────────────────
 
 def _tpl_email_otp(name: str, otp: str) -> str:
+    safe_name = html.escape(name)
+    safe_otp  = html.escape(otp)
     return _wrap(f"""
       <h2>Verify your email address</h2>
-      <p>Hi {name},</p>
+      <p>Hi {safe_name},</p>
       <p>Welcome to Localy! Enter the code below to verify your email and activate your account.</p>
       <div class="otp-box">
-        <div class="otp-code">{otp}</div>
+        <div class="otp-code">{safe_otp}</div>
         <p class="otp-note">Expires in <strong>10 minutes</strong> &bull; Do not share this code</p>
       </div>
       <p>If you didn't create a Localy account, you can safely ignore this email.</p>
@@ -96,12 +97,14 @@ def _tpl_email_otp(name: str, otp: str) -> str:
 
 
 def _tpl_password_reset_otp(name: str, otp: str) -> str:
+    safe_name = html.escape(name)
+    safe_otp  = html.escape(otp)
     return _wrap(f"""
       <h2>Reset your password</h2>
-      <p>Hi {name},</p>
+      <p>Hi {safe_name},</p>
       <p>We received a request to reset your Localy password. Use the code below to proceed.</p>
       <div class="otp-box">
-        <div class="otp-code">{otp}</div>
+        <div class="otp-code">{safe_otp}</div>
         <p class="otp-note">Expires in <strong>30 minutes</strong> &bull; Do not share this code</p>
       </div>
       <hr class="divider">
@@ -112,52 +115,64 @@ def _tpl_password_reset_otp(name: str, otp: str) -> str:
 
 
 def _tpl_welcome(name: str, user_type: str) -> str:
+    safe_name = html.escape(name)
     role_msg = {
         "customer": "Start exploring local hotels, restaurants, services, and more.",
         "business": "Your business listing is live. Complete your profile to attract more customers.",
-        "rider": "Your rider account is active. Head to the app to start accepting deliveries.",
+        "rider":    "Your rider account is active. Head to the app to start accepting deliveries.",
     }.get(user_type.lower(), "Your account is now active.")
-
+    deep_link = html.escape(getattr(settings, "APP_DEEP_LINK", "https://localy.ng"))
     return _wrap(f"""
-      <h2>Welcome to Localy, {name}! 🎉</h2>
+      <h2>Welcome to Localy, {safe_name}! 🎉</h2>
       <p>Your account has been verified and is now fully active.</p>
-      <p>{role_msg}</p>
+      <p>{html.escape(role_msg)}</p>
       <p style="text-align:center;margin-top:24px">
-        <a class="btn" href="{getattr(settings, 'APP_DEEP_LINK', 'https://localy.ng')}">
-          Open Localy App
-        </a>
+        <a class="btn" href="{deep_link}">Open Localy App</a>
       </p>
     """, f"Welcome to Localy, {name}!")
 
 
 def _tpl_booking_confirmation(name: str, details: dict) -> str:
+    safe_name   = html.escape(name)
+    booking_id  = html.escape(str(details.get("id", "N/A")))
+    booking_date = html.escape(str(details.get("date", "N/A")))
+    try:
+        total = f"₦{float(details.get('total', 0)):,.2f}"
+    except (TypeError, ValueError):
+        total = "N/A"
     return _wrap(f"""
       <h2>Booking Confirmed!</h2>
-      <p>Hi {name}, your booking is confirmed. Here are the details:</p>
+      <p>Hi {safe_name}, your booking is confirmed. Here are the details:</p>
       <div style="background:#f0faf7;border-radius:10px;padding:20px;margin:20px 0">
-        <p><strong>Booking ID:</strong> {details.get('id','N/A')}</p>
-        <p><strong>Date:</strong> {details.get('date','N/A')}</p>
-        <p><strong>Total:</strong> ₦{details.get('total',0):,.2f}</p>
+        <p><strong>Booking ID:</strong> {booking_id}</p>
+        <p><strong>Date:</strong> {booking_date}</p>
+        <p><strong>Total:</strong> {total}</p>
       </div>
     """, "Booking Confirmed — Localy")
 
 
 def _tpl_payment_receipt(name: str, details: dict) -> str:
+    safe_name = html.escape(name)
+    reference = html.escape(str(details.get("reference", "N/A")))
+    date      = html.escape(str(details.get("date", "N/A")))
+    method    = html.escape(str(details.get("method", "N/A")))
+    try:
+        amount = f"₦{float(details.get('amount', 0)):,.2f}"
+    except (TypeError, ValueError):
+        amount = "N/A"
     return _wrap(f"""
       <h2>Payment Received</h2>
-      <p>Hi {name}, your payment was successful.</p>
+      <p>Hi {safe_name}, your payment was successful.</p>
       <div style="background:#f0faf7;border-radius:10px;padding:20px;margin:20px 0">
-        <p><strong>Reference:</strong> {details.get('reference','N/A')}</p>
-        <p><strong>Amount:</strong> ₦{details.get('amount',0):,.2f}</p>
-        <p><strong>Date:</strong> {details.get('date','N/A')}</p>
-        <p><strong>Method:</strong> {details.get('method','N/A')}</p>
+        <p><strong>Reference:</strong> {reference}</p>
+        <p><strong>Amount:</strong> {amount}</p>
+        <p><strong>Date:</strong> {date}</p>
+        <p><strong>Method:</strong> {method}</p>
       </div>
     """, "Payment Receipt — Localy")
 
 
-# ============================================
-# EMAIL SERVICE
-# ============================================
+# ─── Email Service ────────────────────────────────────────────────────────────
 
 class EmailService:
     """
@@ -169,56 +184,85 @@ class EmailService:
         FROM_NAME       — display name, default "Localy"
     """
 
-    # ---------- low-level sender ----------
+    # ── low-level sender ──────────────────────────────────────────────────────
 
-    def _send(self, to: str, subject: str, html: str) -> bool:
+    def _send(self, to: str, subject: str, html_body: str) -> bool:
         """Send a single transactional email via Resend."""
         try:
             params: resend.Emails.SendParams = {
-                "from": _FROM,
-                "to": [to],
+                "from":    _FROM,
+                "to":      [to],
                 "subject": subject,
-                "html": html,
+                "html":    html_body,
             }
             resp = resend.Emails.send(params)
-            return bool(resp.get("id"))
-        except Exception as exc:
-            # Log but never raise — email failure should not break the request
-            print(f"[EmailService] send failed to={to!r} subject={subject!r}: {exc}")
+            success = bool(resp.get("id"))
+            if not success:
+                log.warning(
+                    "EmailService: Resend returned no ID. to=%r subject=%r resp=%r",
+                    to, subject, resp,
+                )
+            return success
+        except Exception:
+            # Email failure must never propagate and break the request
+            log.exception(
+                "EmailService: send failed. to=%r subject=%r", to, subject
+            )
             return False
 
-    # ---------- OTP / verification ----------
+    # ── OTP / verification ────────────────────────────────────────────────────
 
     def send_email_otp(self, to_email: str, name: str, otp: str) -> bool:
         """Send 6-digit email-OTP for account verification."""
-        html = _tpl_email_otp(name, otp)
-        return self._send(to_email, "Your Localy verification code", html)
+        if settings.DEBUG:
+            log.info(f"DEVELOPMENT: Email OTP for {to_email} -> {otp}")
+            return True
+        return self._send(
+            to_email,
+            "Your Localy verification code",
+            _tpl_email_otp(name, otp),
+        )
 
     def send_password_reset_otp(self, to_email: str, name: str, otp: str) -> bool:
         """Send 6-digit OTP for password reset."""
-        html = _tpl_password_reset_otp(name, otp)
-        return self._send(to_email, "Reset your Localy password", html)
+        if settings.DEBUG:
+            log.info(f"DEVELOPMENT: Password reset OTP for {to_email} -> {otp}")
+            return True
+        return self._send(
+            to_email,
+            "Reset your Localy password",
+            _tpl_password_reset_otp(name, otp),
+        )
 
-    # ---------- Lifecycle ----------
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def send_welcome(self, to_email: str, name: str, user_type: str) -> bool:
         """Send welcome email after full verification."""
-        html = _tpl_welcome(name, user_type)
-        return self._send(to_email, f"Welcome to Localy, {name}!", html)
+        return self._send(
+            to_email,
+            f"Welcome to Localy, {name}!",
+            _tpl_welcome(name, user_type),
+        )
 
-    # ---------- Transactional ----------
+    # ── Transactional ─────────────────────────────────────────────────────────
 
     def send_booking_confirmation(
         self, to_email: str, name: str, details: dict
     ) -> bool:
-        html = _tpl_booking_confirmation(name, details)
-        return self._send(to_email, "Booking Confirmed — Localy", html)
+        return self._send(
+            to_email,
+            "Booking Confirmed — Localy",
+            _tpl_booking_confirmation(name, details),
+        )
 
     def send_payment_receipt(
         self, to_email: str, name: str, details: dict
     ) -> bool:
-        html = _tpl_payment_receipt(name, details)
-        return self._send(to_email, "Payment Receipt — Localy", html)
+        return self._send(
+            to_email,
+            "Payment Receipt — Localy",
+            _tpl_payment_receipt(name, details),
+        )
 
 
 # Singleton — import this everywhere

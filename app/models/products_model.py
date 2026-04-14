@@ -27,7 +27,7 @@ class OrderStatusEnum(str, enum.Enum):
     DELIVERED = "delivered"
     CANCELLED = "cancelled"
     REFUNDED = "refunded"
-    # FIX: Added return states for blueprint Returns & Refunds flow
+    # Return states — blueprint §11.4 return/refund flow
     RETURN_REQUESTED = "return_requested"
     RETURN_IN_PROGRESS = "return_in_progress"
     RETURNED = "returned"
@@ -37,6 +37,17 @@ class PaymentStatusEnum(str, enum.Enum):
     PENDING = "pending"
     PAID = "paid"
     FAILED = "failed"
+    REFUNDED = "refunded"
+
+
+class ReturnStatusEnum(str, enum.Enum):
+    """
+    Status lifecycle for a ProductReturn record.
+    Blueprint §11.4 / §13.1: in-app return/refund request handled by admin.
+    """
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
     REFUNDED = "refunded"
 
 
@@ -218,7 +229,12 @@ class ProductOrder(BaseModel):
 
     # Delivery Address
     shipping_address = Column(Text, nullable=False)
-    shipping_location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    # FIX: spatial_index=True — was False which defeats the purpose of a Geography
+    # column. PostGIS spatial index is required for ST_DWithin proximity queries.
+    shipping_location = Column(
+        Geography(geometry_type='POINT', srid=4326, spatial_index=True),
+        nullable=True
+    )
     recipient_name = Column(String(200), nullable=False)
     recipient_phone = Column(String(20), nullable=False)
 
@@ -227,9 +243,14 @@ class ProductOrder(BaseModel):
     shipping_fee = Column(Numeric(10, 2), default=0.00)
     tax = Column(Numeric(10, 2), default=0.00)
     discount = Column(Numeric(10, 2), default=0.00)
+    # FIX: Blueprint §4.4 — ₦50 flat fee on every product transaction.
+    # Stored per-order so it can be reported in the admin financial dashboard
+    # (§10.4) and displayed to the customer at checkout (§4.4 — "transparently
+    # shown in the checkout summary before the user confirms payment").
+    platform_fee = Column(Numeric(10, 2), default=50.00, nullable=False)
     total_amount = Column(Numeric(10, 2), nullable=False)
 
-    # FIX: Added coupon_code to record which promo was applied (blueprint: promo codes)
+    # Coupon — blueprint §7: records which promo was applied
     coupon_code = Column(String(50), nullable=True)
 
     # Payment
@@ -240,6 +261,8 @@ class ProductOrder(BaseModel):
         nullable=False,
         index=True
     )
+    # FIX: payment_reference is nullable. It must NEVER be set to the string
+    # "None" — use `reference or None` in the service/crud, never str(reference).
     payment_reference = Column(String(100), nullable=True)
 
     # Status
@@ -258,7 +281,7 @@ class ProductOrder(BaseModel):
     # Notes
     notes = Column(Text, nullable=True)
 
-    # FIX: Proper ForeignKey constraint on delivery_id (was plain UUID with no FK)
+    # Delivery link — FK enforced; SET NULL if delivery record is deleted
     delivery_id = Column(
         UUID(as_uuid=True),
         ForeignKey("deliveries.id", ondelete="SET NULL"),
@@ -273,9 +296,15 @@ class ProductOrder(BaseModel):
         back_populates="order",
         cascade="all, delete-orphan"
     )
+    return_requests = relationship(
+        "ProductReturn",
+        back_populates="order",
+        cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         CheckConstraint('total_amount >= 0', name='non_negative_total'),
+        CheckConstraint('platform_fee >= 0', name='non_negative_platform_fee'),
     )
 
     def __repr__(self):
@@ -320,7 +349,6 @@ class OrderItem(BaseModel):
     product_snapshot = Column(JSONB, nullable=False)
 
     delivery_requested = Column(Boolean, default=False)
-    # FIX: Proper ForeignKey (was plain UUID)
     delivery_id = Column(
         UUID(as_uuid=True),
         ForeignKey("deliveries.id", ondelete="SET NULL"),
@@ -340,6 +368,80 @@ class OrderItem(BaseModel):
 
     def __repr__(self):
         return f"<OrderItem {self.order_id} - Qty: {self.quantity}>"
+
+
+# ============================================
+# PRODUCT RETURN MODEL
+# ============================================
+
+class ProductReturn(BaseModel):
+    """
+    Return / refund request for a delivered order.
+
+    Blueprint §11.4 — in-app return request flow.
+    Blueprint §13.1 — disputes raised within 48 hours; refunds to wallet
+    within 24 hours of approved cancellation (admin review required).
+
+    This model is the persistence layer for the return endpoint added to
+    products.py. Admin reviews via the admin panel and triggers the refund
+    credit to the customer's Localy wallet on approval.
+    """
+
+    __tablename__ = "product_returns"
+
+    order_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("product_orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    customer_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    reason = Column(Text, nullable=False)
+    # item_ids: list of OrderItem UUIDs the customer wants to return.
+    # Stored as JSONB to avoid a separate return_items join table while
+    # keeping the list queryable. If return items need individual tracking
+    # (e.g. partial approvals), migrate to a ReturnItem child table.
+    item_ids = Column(JSONB, nullable=False, default=list)
+    photos = Column(JSONB, nullable=False, default=list)
+
+    status = Column(
+        Enum(ReturnStatusEnum),
+        default=ReturnStatusEnum.PENDING,
+        nullable=False,
+        index=True
+    )
+
+    # Admin resolution fields
+    admin_notes = Column(Text, nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    # Reference to the wallet refund transaction, populated on approval
+    refund_transaction_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("wallet_transactions.id", ondelete="SET NULL"),
+        nullable=True
+    )
+
+    # Relationships
+    order = relationship("ProductOrder", back_populates="return_requests")
+    customer = relationship("User", foreign_keys=[customer_id])
+
+    __table_args__ = (
+        # One active return per order — a second submission requires the
+        # first to be resolved. Prevents duplicate refund requests.
+        UniqueConstraint(
+            'order_id',
+            name='unique_return_per_order'
+        ),
+    )
+
+    def __repr__(self):
+        return f"<ProductReturn {self.order_id} - {self.status}>"
 
 
 # ============================================

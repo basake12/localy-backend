@@ -47,7 +47,7 @@ router = APIRouter()
     summary="Live dashboard overview",
     description="Returns real-time KPI cards: users, orders, deliveries, platform rating, moderation flags.",
 )
-async def get_dashboard(
+def get_dashboard(
     db:   Session = Depends(get_db),
     user: User    = Depends(require_admin),
 ):
@@ -68,7 +68,7 @@ async def get_dashboard(
         "completed_deliveries, new_reviews, total_messages."
     ),
 )
-async def get_trend(
+def get_trend(
     metric:    str  = Query(..., description="KPI slug"),
     from_date: date = Query(..., description="Start date (inclusive)"),
     to_date:   date = Query(..., description="End date (inclusive)"),
@@ -89,7 +89,7 @@ async def get_trend(
     response_model=RevenueReport,
     summary="Revenue report with category breakdown",
 )
-async def get_revenue_report(
+def get_revenue_report(
     from_date: date = Query(..., description="Start date (inclusive)"),
     to_date:   date = Query(..., description="End date (inclusive)"),
     db:        Session = Depends(get_db),
@@ -109,7 +109,7 @@ async def get_revenue_report(
     response_model=AdminUserListOut,
     summary="List all users with filters",
 )
-async def list_users(
+def list_users(
     user_type: Optional[str] = Query(None, description="customer | business | rider | admin"),
     status:    Optional[str] = Query(None, description="active | suspended | banned | pending_verification"),
     search:    Optional[str] = Query(None, description="Search by email, phone, or name"),
@@ -131,7 +131,7 @@ async def list_users(
     "/users/{user_id}/status",
     summary="Update a user's status (suspend / ban / reactivate)",
 )
-async def update_user_status(
+def update_user_status(
     user_id: UUID,
     body:    UserStatusUpdate,
     db:      Session = Depends(get_db),
@@ -157,7 +157,7 @@ async def update_user_status(
     response_model=AdminBusinessListOut,
     summary="List all businesses with filters",
 )
-async def list_businesses(
+def list_businesses(
     category:    Optional[str]  = Query(None, description="Business category slug"),
     is_verified: Optional[bool] = Query(None, description="Filter by verification status"),
     search:      Optional[str]  = Query(None, description="Search by business name"),
@@ -179,7 +179,7 @@ async def list_businesses(
     "/businesses/{business_id}/verify",
     summary="Verify or un-verify a business + set badge",
 )
-async def verify_business(
+def verify_business(
     business_id: UUID,
     body:        BusinessVerifyUpdate,
     db:          Session = Depends(get_db),
@@ -211,7 +211,7 @@ async def verify_business(
     response_model=ModerationQueueOut,
     summary="Flagged & pending reviews awaiting moderation",
 )
-async def get_moderation_queue(
+def get_moderation_queue(
     pagination: dict    = Depends(get_pagination_params),
     db:         Session = Depends(get_db),
     user:       User    = Depends(require_admin),

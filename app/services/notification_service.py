@@ -9,61 +9,36 @@ Other modules call:
 The service:
   1. Resolves which channels are enabled for the user+category.
   2. Persists an in_app row (always, for notification bell).
-  3. Dispatches push / email / sms through provider stubs.
-
-Provider stubs are pluggable — swap real SDK calls in production.
+  3. Enqueues push / email / sms via Celery tasks — never dispatches
+     synchronously so the calling request is never stalled by provider latency.
 """
 
 import logging
 from typing import Optional, List
 from sqlalchemy.orm import Session
 from uuid import UUID
-from datetime import datetime
 
 from app.crud.notifications_crud import notification_crud, preference_crud, device_token_crud
 from app.models.notifications_model import (
     Notification,
     NotificationChannelEnum,
     NotificationStatusEnum,
-    NotificationCategoryEnum,
 )
 from app.models.user_model import User
 from app.schemas.notifications_schema import NotificationPayload, PreferenceToggle
 from app.core.exceptions import NotFoundException
 
+# Import Celery tasks at module level — not inside the send() loop.
+# Lazy imports inside a request handler re-initialise the Celery app
+# on every call, creating a new broker connection and causing the
+# "No hostname supplied" warning even when the worker is running.
+from app.tasks.notification_tasks import (
+    dispatch_push_task,
+    dispatch_email_task,
+    dispatch_sms_task,
+)
+
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# CHANNEL PROVIDERS  (stubbed — replace with real SDK calls)
-# ---------------------------------------------------------------------------
-
-def _send_push(tokens: List[str], title: str, body: str, action_url: str = None) -> dict:
-    """
-    Send FCM push notification.
-    Returns {message_id} on success.
-    Production: use google-cloud-messaging or firebase_admin.
-    """
-    logger.info(f"[PUSH] tokens={tokens} title={title!r}")
-    # Stub — in production iterate tokens and call FCM
-    return {"message_id": "fcm_stub_id", "tokens_sent": len(tokens)}
-
-
-def _send_email(to_email: str, subject: str, body: str, action_url: str = None) -> dict:
-    """
-    Send transactional email.
-    Production: use fastapi-mail or boto3 SES.
-    """
-    logger.info(f"[EMAIL] to={to_email} subject={subject!r}")
-    return {"ses_message_id": "ses_stub_id"}
-
-
-def _send_sms(phone: str, body: str) -> dict:
-    """
-    Send SMS via Termii (Nigerian provider).
-    Production: POST to Termii API.
-    """
-    logger.info(f"[SMS] phone={phone} body={body!r}")
-    return {"termii_message_id": "termii_stub_id"}
 
 
 # ---------------------------------------------------------------------------
@@ -72,64 +47,82 @@ def _send_sms(phone: str, body: str) -> dict:
 
 class NotificationService:
 
-    # ---------- main entry point ----------
-
     def send(self, db: Session, *, payload: NotificationPayload) -> List[Notification]:
         """
-        Fan-out a notification event to all enabled channels for the target user.
-        Always creates an in_app row (notification bell).
+        Fan-out a notification event to all enabled channels.
+        Always creates an in_app row for the notification bell.
+        Push / email / SMS are dispatched to Celery tasks (non-blocking).
         """
         user = db.query(User).filter(User.id == payload.user_id).first()
         if not user:
-            logger.warning(f"Notification target user {payload.user_id} not found — skipped")
+            logger.warning("Notification target user %s not found — skipped", payload.user_id)
             return []
 
-        # Determine which channels to use
         channels = payload.channels or self._resolve_channels(
             db, user_id=payload.user_id, category=payload.category
         )
-
         # Always include in_app
         if NotificationChannelEnum.IN_APP not in channels:
-            channels.append(NotificationChannelEnum.IN_APP)
+            channels = list(channels) + [NotificationChannelEnum.IN_APP]
 
         created: List[Notification] = []
+
         for channel in channels:
             notif = notification_crud.create(db, data={
-                "user_id":     payload.user_id,
-                "channel":     channel,
-                "category":    payload.category,
-                "title":       payload.title,
-                "body":        payload.body,
-                "action_url":  payload.action_url,
-                "icon_url":    payload.icon_url,
-                "status":      NotificationStatusEnum.PENDING,
+                "user_id":    payload.user_id,
+                "channel":    channel,
+                "category":   payload.category,
+                "title":      payload.title,
+                "body":       payload.body,
+                "action_url": payload.action_url,
+                "icon_url":   payload.icon_url,
+                "status":     NotificationStatusEnum.PENDING,
             })
             created.append(notif)
 
-            # Dispatch to provider
-            try:
-                meta = self._dispatch(db, user=user, notif=notif, payload=payload)
+            if channel == NotificationChannelEnum.IN_APP:
+                # In-app is just the DB row — mark sent immediately
                 notification_crud.update_status(
-                    db, notification=notif,
-                    status=NotificationStatusEnum.SENT,
-                    meta=meta,
+                    db, notification=notif, status=NotificationStatusEnum.SENT
                 )
-            except Exception as e:
-                logger.error(f"[NOTIF] dispatch failed for {channel}: {e}")
-                notification_crud.update_status(
-                    db, notification=notif,
-                    status=NotificationStatusEnum.FAILED,
-                    meta={"error": str(e)},
-                )
+
+            elif channel == NotificationChannelEnum.PUSH:
+                # Enqueue Celery task — non-blocking
+                tokens = [dt.token for dt in device_token_crud.get_active_for_user(db, user_id=user.id)]
+                if tokens:
+                    dispatch_push_task.delay(
+                        notification_id=str(notif.id),
+                        tokens=tokens,
+                        title=payload.title,
+                        body=payload.body,
+                        action_url=payload.action_url,
+                    )
+
+            elif channel == NotificationChannelEnum.EMAIL:
+                if user.email:
+                    dispatch_email_task.delay(
+                        notification_id=str(notif.id),
+                        to_email=user.email,
+                        subject=payload.title,
+                        body=payload.body,
+                        action_url=payload.action_url,
+                    )
+
+            elif channel == NotificationChannelEnum.SMS:
+                if user.phone:
+                    dispatch_sms_task.delay(
+                        notification_id=str(notif.id),
+                        phone=user.phone,
+                        body=payload.body,
+                    )
 
         db.commit()
         return created
 
-    # ---------- helpers ----------
-
-    def _resolve_channels(self, db: Session, *, user_id: UUID, category: str) -> List[str]:
-        """Return channels where user has opt-in (or no explicit opt-out)."""
+    def _resolve_channels(
+        self, db: Session, *, user_id: UUID, category: str
+    ) -> List[str]:
+        """Return channels where the user has not opted out."""
         all_channels = [
             NotificationChannelEnum.IN_APP,
             NotificationChannelEnum.PUSH,
@@ -141,55 +134,28 @@ class NotificationService:
             if preference_crud.is_enabled(db, user_id=user_id, category=category, channel=ch)
         ]
 
-    def _dispatch(self, db: Session, *, user: User, notif: Notification, payload: NotificationPayload) -> dict:
-        """Route to the correct provider based on channel."""
-        channel = notif.channel
-
-        if channel == NotificationChannelEnum.IN_APP:
-            # In-app is just the DB row — no external call
-            return {}
-
-        if channel == NotificationChannelEnum.PUSH:
-            tokens = [dt.token for dt in device_token_crud.get_active_for_user(db, user_id=user.id)]
-            if not tokens:
-                logger.info(f"[PUSH] No active device tokens for user {user.id}")
-                return {"skipped": "no_tokens"}
-            return _send_push(tokens, payload.title, payload.body, payload.action_url)
-
-        if channel == NotificationChannelEnum.EMAIL:
-            if not user.email:
-                return {"skipped": "no_email"}
-            return _send_email(user.email, payload.title, payload.body, payload.action_url)
-
-        if channel == NotificationChannelEnum.SMS:
-            if not user.phone:
-                return {"skipped": "no_phone"}
-            return _send_sms(user.phone, payload.body)
-
-        return {"skipped": f"unknown_channel_{channel}"}
-
 
 # ---------------------------------------------------------------------------
-# NOTIFICATION HISTORY SERVICE  (what the API router uses)
+# NOTIFICATION HISTORY SERVICE
 # ---------------------------------------------------------------------------
 
 class NotificationHistoryService:
 
     def list_notifications(
         self, db: Session, *,
-        user_id: UUID,
+        user_id:  UUID,
         category: Optional[str] = None,
         channel:  Optional[str] = None,
         status:   Optional[str] = None,
-        skip: int = 0,
+        skip:  int = 0,
         limit: int = 30,
     ) -> dict:
         notifications = notification_crud.list_for_user(
             db, user_id=user_id, category=category,
             channel=channel, status=status, skip=skip, limit=limit,
         )
-        total   = notification_crud.count_for_user(db, user_id=user_id, category=category, status=status)
-        unread  = notification_crud.unread_count(db, user_id=user_id)
+        total  = notification_crud.count_for_user(db, user_id=user_id, category=category, status=status)
+        unread = notification_crud.unread_count(db, user_id=user_id)
         return {
             "notifications": notifications,
             "total":         total,
@@ -198,7 +164,7 @@ class NotificationHistoryService:
             "limit":         limit,
         }
 
-    def mark_read(self, db: Session, *, user_id: UUID, notification_id: UUID):
+    def mark_read(self, db: Session, *, user_id: UUID, notification_id: UUID) -> Notification:
         notif = notification_crud.mark_read(db, notification_id=notification_id, user_id=user_id)
         if not notif:
             raise NotFoundException("Notification")
@@ -224,7 +190,7 @@ class PreferenceService:
             for p in prefs
         ]
 
-    def toggle(self, db: Session, *, user_id: UUID, payload: PreferenceToggle):
+    def toggle(self, db: Session, *, user_id: UUID, payload: PreferenceToggle) -> dict:
         pref = preference_crud.upsert(
             db,
             user_id=user_id,
@@ -242,8 +208,12 @@ class PreferenceService:
 
 class DeviceTokenService:
 
-    def register(self, db: Session, *, user_id: UUID, token: str, platform: str,
-                 device_name: str = None, app_version: str = None):
+    def register(
+        self, db: Session, *,
+        user_id: UUID, token: str, platform: str,
+        device_name: Optional[str] = None,
+        app_version: Optional[str] = None,
+    ):
         dt = device_token_crud.upsert(
             db, user_id=user_id, token=token, platform=platform,
             device_name=device_name, app_version=app_version,
@@ -263,7 +233,7 @@ class DeviceTokenService:
 # SINGLETONS
 # ---------------------------------------------------------------------------
 
-notification_service      = NotificationService()
-notification_history_svc  = NotificationHistoryService()
-preference_service        = PreferenceService()
-device_token_service      = DeviceTokenService()
+notification_service     = NotificationService()
+notification_history_svc = NotificationHistoryService()
+preference_service       = PreferenceService()
+device_token_service     = DeviceTokenService()

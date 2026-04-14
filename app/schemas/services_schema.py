@@ -1,3 +1,5 @@
+# app/schemas/services_schema.py
+
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, time
@@ -12,13 +14,12 @@ from app.schemas.common_schema import LocationSchema
 # ============================================
 
 class ServiceProviderCreateRequest(BaseModel):
-    """Create service provider request"""
     qualifications: List[str] = Field(default_factory=list)
     certifications: List[str] = Field(default_factory=list)
     years_of_experience: Optional[int] = Field(None, ge=0)
     service_location_types: List[str] = Field(..., min_length=1)
     service_radius_km: Optional[Decimal] = Field(None, gt=0)
-    travel_fee: Decimal = Field(default=0.00, ge=0)
+    travel_fee: Decimal = Field(default=Decimal("0.00"), ge=0)
     provider_address: Optional[str] = None
     provider_location: Optional[LocationSchema] = None
     advance_booking_days: int = Field(default=30, ge=1, le=90)
@@ -40,7 +41,6 @@ class ServiceProviderCreateRequest(BaseModel):
 
 
 class ServiceProviderResponse(BaseModel):
-    """Service provider response"""
     id: UUID
     business_id: UUID
     qualifications: List[str]
@@ -65,7 +65,6 @@ class ServiceProviderResponse(BaseModel):
 # ============================================
 
 class ServiceCreateRequest(BaseModel):
-    """Create service request"""
     name: str = Field(..., min_length=3, max_length=255)
     description: Optional[str] = None
     category: str = Field(..., min_length=2, max_length=100)
@@ -99,7 +98,6 @@ class ServiceCreateRequest(BaseModel):
 
 
 class ServiceUpdateRequest(BaseModel):
-    """Update service request"""
     name: Optional[str] = Field(None, min_length=3, max_length=255)
     description: Optional[str] = None
     base_price: Optional[Decimal] = Field(None, gt=0)
@@ -110,7 +108,6 @@ class ServiceUpdateRequest(BaseModel):
 
 
 class ServiceResponse(BaseModel):
-    """Service response"""
     id: UUID
     provider_id: UUID
     name: str
@@ -129,14 +126,13 @@ class ServiceResponse(BaseModel):
     is_active: bool
     created_at: datetime
 
-    # Nested
     provider: Optional[ServiceProviderResponse] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class ServiceListResponse(BaseModel):
-    """Simplified service list"""
+    """Simplified response for list views — provider_name injected by service layer."""
     id: UUID
     name: str
     category: str
@@ -152,7 +148,6 @@ class ServiceListResponse(BaseModel):
 # ============================================
 
 class AvailabilityCreateRequest(BaseModel):
-    """Create availability slot"""
     day_of_week: int = Field(..., ge=0, le=6)
     is_available: bool = True
     start_time: time
@@ -164,15 +159,15 @@ class AvailabilityCreateRequest(BaseModel):
 
     @field_validator('end_time')
     @classmethod
-    def validate_times(cls, v, info):
+    def validate_end_after_start(cls, v, info):
         start = info.data.get('start_time')
         if start and v <= start:
-            raise ValueError('End time must be after start time')
+            raise ValueError('end_time must be after start_time')
         return v
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "day_of_week": 1,  # Tuesday
+            "day_of_week": 1,
             "is_available": True,
             "start_time": "09:00",
             "end_time": "17:00",
@@ -185,7 +180,6 @@ class AvailabilityCreateRequest(BaseModel):
 
 
 class AvailabilityResponse(BaseModel):
-    """Availability response"""
     id: UUID
     provider_id: UUID
     day_of_week: int
@@ -202,14 +196,12 @@ class AvailabilityResponse(BaseModel):
 
 
 class AvailableSlot(BaseModel):
-    """Available time slot"""
     slot_time: time
     available_capacity: int
     is_available: bool
 
 
 class DailyAvailability(BaseModel):
-    """Daily available slots"""
     date: date
     day_name: str
     slots: List[AvailableSlot]
@@ -219,23 +211,7 @@ class DailyAvailability(BaseModel):
 # BOOKING SCHEMAS
 # ============================================
 
-class BookingCheckAvailabilityRequest(BaseModel):
-    """Check availability request"""
-    service_id: UUID
-    booking_date: date
-    service_location_type: str
-
-    @field_validator('booking_date')
-    @classmethod
-    def validate_future_date(cls, v):
-        from datetime import date as dt_date
-        if v < dt_date.today():
-            raise ValueError('Booking date must be in the future')
-        return v
-
-
 class BookingCreateRequest(BaseModel):
-    """Create booking request"""
     service_id: UUID
     booking_date: date
     booking_time: time
@@ -252,15 +228,15 @@ class BookingCreateRequest(BaseModel):
     def validate_future_date(cls, v):
         from datetime import date as dt_date
         if v < dt_date.today():
-            raise ValueError('Booking date must be in the future')
+            raise ValueError('booking_date must be today or in the future')
         return v
 
     @field_validator('service_location_type')
     @classmethod
     def validate_location_type(cls, v):
-        valid_types = ["in_home", "provider_location", "virtual"]
-        if v not in valid_types:
-            raise ValueError(f'Invalid location type. Must be one of: {valid_types}')
+        valid = {"in_home", "provider_location", "virtual"}
+        if v not in valid:
+            raise ValueError(f'service_location_type must be one of {valid}')
         return v
 
     model_config = ConfigDict(json_schema_extra={
@@ -279,8 +255,22 @@ class BookingCreateRequest(BaseModel):
     })
 
 
+class PriceCalculateRequest(BaseModel):
+    """Request body for price calculation endpoint."""
+    service_id: UUID
+    selected_options: List[Dict[str, Any]] = Field(default_factory=list)
+    service_location_type: str
+
+    @field_validator('service_location_type')
+    @classmethod
+    def validate_location_type(cls, v):
+        valid = {"in_home", "provider_location", "virtual"}
+        if v not in valid:
+            raise ValueError(f'Must be one of {valid}')
+        return v
+
+
 class BookingResponse(BaseModel):
-    """Booking response"""
     id: UUID
     service_id: UUID
     provider_id: UUID
@@ -301,14 +291,12 @@ class BookingResponse(BaseModel):
     payment_status: str
     created_at: datetime
 
-    # Nested
     service: Optional[ServiceResponse] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class BookingListResponse(BaseModel):
-    """Simplified booking list"""
     id: UUID
     service_name: str
     provider_name: str
@@ -325,13 +313,21 @@ class BookingListResponse(BaseModel):
 # ============================================
 
 class ServiceSearchFilters(BaseModel):
-    """Service search filters"""
+    """
+    Filters for service discovery.
+
+    Per Blueprint Section 3.1: location is strictly radius-based using GPS
+    coordinates. No LGA or city-name filtering anywhere.
+
+    Default radius: 5 km (Blueprint default).
+    Adjustable by user: 1 km to 50 km.
+    """
     query: Optional[str] = None
     category: Optional[str] = None
     subcategory: Optional[str] = None
     min_price: Optional[Decimal] = Field(None, ge=0)
     max_price: Optional[Decimal] = Field(None, ge=0)
-    location: Optional[LocationSchema] = None
-    radius_km: Optional[float] = Field(None, gt=0)
+    location: Optional[LocationSchema] = None          # GPS coordinates (required for radius filter)
+    radius_km: Optional[float] = Field(5.0, gt=0)     # default 5 km — Blueprint Section 3.1
     service_location_type: Optional[str] = None
     sort_by: Optional[str] = "created_at"

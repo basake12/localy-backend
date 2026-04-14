@@ -52,7 +52,7 @@ class Business(BaseModel):
     banner_image = Column(Text, nullable=True)
 
     # Location
-    location = Column(Geography(geometry_type='POINT', srid=4326), nullable=True)
+    location = Column(Geography(geometry_type='POINT', srid=4326, spatial_index=False), nullable=True)
     address = Column(Text, nullable=False)
     city = Column(String(100), nullable=True, index=True)
     local_government = Column(String(100), nullable=False, index=True)

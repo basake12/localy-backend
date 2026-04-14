@@ -9,11 +9,11 @@ from uuid import UUID
 # ============================================
 
 class ConversationCreateRequest(BaseModel):
-    """Start a new conversation"""
-    other_user_id: UUID                          # The person you're messaging
-    context_type: Optional[str] = None           # food_order | hotel_booking | …
+    """Start a new 1:1 or business conversation"""
+    other_user_id: UUID
+    context_type: Optional[str] = None
     context_id: Optional[UUID] = None
-    initial_message: Optional[str] = None        # Optional first message body
+    initial_message: Optional[str] = None
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -25,10 +25,22 @@ class ConversationCreateRequest(BaseModel):
     })
 
 
+class SupportChatRequest(BaseModel):
+    """
+    Open or retrieve the platform support conversation.
+    Blueprint §9.3 — separate channel from business chat.
+    """
+    initial_message: Optional[str] = None
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"initial_message": "I need help with a refund"}
+    })
+
+
 class ConversationResponse(BaseModel):
     id: UUID
     conversation_type: str
-    other_user_id: UUID              # Resolved at serialisation time
+    other_user_id: UUID
     other_user_name: Optional[str] = None
     other_user_avatar: Optional[str] = None
     context_type: Optional[str]
@@ -38,6 +50,7 @@ class ConversationResponse(BaseModel):
     unread_count: int = 0
     is_muted: bool = False
     is_archived: bool = False
+    is_active: bool = True
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -50,13 +63,9 @@ class ConversationResponse(BaseModel):
 class MessageCreateRequest(BaseModel):
     """Send a message"""
     conversation_id: UUID
-    message_type: str = "text"   # text | image | file | location | template
+    message_type: str = "text"
     content: Optional[str] = None
-
-    # Media payload — caller fills the relevant sub-object
     media: Optional[Dict[str, Any]] = None
-
-    # Thread reply
     reply_to_message_id: Optional[UUID] = None
 
     model_config = ConfigDict(json_schema_extra={
@@ -123,12 +132,12 @@ class TypingStartRequest(BaseModel):
 
 
 # ============================================
-# WEBSOCKET EVENT PAYLOADS (sent over the wire)
+# WEBSOCKET EVENT PAYLOADS
 # ============================================
 
 class WSEventPayload(BaseModel):
     """Generic envelope for all WebSocket frames"""
-    event: str                          # new_message | message_read | typing_start | typing_stop | presence_update | error
+    event: str
     data: Dict[str, Any] = {}
 
     model_config = ConfigDict(json_schema_extra={
