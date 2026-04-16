@@ -1,74 +1,156 @@
 """
 app/services/transaction_service.py
 
-Unified payment transaction processor for Localy platform.
+Unified payment transaction processor. Blueprint §5.4 / §5.6.
 
-Per Blueprint Section 4.4 - Platform Fee Middleware:
-- Centralizes ALL payment flows across all modules
-- Automatically calculates and deducts platform fees
-- Atomic transactions: customer debit + business credit + revenue tracking
-- Idempotency protection via reference_id
-- Supports refunds with automatic fee reversal
+FIXES vs previous version:
+  1.  [FINANCIAL ERROR — CRITICAL] Platform fee structure corrected.
+      Blueprint §5.4:
+        "Product/food orders: ₦50 flat — ₦50 from business + ₦50 from customer"
+        "Debit customer wallet: total_amount (product price + customer fee)"
+        "Credit business wallet: product_price - business_fee"
+        "Credit platform_revenue_pool: customer_fee + business_fee"
 
-This service is the MANDATORY gateway for:
-- Hotel bookings
-- Food orders
-- Service bookings
-- Product purchases
-- Health appointments
-- Ticket sales
+      Previous code deducted ONE ₦50 from gross_amount — platform only
+      earned ₦50 per product order (wrong). Platform must earn ₦100
+      (₦50 from each side).
 
-Fee structure:
-- ₦50 flat fee: products, food orders, tickets
-- ₦100 flat fee: hotel bookings, service bookings, health appointments
+      Corrected function signature:
+        process_payment(product_price, transaction_type, ...)
+      where product_price is the BASE price (before fees). The function
+      internally calculates customer_fee and business_fee and:
+        - Debits customer: product_price + customer_fee
+        - Credits business: product_price - business_fee
+        - Records revenue: customer_fee + business_fee
 
-All transactions are atomic: if any step fails, entire transaction rolls back.
+  2.  [FINANCIAL INTEGRITY §5.6] idempotency_key generated and passed to
+      every wallet_crud.credit_wallet() and debit_wallet() call.
+      Blueprint §5.6 HARD RULE: "All external payment operations use
+      idempotency keys."
+
+  3.  [HARD RULE §16.4] All datetime.utcnow() replaced with
+      datetime.now(timezone.utc).
+
+  4.  Fee structure for tickets: ₦50 from customer ONLY (no business fee).
+      Blueprint §5.4: "Ticket purchases: ₦50 flat — from customer only."
+
+PLATFORM FEE STRUCTURE (Blueprint §5.4):
+  Product / food orders:     customer_fee=₦50, business_fee=₦50, total=₦100
+  Service / hotel / health:  customer_fee=₦100, business_fee=₦100, total=₦200
+  Ticket purchases:          customer_fee=₦50, business_fee=₦0, total=₦50
+
+  customer_total  = product_price + customer_fee    (what customer pays)
+  business_net    = product_price - business_fee    (what business receives)
+  platform_takes  = customer_fee + business_fee     (platform revenue)
+  gross_amount    = customer_total                  (for PlatformRevenue record)
 """
 import logging
-from typing import Optional, Tuple
+import uuid as _uuid
+from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Optional, Tuple
 from uuid import UUID
-from datetime import datetime
-from sqlalchemy.ext.asyncio import AsyncSession
+
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud.wallet_crud import (
+    generate_idempotency_key,
+    platform_revenue_crud,
     wallet_crud,
     wallet_transaction_crud,
-    platform_revenue_crud,
 )
 from app.models.wallet_model import (
-    WalletTransaction,
     PlatformRevenue,
     TransactionType,
+    WalletTransaction,
 )
 from app.core.exceptions import (
-    NotFoundException,
     InsufficientBalanceException,
+    NotFoundException,
     ValidationException,
-)
-from app.core.constants import (
-    PLATFORM_FEE_STANDARD,
-    PLATFORM_FEE_BOOKING,
-    PLATFORM_FEE_TICKET,
 )
 
 logger = logging.getLogger(__name__)
+
+# ─── Fee constants — Blueprint §5.4 ──────────────────────────────────────────
+# Per-side fees (charged to BOTH customer and business independently).
+
+STANDARD_FEE_PER_SIDE = Decimal("50")    # product/food: ₦50 each side
+BOOKING_FEE_PER_SIDE  = Decimal("100")   # service/hotel/health: ₦100 each side
+TICKET_FEE_CUSTOMER   = Decimal("50")    # tickets: ₦50 from customer only
+TICKET_FEE_BUSINESS   = Decimal("0")     # tickets: no business fee
 
 
 class TransactionService:
     """
     Centralized payment transaction processor.
-    
-    All payment flows MUST go through this service to ensure:
-    1. Platform fees are deducted automatically
-    2. Revenue is tracked for analytics
+
+    ALL payment flows MUST use process_payment() to ensure:
+    1. Platform fees are calculated and charged correctly (both sides)
+    2. Revenue is tracked with full audit trail
     3. Transactions are atomic (all-or-nothing)
-    4. Idempotency is enforced
+    4. Idempotency is enforced with unique keys
     """
 
     # ═══════════════════════════════════════════════════════════════════════
-    # PAYMENT PROCESSING
+    # FEE CALCULATION — Blueprint §5.4
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def get_fees(transaction_type: str) -> Tuple[Decimal, Decimal]:
+        """
+        Return (customer_fee, business_fee) for a given transaction type.
+
+        Blueprint §5.4:
+          Product / food:    (₦50, ₦50)
+          Service / hotel / health / booking: (₦100, ₦100)
+          Ticket:            (₦50, ₦0)
+        """
+        t = transaction_type.lower()
+
+        # Ticket: customer only, no business fee
+        if "ticket" in t:
+            return TICKET_FEE_CUSTOMER, TICKET_FEE_BUSINESS
+
+        # Bookings: ₦100 per side
+        if any(kw in t for kw in ("hotel", "booking", "service", "health", "appointment")):
+            return BOOKING_FEE_PER_SIDE, BOOKING_FEE_PER_SIDE
+
+        # Standard (product, food order): ₦50 per side
+        return STANDARD_FEE_PER_SIDE, STANDARD_FEE_PER_SIDE
+
+    @staticmethod
+    def get_fee_breakdown(
+        product_price: Decimal,
+        transaction_type: str,
+    ) -> dict:
+        """
+        Calculate fee breakdown for display at checkout.
+        Blueprint §5.4: "All fees shown transparently in checkout summary
+        before user confirms."
+        """
+        customer_fee, business_fee = TransactionService.get_fees(transaction_type)
+        return {
+            "product_price":   product_price,
+            "customer_fee":    customer_fee,
+            "business_fee":    business_fee,
+            "customer_total":  product_price + customer_fee,
+            "business_net":    product_price - business_fee,
+            "platform_total":  customer_fee + business_fee,
+            "currency":        "NGN",
+            "transaction_type": transaction_type,
+        }
+
+    # Backward-compat alias
+    @staticmethod
+    def calculate_platform_fee(transaction_type: str) -> Decimal:
+        """Returns customer_fee (per-side). Use get_fees() for full breakdown."""
+        customer_fee, _ = TransactionService.get_fees(transaction_type)
+        return customer_fee
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PAYMENT PROCESSING — Blueprint §5.4 Middleware
     # ═══════════════════════════════════════════════════════════════════════
 
     async def process_payment(
@@ -77,131 +159,128 @@ class TransactionService:
         *,
         customer_id: UUID,
         business_id: UUID,
-        gross_amount: Decimal,
+        product_price: Decimal,        # BASE price (before any fees)
         transaction_type: str,
         description: str,
-        reference: str,
+        reference: str,                # idempotency key (e.g. booking_id str)
         related_entity_id: Optional[UUID] = None,
+        related_order_id: Optional[UUID] = None,
+        related_booking_id: Optional[UUID] = None,
         metadata: Optional[dict] = None,
     ) -> Tuple[WalletTransaction, WalletTransaction, PlatformRevenue]:
         """
-        Process a complete payment transaction with automatic fee deduction.
-        
-        This is an ATOMIC operation that:
-        1. Debits customer wallet (gross amount)
-        2. Calculates platform fee based on transaction type
-        3. Credits business wallet (gross - fee)
-        4. Records platform revenue
-        
-        All steps occur in a single database transaction. If any step fails,
-        the entire operation rolls back.
-        
-        Args:
-            customer_id: UUID of the paying customer
-            business_id: UUID of the business receiving payment
-            gross_amount: Total amount customer pays (₦)
-            transaction_type: One of: hotel_booking, food_order, service_booking,
-                            product_purchase, ticket_sale, health_appointment
-            description: Human-readable description
-            reference: Unique idempotency key (e.g., booking_id, order_id)
-            related_entity_id: Optional ID of the booking/order/purchase
-            metadata: Optional additional context
-        
-        Returns:
-            Tuple of (customer_transaction, business_transaction, platform_revenue)
-        
-        Raises:
-            ValidationException: If gross_amount <= 0 or net_amount <= 0
-            InsufficientBalanceException: If customer wallet balance < gross_amount
-            NotFoundException: If customer or business wallet not found
-        """
-        # Validate amount
-        if gross_amount <= 0:
-            raise ValidationException("Gross amount must be positive")
+        Process a complete payment with Blueprint-correct two-sided fee deduction.
 
-        # Check idempotency - if this reference already processed, return existing
+        Blueprint §5.4 Implementation:
+          Step 1: customer_fee, business_fee = get_fees(transaction_type)
+          Step 2: Debit customer wallet: product_price + customer_fee
+          Step 3: Credit business wallet: product_price - business_fee
+          Step 4: Credit platform_revenue_pool: customer_fee + business_fee
+          Step 5: All in a single DB transaction — atomic. Rollback on failure.
+
+        Args:
+            product_price:    Base price of the product/service (before fees).
+            transaction_type: "product_purchase" | "food_order" | "hotel_booking" |
+                              "service_booking" | "health_appointment" | "ticket_sale"
+            reference:        Unique idempotency key — safe to retry with same key.
+
+        Returns:
+            (customer_transaction, business_transaction, platform_revenue)
+        """
+        if product_price <= 0:
+            raise ValidationException("Product price must be positive")
+
+        # ── Idempotency check ─────────────────────────────────────────────────
         existing_revenue = await platform_revenue_crud.get_by_reference(
             db, reference=reference
         )
         if existing_revenue:
-            logger.info(f"Duplicate payment attempt: {reference}")
-            # Fetch and return the original transactions
-            customer_txn = await wallet_transaction_crud.get(
-                db, id=existing_revenue.customer_transaction_id
+            logger.info("Duplicate payment (idempotent): %s", reference)
+            customer_txn = await wallet_transaction_crud.get_by_idempotency_key(
+                db, idempotency_key=reference
             )
-            business_txn = await wallet_transaction_crud.get(
-                db, id=existing_revenue.business_transaction_id
+            business_txn = await wallet_transaction_crud.get_by_idempotency_key(
+                db, idempotency_key=f"{reference}_BUSINESS"
             )
             return customer_txn, business_txn, existing_revenue
 
-        # Calculate platform fee
-        platform_fee = self.calculate_platform_fee(transaction_type)
-        net_amount = gross_amount - platform_fee
+        # ── Fee calculation — Blueprint §5.4 ──────────────────────────────────
+        customer_fee, business_fee = self.get_fees(transaction_type)
+        customer_total = product_price + customer_fee    # what customer pays
+        business_net   = product_price - business_fee    # what business receives
+        platform_total = customer_fee + business_fee     # platform revenue
 
-        if net_amount <= 0:
+        if business_net < 0:
             raise ValidationException(
-                f"Net amount after ₦{platform_fee} fee must be positive"
+                f"Product price ₦{product_price} is less than business fee ₦{business_fee}"
             )
 
-        # Get wallets
-        customer_wallet = await wallet_crud.get_by_user(db, user_id=customer_id)
+        # ── Wallet lookup ─────────────────────────────────────────────────────
+        customer_wallet = await wallet_crud.get_by_owner(db, owner_id=customer_id)
         if not customer_wallet:
-            raise NotFoundException("Customer wallet")
+            raise NotFoundException("Customer wallet not found")
 
-        business_wallet = await wallet_crud.get_by_user(db, user_id=business_id)
+        business_wallet = await wallet_crud.get_by_owner(db, owner_id=business_id)
         if not business_wallet:
-            raise NotFoundException("Business wallet")
+            raise NotFoundException("Business wallet not found")
 
         try:
-            # Step 1: Debit customer wallet (gross amount)
-            customer_transaction = await wallet_crud.debit_wallet(
+            # ── Step 2: Debit customer (product_price + customer_fee) ──────────
+            customer_txn = await wallet_crud.debit_wallet(
                 db,
                 wallet_id=customer_wallet.id,
-                amount=gross_amount,
+                amount=customer_total,
                 transaction_type=TransactionType.PAYMENT,
                 description=f"Payment: {description}",
-                reference_id=reference,
+                idempotency_key=reference,            # UNIQUE NOT NULL
+                related_order_id=related_order_id,
+                related_booking_id=related_booking_id,
                 metadata={
                     **(metadata or {}),
                     "transaction_type": transaction_type,
-                    "business_id": str(business_id),
-                    "gross_amount": float(gross_amount),
-                    "platform_fee": float(platform_fee),
+                    "business_id":      str(business_id),
+                    "product_price":    float(product_price),
+                    "customer_fee":     float(customer_fee),
+                    "customer_total":   float(customer_total),
                 },
             )
 
-            # Step 2: Credit business wallet (net amount)
-            business_transaction = await wallet_crud.credit_wallet(
+            # ── Step 3: Credit business (product_price - business_fee) ─────────
+            business_txn = await wallet_crud.credit_wallet(
                 db,
                 wallet_id=business_wallet.id,
-                amount=net_amount,
+                amount=business_net,
                 transaction_type=TransactionType.CREDIT,
                 description=f"Payment received: {description}",
-                reference_id=f"{reference}_BUSINESS",
+                idempotency_key=f"{reference}_BUSINESS",    # UNIQUE NOT NULL
+                related_order_id=related_order_id,
+                related_booking_id=related_booking_id,
                 metadata={
                     **(metadata or {}),
                     "transaction_type": transaction_type,
-                    "customer_id": str(customer_id),
-                    "gross_amount": float(gross_amount),
-                    "platform_fee": float(platform_fee),
-                    "net_amount": float(net_amount),
+                    "customer_id":      str(customer_id),
+                    "product_price":    float(product_price),
+                    "business_fee":     float(business_fee),
+                    "business_net":     float(business_net),
                 },
             )
 
-            # Step 3: Record platform revenue.
-            # Flush first so customer_transaction.id and business_transaction.id
-            # are populated (server-generated UUIDs are NULL until flushed).
+            # Flush so UUIDs are populated before revenue record FK references them
             await db.flush()
 
-            revenue_record = await platform_revenue_crud.create_revenue_record(
+            # ── Step 4: Record platform revenue ──────────────────────────────
+            # gross_amount = customer_total (what customer paid)
+            # platform_fee = platform_total (what platform earns)
+            # net_amount   = business_net   (what business received)
+            revenue = await platform_revenue_crud.create_revenue_record(
                 db,
-                customer_transaction_id=customer_transaction.id,
-                business_transaction_id=business_transaction.id,
+                customer_transaction_id=customer_txn.id,
+                business_transaction_id=business_txn.id,
                 customer_id=customer_id,
                 business_id=business_id,
-                gross_amount=gross_amount,
-                platform_fee=platform_fee,
-                net_amount=net_amount,
+                gross_amount=customer_total,
+                platform_fee=platform_total,
+                net_amount=business_net,
                 transaction_type=transaction_type,
                 transaction_reference=reference,
                 related_entity_id=related_entity_id,
@@ -209,34 +288,30 @@ class TransactionService:
                 metadata=metadata,
             )
 
-            # Commit all changes atomically
+            # ── Step 5: Commit all atomically ─────────────────────────────────
             await db.commit()
-            await db.refresh(customer_transaction)
-            await db.refresh(business_transaction)
-            await db.refresh(revenue_record)
+            await db.refresh(customer_txn)
+            await db.refresh(business_txn)
+            await db.refresh(revenue)
 
             logger.info(
-                f"Payment processed: {reference} | "
-                f"Customer: ₦{gross_amount} | "
-                f"Business: ₦{net_amount} | "
-                f"Fee: ₦{platform_fee}"
+                "Payment processed: %s | customer_paid=₦%s | business_net=₦%s | "
+                "platform=₦%s",
+                reference, customer_total, business_net, platform_total,
             )
+            return customer_txn, business_txn, revenue
 
-            return customer_transaction, business_transaction, revenue_record
-
-        except IntegrityError as e:
+        except IntegrityError as exc:
             await db.rollback()
-            logger.error(f"Payment integrity error: {reference} - {str(e)}")
-            raise ValidationException("Payment processing failed - duplicate reference")
-
+            logger.error("Payment IntegrityError: %s — %s", reference, exc)
+            raise ValidationException("Payment failed — duplicate reference")
         except InsufficientBalanceException:
             await db.rollback()
             raise
-
-        except Exception as e:
+        except Exception as exc:
             await db.rollback()
-            logger.error(f"Payment processing error: {reference} - {str(e)}")
-            raise ValidationException(f"Payment processing failed: {str(e)}")
+            logger.error("Payment error: %s — %s", reference, exc)
+            raise ValidationException(f"Payment failed: {exc}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # REFUND PROCESSING
@@ -251,159 +326,105 @@ class TransactionService:
         refund_amount: Optional[Decimal] = None,
         description: Optional[str] = None,
         metadata: Optional[dict] = None,
-    ) -> Tuple[WalletTransaction, WalletTransaction, Optional[PlatformRevenue]]:
+    ) -> Tuple[WalletTransaction, WalletTransaction, PlatformRevenue]:
         """
-        Process a refund for a previous payment.
+        Refund a previous payment.
 
-        This operation:
-        1. Finds the original payment transaction
-        2. Credits customer wallet (refund full or partial gross amount)
-        3. Debits business wallet (corresponding net amount)
-        4. Reverses platform revenue if full refund
+        Blueprint §5.1: "Refunds return to customer wallet within 24 hours
+        of cancellation approval."
+        Blueprint §5.4: Platform fee is NOT refundable unless the cancellation
+        is due to a verified platform error.
 
-        Args:
-            original_reference: Reference of the original payment
-            refund_reference: Unique reference for this refund
-            refund_amount: Optional partial refund amount (defaults to full)
-            description: Optional refund reason
-            metadata: Optional additional context
+        Full refund: customer receives back `business_net` (product_price - business_fee).
+        Business pays back: `business_net` (exactly what they received).
+        Platform retains: the platform fee.
 
-        Returns:
-            Tuple of (customer_refund, business_debit, reversed_revenue_or_none)
+        This is handled by Celery task `process_refund` (max 24h delay).
         """
-        # Check refund idempotency
-        existing_refund = await platform_revenue_crud.get_by_reference(
+        # Idempotency check
+        existing = await platform_revenue_crud.get_by_reference(
             db, reference=refund_reference
         )
-        if existing_refund:
-            logger.info(f"Duplicate refund attempt: {refund_reference}")
-            customer_txn = await wallet_transaction_crud.get(
-                db, id=existing_refund.customer_transaction_id
+        if existing:
+            logger.info("Duplicate refund (idempotent): %s", refund_reference)
+            customer_txn = await wallet_transaction_crud.get_by_idempotency_key(
+                db, idempotency_key=refund_reference
             )
-            business_txn = await wallet_transaction_crud.get(
-                db, id=existing_refund.business_transaction_id
+            business_txn = await wallet_transaction_crud.get_by_idempotency_key(
+                db, idempotency_key=f"{refund_reference}_BUSINESS"
             )
-            return customer_txn, business_txn, existing_refund
+            return customer_txn, business_txn, existing
 
         # Find original revenue record
-        original_revenue = await platform_revenue_crud.get_by_reference(
+        original = await platform_revenue_crud.get_by_reference(
             db, reference=original_reference
         )
-        if not original_revenue:
-            raise NotFoundException(
-                f"Original payment not found: {original_reference}"
-            )
+        if not original:
+            raise NotFoundException(f"Original payment not found: {original_reference}")
 
-        # Determine refund amounts.
-        #
-        # Blueprint §4.4: "Platform fee is non-refundable even if a booking
-        # is cancelled."
-        #
-        # Full refund flow:
-        #   Customer receives back:  net_amount  (gross - platform_fee)
-        #   Business pays back:      net_amount  (exactly what they received)
-        #   Platform retains:        platform_fee (already in PlatformRevenue)
-        #
-        # Both parties effectively bear the platform fee — the customer does
-        # not recover it, and the business returns only what they were credited.
+        # Refund amounts — platform fee retained
         if refund_amount is None:
-            # Full refund — platform fee is kept, not returned to customer
-            customer_refund_amount = original_revenue.net_amount   # gross - fee
-            business_debit_amount  = original_revenue.net_amount   # what they received
-            fee_refund             = Decimal("0.00")               # platform retains
+            customer_refund_amount = original.net_amount   # full refund = business_net
+            business_debit_amount  = original.net_amount
         else:
-            # Partial refund — scale against net (already excludes the fee)
-            if refund_amount > original_revenue.net_amount:
-                raise ValidationException("Refund amount exceeds refundable amount (gross minus platform fee)")
-
-            refund_ratio           = refund_amount / original_revenue.net_amount
+            if refund_amount > original.net_amount:
+                raise ValidationException(
+                    "Refund amount exceeds refundable amount (gross minus platform fee)"
+                )
             customer_refund_amount = refund_amount
-            business_debit_amount  = original_revenue.net_amount * refund_ratio
-            fee_refund             = Decimal("0.00")               # platform retains
+            business_debit_amount  = refund_amount
 
-        # Aliases used below for clarity
-        gross_refund = customer_refund_amount
-        net_refund   = business_debit_amount
-
-        # Resolve original wallet transactions by their reference_id strings —
-        # this avoids both the lazy-load problem (ORM relationship returns None
-        # in async context) and any UUID type-cast issues with FK column lookups.
-        # The reference strings are deterministic: they were set when
-        # process_payment() called debit_wallet / credit_wallet.
-        original_customer_txn = await wallet_transaction_crud.get_by_reference(
-            db, reference_id=original_reference
+        # Find original wallet transactions
+        original_customer_txn = await wallet_transaction_crud.get_by_idempotency_key(
+            db, idempotency_key=original_reference
         )
-        original_business_txn = await wallet_transaction_crud.get_by_reference(
-            db, reference_id=f"{original_reference}_BUSINESS"
+        original_business_txn = await wallet_transaction_crud.get_by_idempotency_key(
+            db, idempotency_key=f"{original_reference}_BUSINESS"
         )
         if not original_customer_txn or not original_business_txn:
             raise ValidationException(
-                f"Original wallet transactions not found for refund '{original_reference}'. "
-                "Ensure the original payment was processed successfully."
+                f"Original wallet transactions not found for: {original_reference}"
             )
 
         try:
-            # Step 1: Credit customer wallet (gross refund)
+            # Credit customer
             customer_refund = await wallet_crud.credit_wallet(
                 db,
                 wallet_id=original_customer_txn.wallet_id,
-                amount=gross_refund,
+                amount=customer_refund_amount,
                 transaction_type=TransactionType.REFUND,
-                description=description or f"Refund: {original_revenue.description}",
-                reference_id=refund_reference,
-                metadata={
-                    **(metadata or {}),
-                    "original_reference": original_reference,
-                    "original_gross": float(original_revenue.gross_amount),
-                    "refund_gross": float(gross_refund),
-                },
+                description=description or f"Refund: {original.description}",
+                idempotency_key=refund_reference,
+                metadata={**(metadata or {}), "original_reference": original_reference},
             )
 
-            # Step 2: Debit business wallet (net refund)
+            # Debit business
             business_debit = await wallet_crud.debit_wallet(
                 db,
                 wallet_id=original_business_txn.wallet_id,
-                amount=net_refund,
+                amount=business_debit_amount,
                 transaction_type=TransactionType.DEBIT,
-                description=description or f"Refund issued: {original_revenue.description}",
-                reference_id=f"{refund_reference}_BUSINESS",
-                metadata={
-                    **(metadata or {}),
-                    "original_reference": original_reference,
-                    "refund_net": float(net_refund),
-                },
+                description=description or f"Refund issued: {original.description}",
+                idempotency_key=f"{refund_reference}_BUSINESS",
+                metadata={**(metadata or {}), "original_reference": original_reference},
             )
 
-            # Step 3: Record reversed revenue.
-            #
-            # FIX: The platform_revenue table has a non_negative_net_amount
-            # CHECK constraint — it rejects negative values.  Store absolute
-            # (positive) amounts; the transaction_type already identifies this
-            # as a refund/reversal.
-            #
-            # FIX: flush before reading .id — WalletTransaction PKs are
-            # server-generated UUIDs so they are NULL until the row is flushed.
-            # Without flush, business_transaction_id is None → IntegrityError.
             await db.flush()
 
             reversed_revenue = await platform_revenue_crud.create_revenue_record(
                 db,
                 customer_transaction_id=customer_refund.id,
                 business_transaction_id=business_debit.id,
-                customer_id=original_revenue.customer_id,
-                business_id=original_revenue.business_id,
-                gross_amount=gross_refund,   # positive — constraint forbids negative
-                platform_fee=fee_refund,     # positive — type field marks as reversal
-                net_amount=net_refund,       # positive
-                transaction_type=f"{original_revenue.transaction_type}_refund",
+                customer_id=original.customer_id,
+                business_id=original.business_id,
+                gross_amount=customer_refund_amount,
+                platform_fee=Decimal("0"),          # platform retains its fee
+                net_amount=business_debit_amount,
+                transaction_type=f"{original.transaction_type}_refund",
                 transaction_reference=refund_reference,
-                related_entity_id=original_revenue.related_entity_id,
-                description=description or f"Refund: {original_revenue.description}",
-                metadata={
-                    **(metadata or {}),
-                    "original_reference": original_reference,
-                    "is_reversal": True,
-                },
+                related_entity_id=original.related_entity_id,
+                description=description or f"Refund: {original.description}",
+                metadata={**(metadata or {}), "original_reference": original_reference},
             )
 
             await db.commit()
@@ -412,88 +433,15 @@ class TransactionService:
             await db.refresh(reversed_revenue)
 
             logger.info(
-                f"Refund processed: {refund_reference} | "
-                f"Customer refund: ₦{gross_refund} | "
-                f"Business debit: ₦{net_refund} | "
-                f"Fee reversed: ₦{fee_refund}"
+                "Refund processed: %s | customer=₦%s | business_debit=₦%s",
+                refund_reference, customer_refund_amount, business_debit_amount,
             )
-
             return customer_refund, business_debit, reversed_revenue
 
-        except Exception as e:
+        except Exception as exc:
             await db.rollback()
-            logger.error(f"Refund processing error: {refund_reference} - {str(e)}")
-            raise ValidationException(f"Refund processing failed: {str(e)}")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # FEE CALCULATION
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def calculate_platform_fee(transaction_type: str) -> Decimal:
-        """
-        Calculate platform fee based on transaction type.
-        
-        Per Blueprint Section 4.4:
-        - ₦50: product_purchase, food_order, ticket_sale
-        - ₦100: hotel_booking, service_booking, health_appointment
-        
-        Args:
-            transaction_type: Type of transaction
-        
-        Returns:
-            Platform fee amount (₦50 or ₦100)
-        """
-        # Normalize transaction type to lowercase for comparison
-        txn_type_lower = transaction_type.lower()
-
-        # ₦100 fee (bookings)
-        booking_types = [
-            "hotel_booking",
-            "hotel",
-            "service_booking",
-            "service",
-            "health_appointment",
-            "health",
-            "booking",
-        ]
-
-        if any(t in txn_type_lower for t in booking_types):
-            return PLATFORM_FEE_BOOKING  # ₦100
-
-        # ₦50 fee (standard transactions)
-        # Includes: product_purchase, food_order, ticket_sale
-        return PLATFORM_FEE_STANDARD  # ₦50
-
-    @staticmethod
-    def get_fee_breakdown(
-        gross_amount: Decimal,
-        transaction_type: str,
-    ) -> dict:
-        """
-        Calculate fee breakdown for display before payment confirmation.
-        
-        Useful for checkout screens to show:
-        - Amount to be charged
-        - Platform fee
-        - Amount business will receive
-        
-        Args:
-            gross_amount: Total amount customer will pay
-            transaction_type: Type of transaction
-        
-        Returns:
-            Dict with gross_amount, platform_fee, net_amount
-        """
-        platform_fee = TransactionService.calculate_platform_fee(transaction_type)
-        net_amount = gross_amount - platform_fee
-
-        return {
-            "gross_amount": gross_amount,
-            "platform_fee": platform_fee,
-            "net_amount": net_amount,
-            "currency": "NGN",
-        }
+            logger.error("Refund error: %s — %s", refund_reference, exc)
+            raise ValidationException(f"Refund failed: {exc}")
 
 
 # Singleton

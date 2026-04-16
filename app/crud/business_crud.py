@@ -18,11 +18,25 @@ FIX: Custom async update() override added.
   The override intercepts latitude/longitude from the update payload and
   converts them into a PostGIS ST_SetSRID(ST_MakePoint(lng, lat), 4326)
   expression written to the 'location' column instead.
+
+FIX: Sync lookup methods added (get_sync, get_by_user_id_sync).
+  business_crud inherits from AsyncCRUDBase and all its methods expect an
+  AsyncSession. The services module (services.py, service_service.py,
+  services_crud.py) uses a synchronous Session throughout. Calling an async
+  crud method with a sync Session causes db.execute() to return a
+  ChunkedIteratorResult directly (no coroutine), then awaiting that result
+  raises:
+      TypeError: object ChunkedIteratorResult can't be used in 'await' expression
+
+  Fix: expose plain sync methods that accept sqlalchemy.orm.Session and use
+  db.query() — the same pattern as services_crud.py. These are the only
+  methods services.py needs from business_crud; all async methods remain
+  intact for the rest of the app.
 """
 
 from typing import Optional, Tuple, List, Union
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import or_, case, func, and_, select, update as sa_update
 from uuid import UUID
 from geoalchemy2.functions import ST_DWithin, ST_Distance
@@ -41,7 +55,7 @@ _TIER_ORDER = case(
     else_=3,
 )
 
-# Relationships eagerly loaded for every list/search query
+# Relationships eagerly loaded for every list/search query (async path)
 _EAGER = [
     selectinload(Business.user),
     selectinload(Business.business_hours),
@@ -106,18 +120,54 @@ class CRUDBusiness(CRUDBase[Business, dict, dict]):
         await db.refresh(db_obj)
         return db_obj
 
-    # ── Lookups ──────────────────────────────────────────────────────────────
+    # ── Async lookups (for async routes / admin / other async contexts) ───────
 
     async def get_by_user_id(
         self, db: AsyncSession, *, user_id: UUID
     ) -> Optional[Business]:
-        """Get business by user ID."""
+        """Get business by user ID. Requires AsyncSession."""
         result = await db.execute(
             select(Business)
             .options(*_EAGER)
             .where(Business.user_id == user_id)
         )
         return result.scalars().first()
+
+    # ── Sync lookups (for sync service routes that use sqlalchemy.orm.Session) ─
+    #
+    # The services module (services.py, service_service.py, services_crud.py)
+    # operates entirely on a synchronous Session from get_db(). Calling the
+    # async methods above with a sync Session causes:
+    #     TypeError: object ChunkedIteratorResult can't be used in 'await' expression
+    # because db.execute() returns a result directly instead of a coroutine.
+    #
+    # These sync methods mirror the async versions using db.query() — the same
+    # pattern used throughout services_crud.py.
+
+    def get_sync(self, db: Session, *, id: UUID) -> Optional[Business]:
+        """
+        Sync equivalent of AsyncCRUDBase.get().
+
+        Use in any route or service that holds a sync Session (get_db).
+        The base class get() is async and must NOT be called with a sync session.
+        """
+        return db.query(Business).filter(Business.id == id).first()
+
+    def get_by_user_id_sync(
+        self, db: Session, *, user_id: UUID
+    ) -> Optional[Business]:
+        """
+        Sync equivalent of get_by_user_id().
+
+        Use in any route or service that holds a sync Session (get_db).
+        """
+        return (
+            db.query(Business)
+            .filter(Business.user_id == user_id)
+            .first()
+        )
+
+    # ── Async spatial queries ─────────────────────────────────────────────────
 
     async def get_nearby_businesses(
         self,

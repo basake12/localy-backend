@@ -40,8 +40,7 @@ from app.crud.properties_crud import (
     saved_property_crud,
     property_inquiry_crud,
 )
-from app.crud.business_crud import business_crud
-from app.crud.subscription_crud import subscription_crud
+from app.models.business_model import Business
 from app.models.properties_model import Property, PropertyViewing, PropertyOffer
 from app.models.user_model import User
 from app.core.exceptions import (
@@ -54,12 +53,27 @@ router = APIRouter()
 
 
 # ─────────────────────────────────────────────
+# FIX: SYNC BUSINESS LOOKUP
+# ─────────────────────────────────────────────
+# business_crud is an AsyncCRUDBase — calling its methods without `await`
+# in a sync router returns a coroutine object, not a Business instance.
+# Accessing any attribute on that coroutine (.id, .category) raises:
+#   AttributeError: 'coroutine' object has no attribute '...'
+# Fix: query Business directly with the sync Session everywhere in this router.
+
+def _get_business_sync(db: Session, user_id: UUID) -> Optional[Business]:
+    """Sync Business lookup by user_id — safe to call from a sync router."""
+    return db.query(Business).filter(Business.user_id == user_id).first()
+
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 
 def _get_verified_agent(db: Session, current_user: User):
     """Return the agent record for the authenticated business user or raise."""
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: was business_crud.get_by_user_id() — async crud in sync router → coroutine
+    business = _get_business_sync(db, current_user.id)
     if not business:
         raise NotFoundException("Business")
     agent = property_agent_crud.get_by_business_id(db, business_id=business.id)
@@ -78,24 +92,95 @@ def _assert_property_owned_by_agent(db: Session, property_id: UUID, agent):
     return property_obj
 
 
-def _require_pro_subscription(db: Session, current_user: User) -> None:
+# ── Blueprint §6.6 tier limits ────────────────────────────────────────────────
+# Free:       0 listings — BLOCKED at creation. PropertyUpgradeGate shown.
+# Starter:    Up to 15 active listings.
+# Pro:        Up to 35 active listings.
+# Enterprise: Unlimited.
+#
+# IMPORTANT: Starter is NOT blocked — it has a cap of 15.
+# The previous code blocked Starter entirely, which is wrong per blueprint.
+#
+# Implementation uses business.subscription_tier (kept in sync by
+# subscription_service on every plan change — Blueprint §7.2).
+# NO inspect.iscoroutine() anti-pattern — reads the DB column directly.
+
+_TIER_LISTING_LIMITS: dict[str, Optional[int]] = {
+    "free":       0,     # Blocked — no listings
+    "starter":    15,    # Up to 15
+    "pro":        35,    # Up to 35
+    "enterprise": None,  # Unlimited
+}
+
+
+def _get_tier_val(business) -> str:
+    """Extract subscription_tier as a plain lowercase string."""
+    tier = business.subscription_tier
+    return tier.value if hasattr(tier, "value") else str(tier or "free").lower()
+
+
+def _check_property_listing_gate(db: Session, current_user: User) -> tuple:
     """
-    Blueprint §2.4, §8.2, §11.6 — Property listing creation requires
-    Pro or Enterprise subscription. Raises ValidationException if the
-    business is on Free or Starter.
+    Enforce property listing tier limits before any DB write.
+    Blueprint §6.6: Free=0, Starter=15, Pro=35, Enterprise=unlimited.
+    Blueprint §3.4 HARD RULE: paywall shown at creation screen — BEFORE
+    the user starts filling in listing details.
+
+    Returns (business, agent) for use by the calling endpoint.
+    Raises HTTP 403 with upgrade prompt if limit reached.
     """
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    from fastapi import HTTPException
+    from app.models.properties_model import PropertyStatusEnum
+
+    business = _get_business_sync(db, current_user.id)
     if not business:
         raise NotFoundException("Business")
 
-    sub = subscription_crud.get_active_by_business_id(db, business_id=business.id)
-    plan = sub.plan_type if sub else "free"
+    tier_val = _get_tier_val(business)
+    limit    = _TIER_LISTING_LIMITS.get(tier_val, 0)
 
-    if plan not in ("pro", "enterprise"):
-        raise ValidationException(
-            "Publishing property listings requires a Pro or Enterprise subscription. "
-            "Please upgrade your plan from the subscription settings to continue."
+    # Free: blocked entirely
+    if limit == 0:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error":        "property_listing_blocked",
+                "message":      (
+                    "Property listing creation requires a Pro or Enterprise plan. "
+                    "Free plan: 0 listings allowed."
+                ),
+                "upgrade_url":  "/plans/upgrade",
+                "current_tier": tier_val,
+            },
         )
+
+    agent = property_agent_crud.get_by_business_id(db, business_id=business.id)
+    if not agent:
+        raise NotFoundException("Property agent. Create agent profile first.")
+
+    # Starter and Pro: count-based limit
+    if limit is not None:
+        active_count = property_agent_crud.count_active_listings(
+            db, agent_id=agent.id
+        )
+        if active_count >= limit:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error":         "property_listing_limit_reached",
+                    "message":       (
+                        f"{tier_val.capitalize()} plan allows up to {limit} "
+                        f"active property listings. You have {active_count}."
+                    ),
+                    "upgrade_url":   "/plans/upgrade",
+                    "current_count": active_count,
+                    "limit":         limit,
+                    "current_tier":  tier_val,
+                },
+            )
+
+    # Enterprise: unlimited — no count check needed
+    return business, agent
 
 
 # ─────────────────────────────────────────────
@@ -129,7 +214,7 @@ def search_properties(
         listing_type=search_params.listing_type,
         city=search_params.city,
         state=search_params.state,
-        local_government=search_params.local_government,
+        # local_government intentionally omitted — Blueprint §2/§4 HARD RULE
         location=location,
         radius_km=search_params.radius_km or 20.0,
         min_price=search_params.min_price,
@@ -201,46 +286,43 @@ def create_property_agent(
     agent_in: PropertyAgentCreateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
     if not business:
         raise NotFoundException("Business")
-    # FIX: was "properties" — correct value from BusinessCategory enum is "property_agent"
     if business.category != "property_agent":
         raise ValidationException(
-            "Only property_agent category businesses can create an agent profile"
+            "Only property_agent category businesses can create agent profiles"
         )
-    if property_agent_crud.get_by_business_id(db, business_id=business.id):
-        raise ValidationException("Property agent already exists for this business")
 
-    agent_data = agent_in.model_dump()
-    agent_data["business_id"] = business.id
-    agent = property_agent_crud.create_from_dict(db, obj_in=agent_data)
+    existing = property_agent_crud.get_by_business_id(db, business_id=business.id)
+    if existing:
+        raise ValidationException("Agent profile already exists for this business")
+
+    data = agent_in.model_dump()
+    data["business_id"] = business.id
+    agent = property_agent_crud.create_from_dict(db, obj_in=data)
     return {"success": True, "data": agent}
 
 
 @router.get(
     "/agents/my",
     response_model=SuccessResponse[PropertyAgentResponse],
-    summary="Get own agent profile",
+    summary="Get my agent profile",
 )
 def get_my_agent_profile(
     *,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
-    if not business:
-        raise NotFoundException("Business")
-    agent = property_agent_crud.get_by_business_id(db, business_id=business.id)
-    if not agent:
-        raise NotFoundException("Property agent")
+    agent = _get_verified_agent(db, current_user)
     return {"success": True, "data": agent}
 
 
 @router.patch(
     "/agents/my",
     response_model=SuccessResponse[PropertyAgentResponse],
-    summary="Update own agent profile",
+    summary="Update my agent profile",
 )
 def update_my_agent_profile(
     *,
@@ -248,27 +330,21 @@ def update_my_agent_profile(
     agent_in: PropertyAgentUpdateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
-    if not business:
-        raise NotFoundException("Business")
-    agent = property_agent_crud.get_by_business_id(db, business_id=business.id)
-    if not agent:
-        raise NotFoundException("Property agent")
-    updated = property_agent_crud.update(
-        db, db_obj=agent, obj_in=agent_in.model_dump(exclude_none=True)
-    )
-    return {"success": True, "data": updated}
+    agent = _get_verified_agent(db, current_user)
+    update_data = agent_in.model_dump(exclude_unset=True)
+    agent = property_agent_crud.update(db, db_obj=agent, obj_in=update_data)
+    return {"success": True, "data": agent}
 
 
 # ─────────────────────────────────────────────
-# PROPERTY MANAGEMENT — BUSINESS
+# PROPERTY LISTINGS — BUSINESS (AGENT)
 # ─────────────────────────────────────────────
 
 @router.post(
-    "/",
+    "/my",
     response_model=SuccessResponse[PropertyResponse],
     status_code=status.HTTP_201_CREATED,
-    summary="Create property listing (requires Pro or Enterprise subscription)",
+    summary="Create property listing (Pro/Enterprise required)",
 )
 def create_property(
     *,
@@ -276,40 +352,56 @@ def create_property(
     property_in: PropertyCreateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; helpers are sync so no await needed.
-    # FIX (Blueprint §2.4, §8.2, §11.6): Pro/Enterprise gate enforced before
-    # any listing is created. Free and Starter agents see a 400 with upgrade prompt.
-    _require_pro_subscription(db, current_user)
-    agent = _get_verified_agent(db, current_user)
+    # Blueprint §6.6: tier gate + count limit enforced BEFORE any DB write
+    # Free: blocked. Starter: ≤15. Pro: ≤35. Enterprise: unlimited.
+    _, agent = _check_property_listing_gate(db, current_user)
+
+    property_data = property_in.model_dump(exclude={"location"})
+    if property_in.location:
+        property_data["location"] = {
+            "latitude": property_in.location.latitude,
+            "longitude": property_in.location.longitude,
+        }
+
     property_obj = property_crud.create_property(
-        db, agent_id=agent.id, property_data=property_in.model_dump()
+        db, agent_id=agent.id, property_data=property_data
     )
-    return {"success": True, "data": property_obj}
+    property_dict = property_service.get_property_details(
+        db, property_id=property_obj.id
+    )
+    return {"success": True, "data": property_dict}
 
 
 @router.get(
-    "/my/listings",
+    "/my",
     response_model=SuccessResponse[List[PropertyListResponse]],
-    summary="Get own listings",
+    summary="Get my property listings",
 )
 def get_my_properties(
     *,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
     pagination: dict = Depends(get_pagination_params),
+    listing_status: Optional[str] = Query(None, alias="status"),
 ) -> dict:
-    # FIX: was async; removed erroneous await on sync helper
     agent = _get_verified_agent(db, current_user)
     properties = property_crud.get_by_agent(
-        db, agent_id=agent.id, skip=pagination["skip"], limit=pagination["limit"]
+        db,
+        agent_id=agent.id,
+        status=listing_status,
+        skip=pagination["skip"],
+        limit=pagination["limit"],
     )
-    return {"success": True, "data": properties}
+    results = [
+        property_service._property_to_dict(p, agent, None) for p in properties
+    ]
+    return {"success": True, "data": results}
 
 
 @router.patch(
-    "/{property_id}",
+    "/my/{property_id}",
     response_model=SuccessResponse[PropertyResponse],
-    summary="Partial-update a property listing",
+    summary="Update property listing",
 )
 def update_property(
     *,
@@ -318,21 +410,26 @@ def update_property(
     property_in: PropertyUpdateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await on both sync helpers
     agent = _get_verified_agent(db, current_user)
     property_obj = _assert_property_owned_by_agent(db, property_id, agent)
-    updated = property_crud.update(
-        db,
-        db_obj=property_obj,
-        obj_in=property_in.model_dump(exclude_none=True),
-    )
-    return {"success": True, "data": updated}
+
+    update_data = property_in.model_dump(exclude_unset=True, exclude={"location"})
+    if property_in.location:
+        from geoalchemy2.elements import WKTElement
+        update_data["location"] = WKTElement(
+            f"POINT({property_in.location.longitude} {property_in.location.latitude})",
+            srid=4326,
+        )
+
+    property_obj = property_crud.update(db, db_obj=property_obj, obj_in=update_data)
+    property_dict = property_service.get_property_details(db, property_id=property_obj.id)
+    return {"success": True, "data": property_dict}
 
 
 @router.delete(
-    "/{property_id}",
+    "/my/{property_id}",
     response_model=SuccessResponse[dict],
-    summary="Soft-delete property listing",
+    summary="Remove (deactivate) property listing",
 )
 def delete_property(
     *,
@@ -340,12 +437,11 @@ def delete_property(
     property_id: UUID,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await on both sync helpers
     agent = _get_verified_agent(db, current_user)
     property_obj = _assert_property_owned_by_agent(db, property_id, agent)
     property_obj.is_active = False
     db.commit()
-    return {"success": True, "data": {"message": "Property listing removed"}}
+    return {"success": True, "data": {"message": "Property listing deactivated"}}
 
 
 # ─────────────────────────────────────────────
@@ -353,8 +449,8 @@ def delete_property(
 # ─────────────────────────────────────────────
 
 @router.get(
-    "/saved/my",
-    response_model=SuccessResponse[List[dict]],
+    "/saved",
+    response_model=SuccessResponse[List[PropertyListResponse]],
     summary="Get saved properties",
 )
 def get_saved_properties(
@@ -363,35 +459,56 @@ def get_saved_properties(
     current_user: User = Depends(require_customer),
     pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    saved = saved_property_crud.get_saved_properties(
+    saved = saved_property_crud.get_by_customer(
         db,
         customer_id=current_user.id,
         skip=pagination["skip"],
         limit=pagination["limit"],
     )
-    results = [
-        {"saved_at": item.created_at, "notes": item.notes, "property": item.property}
-        for item in saved
-    ]
+    results = []
+    for s in saved:
+        prop = property_crud.get(db, id=s.property_id)
+        if prop:
+            results.append(property_service._property_to_dict(prop, None, None))
     return {"success": True, "data": results}
 
 
 @router.post(
-    "/{property_id}/save",
+    "/saved/{property_id}",
     response_model=SuccessResponse[dict],
-    summary="Toggle save / unsave property",
+    status_code=status.HTTP_201_CREATED,
+    summary="Save a property",
 )
-def toggle_save_property(
+def save_property(
     *,
     db: Session = Depends(get_db),
     property_id: UUID,
-    notes: Optional[str] = None,
     current_user: User = Depends(require_customer),
 ) -> dict:
-    result = saved_property_crud.toggle_save(
-        db, property_id=property_id, customer_id=current_user.id, notes=notes
+    property_obj = property_crud.get(db, id=property_id)
+    if not property_obj or not property_obj.is_active:
+        raise NotFoundException("Property")
+    saved_property_crud.save(
+        db, property_id=property_id, customer_id=current_user.id
     )
-    return {"success": True, "data": result}
+    return {"success": True, "data": {"message": "Property saved"}}
+
+
+@router.delete(
+    "/saved/{property_id}",
+    response_model=SuccessResponse[dict],
+    summary="Remove saved property",
+)
+def unsave_property(
+    *,
+    db: Session = Depends(get_db),
+    property_id: UUID,
+    current_user: User = Depends(require_customer),
+) -> dict:
+    saved_property_crud.unsave(
+        db, property_id=property_id, customer_id=current_user.id
+    )
+    return {"success": True, "data": {"message": "Property removed from saved"}}
 
 
 # ─────────────────────────────────────────────
@@ -404,12 +521,16 @@ def toggle_save_property(
     status_code=status.HTTP_201_CREATED,
     summary="Schedule a property viewing",
 )
-def create_viewing(
+def schedule_viewing(
     *,
     db: Session = Depends(get_db),
     viewing_in: ViewingCreateRequest,
     current_user: User = Depends(require_customer),
 ) -> dict:
+    property_obj = property_crud.get(db, id=viewing_in.property_id)
+    if not property_obj or not property_obj.is_active:
+        raise NotFoundException("Property")
+
     viewing = property_viewing_crud.create_viewing(
         db,
         property_id=viewing_in.property_id,
@@ -429,7 +550,7 @@ def create_viewing(
 @router.get(
     "/viewings/my",
     response_model=SuccessResponse[List[ViewingResponse]],
-    summary="Get own viewing appointments",
+    summary="Get my scheduled viewings",
 )
 def get_my_viewings(
     *,
@@ -449,13 +570,12 @@ def get_my_viewings(
 @router.post(
     "/viewings/{viewing_id}/cancel",
     response_model=SuccessResponse[ViewingResponse],
-    summary="Cancel viewing appointment",
+    summary="Cancel a viewing (customer action)",
 )
 def cancel_viewing(
     *,
     db: Session = Depends(get_db),
     viewing_id: UUID,
-    reason: Optional[str] = None,
     current_user: User = Depends(require_customer),
 ) -> dict:
     viewing = property_viewing_crud.get(db, id=viewing_id)
@@ -464,11 +584,10 @@ def cancel_viewing(
     if viewing.customer_id != current_user.id:
         raise PermissionDeniedException()
     if viewing.status in ["completed", "cancelled"]:
-        raise ValidationException("Cannot cancel a completed or already cancelled viewing")
+        raise ValidationException("Cannot cancel this viewing")
 
     viewing.status = "cancelled"
     viewing.cancelled_at = datetime.now(timezone.utc)
-    viewing.cancellation_reason = reason
     db.commit()
     db.refresh(viewing)
     return {"success": True, "data": viewing}
@@ -491,7 +610,6 @@ def get_agent_viewings(
     viewing_date: Optional[date] = Query(None),
     viewing_status: Optional[str] = Query(None, alias="status"),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
     viewings = property_viewing_crud.get_agent_viewings(
         db,
@@ -515,7 +633,6 @@ def confirm_viewing(
     viewing_id: UUID,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     viewing = property_viewing_crud.get(db, id=viewing_id)
     if not viewing:
         raise NotFoundException("Viewing")
@@ -543,7 +660,6 @@ def complete_viewing(
     agent_notes: Optional[str] = None,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     viewing = property_viewing_crud.get(db, id=viewing_id)
     if not viewing:
         raise NotFoundException("Viewing")
@@ -651,7 +767,6 @@ def get_property_offers(
     current_user: User = Depends(require_business),
     offer_status: Optional[str] = Query(None, alias="status"),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
     _assert_property_owned_by_agent(db, property_id, agent)
     offers = property_offer_crud.get_property_offers(
@@ -671,7 +786,6 @@ def accept_offer(
     offer_id: UUID,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
     offer = property_service.accept_offer(db, offer_id=offer_id, agent_id=agent.id)
     return {"success": True, "data": offer}
@@ -689,7 +803,6 @@ def reject_offer(
     body: RejectOfferRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
     offer = property_service.reject_offer(
         db, offer_id=offer_id, agent_id=agent.id, reason=body.reason
@@ -709,7 +822,6 @@ def counter_offer(
     body: CounterOfferRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
     offer = property_service.counter_offer(
         db,
@@ -768,7 +880,6 @@ def get_property_inquiries(
     is_responded: Optional[bool] = Query(None),
     pagination: dict = Depends(get_pagination_params),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
     _assert_property_owned_by_agent(db, property_id, agent)
     inquiries = property_inquiry_crud.get_property_inquiries(
@@ -793,7 +904,6 @@ def respond_to_inquiry(
     body: InquiryRespondRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     inquiry = property_inquiry_crud.get(db, id=inquiry_id)
     if not inquiry:
         raise NotFoundException("Inquiry")
@@ -824,7 +934,6 @@ def get_agent_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
 ) -> dict:
-    # FIX: was async; removed erroneous await
     agent = _get_verified_agent(db, current_user)
 
     from sqlalchemy import func

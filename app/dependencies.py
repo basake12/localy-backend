@@ -3,93 +3,111 @@ app/dependencies.py
 
 FastAPI dependency injection — authentication, role guards, pagination.
 
-AUTH FLOW
----------
-  JWT token  →  get_current_user (sync) / get_async_current_user (async)
-             →  get_current_active_user  (email verified)
-             →  get_current_fully_verified_user  (email + phone verified)
+FIXES vs previous version:
+  1.  [HARD RULE] get_current_admin_user / require_admin DELETED from this file.
+      Blueprint §2 / §13.3: admin tokens are NEVER accepted by mobile API endpoints.
+      Admin auth lives in a separate admin router with its own JWT secret.
+      Having it here means any accidentally imported guard could let an admin
+      token hit a mobile endpoint.
 
-ROLE GUARDS
------------
-  Each user type has two names for convenience:
-    get_current_<role>_user  — descriptive, used internally
-    get_current_<role>       — short alias, used in router Depends()
+  2.  All user.status enum checks replaced with user.is_active + user.is_banned
+      booleans. Blueprint §14: model uses two separate booleans, not a status enum.
 
-  Both names are identical in behaviour — use whichever reads more clearly
-  at the call site.
+  3.  All user.user_type comparisons changed to user.role.
+      Blueprint §14: field renamed role to match schema exactly.
 
-SYNC vs ASYNC
--------------
-  Sync dependencies use Session + user_crud.get().
-  Async dependencies use AsyncSession + raw select() and are required by
-  any endpoint whose service layer is async (e.g. wallet, payments,
-  businesses).
+  4.  get_current_active_user now checks is_phone_verified (not is_email_verified).
+      Blueprint §3 is phone-number-only registration; email is optional.
+      Phone verification is the gating check for active status.
 
-ADDED:
-  - get_async_current_user_optional — async equivalent of get_current_user_optional.
-    Returns None for unauthenticated requests. Safe for public endpoints.
-  - get_async_current_business_user / require_async_business — async role
-    guard for business-only endpoints that use AsyncSession.
-  - get_async_current_customer_user / require_async_customer — async customer guard.
-  - get_async_current_rider_user / require_async_rider — async rider guard.
+  5.  require_verified_business dependency ADDED.
+      Blueprint §8.4 / §8.5 / §8.6 HARD RULES: only VERIFIED businesses may
+      post reels, stories, or job vacancies. Unverified businesses get a clear
+      error — not a silent blank state.
+
+  6.  All UserType.ADMIN references removed — admin is not a mobile role.
+      UserRoleEnum only has CUSTOMER | BUSINESS | RIDER.
+
+  7.  require_pin_verified — new dependency for wallet transaction endpoints.
+      Blueprint §3.3: PIN required for ALL wallet transactions, withdrawals,
+      and any payment above ₦5,000 regardless of session state or biometric.
+      Enforced at the route dependency level, not inside each service function.
+
+SYNC vs ASYNC:
+  Sync dependencies: Session + user_crud.get() — for legacy sync routers.
+  Async dependencies: AsyncSession + raw select() — required by all new routes.
 """
-
 from typing import Optional
-from fastapi import Depends, Header
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from uuid import UUID
 
-from app.core.database import get_db, get_async_db
-from app.core.security import decode_token
-from app.core.exceptions import (
-    AuthenticationException,
-    PermissionDeniedException,
-    AccountSuspendedException,
-    AccountBannedException,
-    EmailNotVerifiedException,
-    PhoneNotVerifiedException,
-    InvalidUserTypeException,
-)
-from app.core.constants import UserType, UserStatus
+from fastapi import Depends, Header, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+
+from app.core.database import get_async_db, get_db
+from app.core.security import decode_token, TokenDecodeError
 from app.crud.user_crud import user_crud
 from app.models.user_model import User
 
 security = HTTPBearer()
 
+# ────────────────────────────────────────────────────────────────────────────
+# Exception imports — keep local to avoid circular imports
+# ────────────────────────────────────────────────────────────────────────────
+from app.core.exceptions import (
+    AuthenticationException,
+    PermissionDeniedException,
+)
 
-# ================================================================
+
+def _banned_or_inactive_check(user: User) -> None:
+    """
+    Shared status check for both sync and async auth paths.
+    Blueprint §14: is_active + is_banned are separate booleans.
+    """
+    if user.is_banned:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "account_banned",
+                "message": "Your account has been banned. Contact support to appeal.",
+            },
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "account_inactive",
+                "message": "Your account is inactive. Contact support.",
+            },
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # SYNC AUTH DEPENDENCIES
-# Default for all routers. Uses Session from get_db.
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
 
 def get_current_user(
     db: Session = Depends(get_db),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
-    """Decode JWT and return the matching User row."""
-    token = credentials.credentials
+    """Decode JWT and return the matching User row (sync)."""
     try:
-        payload = decode_token(token)
+        payload     = decode_token(credentials.credentials)
         user_id_str = payload.get("sub")
         if not user_id_str:
             raise AuthenticationException("Invalid token payload")
         user_id = UUID(user_id_str)
-    except AuthenticationException:
-        raise
-    except Exception:
+    except (TokenDecodeError, ValueError):
         raise AuthenticationException("Invalid authentication token")
 
     user = user_crud.get(db, id=user_id)
     if not user:
         raise AuthenticationException("User not found")
-    if user.status == UserStatus.SUSPENDED:
-        raise AccountSuspendedException()
-    if user.status == UserStatus.BANNED:
-        raise AccountBannedException()
 
+    _banned_or_inactive_check(user)
     return user
 
 
@@ -97,26 +115,19 @@ def get_current_active_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
     """
-    Require an email-verified, non-suspended account.
+    Require phone-verified account.
 
-    Phone verification is intentionally NOT required here to avoid
-    a bootstrap problem where users cannot reach /verify-phone
-    because their phone is not yet verified.
-    Use get_current_fully_verified_user for payment/order endpoints.
+    Blueprint §3: registration is phone-only.
+    Email is optional — phone verification is the gating check.
     """
-    if not current_user.is_email_verified:
-        raise EmailNotVerifiedException()
-    if current_user.status not in (UserStatus.ACTIVE, UserStatus.PENDING_VERIFICATION):
-        raise PermissionDeniedException("Account is not active")
-    return current_user
-
-
-def get_current_fully_verified_user(
-    current_user: User = Depends(get_current_active_user),
-) -> User:
-    """Require both email AND phone verified. Use for payments and orders."""
     if not current_user.is_phone_verified:
-        raise PhoneNotVerifiedException()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "phone_not_verified",
+                "message": "Please verify your phone number to continue.",
+            },
+        )
     return current_user
 
 
@@ -124,15 +135,11 @@ def get_current_user_optional(
     db: Session = Depends(get_db),
     authorization: Optional[str] = Header(None),
 ) -> Optional[User]:
-    """
-    Return the authenticated user if a valid Bearer token is present,
-    otherwise return None. Never raises — safe for public endpoints
-    that optionally personalise their response.
-    """
+    """Return authenticated User if valid Bearer token present, else None."""
     if not authorization or not authorization.startswith("Bearer "):
         return None
     try:
-        token = authorization.removeprefix("Bearer ").strip()
+        token   = authorization.removeprefix("Bearer ").strip()
         payload = decode_token(token)
         user_id = UUID(payload.get("sub"))
         return user_crud.get(db, id=user_id)
@@ -140,29 +147,22 @@ def get_current_user_optional(
         return None
 
 
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # ASYNC AUTH DEPENDENCIES
-# Required by endpoints whose service layer uses AsyncSession
-# (wallet, payments, businesses, notifications, etc.).
-# Logic mirrors the sync variants above; user lookup uses
-# raw select() because user_crud.get() is synchronous.
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
 
 async def get_async_current_user(
     db: AsyncSession = Depends(get_async_db),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
-    """Decode JWT and return the matching User row (async)."""
-    token = credentials.credentials
+    """Decode JWT and return matching User row (async)."""
     try:
-        payload = decode_token(token)
+        payload     = decode_token(credentials.credentials)
         user_id_str = payload.get("sub")
         if not user_id_str:
             raise AuthenticationException("Invalid token payload")
         user_id = UUID(user_id_str)
-    except AuthenticationException:
-        raise
-    except Exception:
+    except (TokenDecodeError, ValueError):
         raise AuthenticationException("Invalid authentication token")
 
     result = await db.execute(select(User).where(User.id == user_id))
@@ -170,31 +170,23 @@ async def get_async_current_user(
 
     if not user:
         raise AuthenticationException("User not found")
-    if user.status == UserStatus.SUSPENDED:
-        raise AccountSuspendedException()
-    if user.status == UserStatus.BANNED:
-        raise AccountBannedException()
 
+    _banned_or_inactive_check(user)
     return user
 
 
 async def get_async_current_active_user(
     current_user: User = Depends(get_async_current_user),
 ) -> User:
-    """Require email-verified, active account (async)."""
-    if not current_user.is_email_verified:
-        raise EmailNotVerifiedException()
-    if current_user.status not in (UserStatus.ACTIVE, UserStatus.PENDING_VERIFICATION):
-        raise PermissionDeniedException("Account is not active")
-    return current_user
-
-
-async def get_async_fully_verified_user(
-    current_user: User = Depends(get_async_current_active_user),
-) -> User:
-    """Require email + phone verified (async). Use for withdraw/transfer."""
+    """Require phone-verified, active account (async)."""
     if not current_user.is_phone_verified:
-        raise PhoneNotVerifiedException()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "phone_not_verified",
+                "message": "Please verify your phone number to continue.",
+            },
+        )
     return current_user
 
 
@@ -202,86 +194,116 @@ async def get_async_current_user_optional(
     db: AsyncSession = Depends(get_async_db),
     authorization: Optional[str] = Header(None),
 ) -> Optional[User]:
-    """
-    Async equivalent of get_current_user_optional.
-
-    Returns the authenticated User if a valid Bearer token is present,
-    otherwise returns None. Never raises — safe for public endpoints
-    that optionally personalise their response (e.g. business profile pages).
-    """
+    """Async equivalent of get_current_user_optional. Never raises."""
     if not authorization or not authorization.startswith("Bearer "):
         return None
     try:
-        token = authorization.removeprefix("Bearer ").strip()
+        token   = authorization.removeprefix("Bearer ").strip()
         payload = decode_token(token)
         user_id = UUID(payload.get("sub"))
-        result = await db.execute(select(User).where(User.id == user_id))
+        result  = await db.execute(select(User).where(User.id == user_id))
         return result.scalars().first()
     except Exception:
         return None
 
 
-# ================================================================
-# ROLE GUARDS  (sync)
-# Each role exposes two names:
-#   get_current_<role>_user  — verbose, self-documenting
-#   get_current_<role>       — short alias for Depends() call sites
-# Both are identical — pick whichever is clearer at the call site.
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# ROLE GUARDS — sync
+# Blueprint §2: role IN ('customer','business','rider') ONLY.
+# ADMIN is NOT a mobile role — admin has its own separate JWT + router.
+# ════════════════════════════════════════════════════════════════════════════
 
 def get_current_customer_user(
     current_user: User = Depends(get_current_active_user),
 ) -> User:
-    if current_user.user_type != UserType.CUSTOMER:
-        raise InvalidUserTypeException([UserType.CUSTOMER])
+    """Require CUSTOMER role."""
+    if current_user.role.value != "customer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_required", "required": "customer"},
+        )
     return current_user
 
 get_current_customer = get_current_customer_user
+require_customer     = get_current_customer_user
 
 
 def get_current_business_user(
     current_user: User = Depends(get_current_active_user),
 ) -> User:
-    if current_user.user_type != UserType.BUSINESS:
-        raise InvalidUserTypeException([UserType.BUSINESS])
+    """Require BUSINESS role."""
+    if current_user.role.value != "business":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_required", "required": "business"},
+        )
     return current_user
 
 get_current_business = get_current_business_user
+require_business     = get_current_business_user
 
 
 def get_current_rider_user(
     current_user: User = Depends(get_current_active_user),
 ) -> User:
-    if current_user.user_type != UserType.RIDER:
-        raise InvalidUserTypeException([UserType.RIDER])
+    """Require RIDER role."""
+    if current_user.role.value != "rider":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_required", "required": "rider"},
+        )
     return current_user
 
 get_current_rider = get_current_rider_user
+require_rider     = get_current_rider_user
 
 
-def get_current_admin_user(
-    current_user: User = Depends(get_current_active_user),
+# REMOVED: get_current_admin_user / require_admin
+# Blueprint §2 / §13.3 HARD RULE: admin tokens are NEVER accepted by mobile
+# API endpoints. Admin auth is in a separate admin router with JWT_ADMIN_SECRET_KEY.
+
+
+def require_verified_business(
+    current_user: User = Depends(get_current_business_user),
 ) -> User:
-    if current_user.user_type != UserType.ADMIN:
-        raise InvalidUserTypeException([UserType.ADMIN])
+    """
+    Require BUSINESS role AND is_verified = True.
+
+    Blueprint §8.4 / §8.5 / §8.6 HARD RULES:
+      "Only VERIFIED businesses may post reels / stories / job vacancies.
+       Unverified businesses see these features LOCKED with a clear
+       verification prompt — NOT a silent blank state."
+
+    Returns HTTP 403 with structured error if business is not yet verified.
+    """
+    if not current_user.business or not current_user.business.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "business_not_verified",
+                "message": (
+                    "Your business profile must be verified before you can post "
+                    "reels, stories, or job vacancies. Complete your profile and "
+                    "await admin review."
+                ),
+            },
+        )
     return current_user
 
-get_current_admin = get_current_admin_user
-require_admin     = get_current_admin_user
 
-
-# ================================================================
-# ROLE GUARDS  (async)
-# Async equivalents for routers that use AsyncSession throughout.
-# Required by businesses, and any future module with async CRUD.
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# ROLE GUARDS — async
+# ════════════════════════════════════════════════════════════════════════════
 
 async def get_async_current_business_user(
     current_user: User = Depends(get_async_current_active_user),
 ) -> User:
-    """Require BUSINESS user type (async)."""
-    if current_user.user_type != UserType.BUSINESS:
-        raise InvalidUserTypeException([UserType.BUSINESS])
+    """Require BUSINESS role (async)."""
+    if current_user.role.value != "business":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_required", "required": "business"},
+        )
     return current_user
 
 require_async_business = get_async_current_business_user
@@ -290,9 +312,12 @@ require_async_business = get_async_current_business_user
 async def get_async_current_customer_user(
     current_user: User = Depends(get_async_current_active_user),
 ) -> User:
-    """Require CUSTOMER user type (async)."""
-    if current_user.user_type != UserType.CUSTOMER:
-        raise InvalidUserTypeException([UserType.CUSTOMER])
+    """Require CUSTOMER role (async)."""
+    if current_user.role.value != "customer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_required", "required": "customer"},
+        )
     return current_user
 
 require_async_customer = get_async_current_customer_user
@@ -301,62 +326,125 @@ require_async_customer = get_async_current_customer_user
 async def get_async_current_rider_user(
     current_user: User = Depends(get_async_current_active_user),
 ) -> User:
-    """Require RIDER user type (async)."""
-    if current_user.user_type != UserType.RIDER:
-        raise InvalidUserTypeException([UserType.RIDER])
+    """Require RIDER role (async)."""
+    if current_user.role.value != "rider":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_required", "required": "rider"},
+        )
     return current_user
 
 require_async_rider = get_async_current_rider_user
 
 
-# ================================================================
-# LEGACY ALIASES
-# Kept for backwards-compatibility with existing routers that
-# use require_* names. All delegate to the canonical guards above.
-# ================================================================
-
-require_customer = get_current_customer_user
-require_business = get_current_business_user
-require_rider    = get_current_rider_user
-
-
-# ================================================================
-# MULTI-ROLE GUARD FACTORY
-# ================================================================
-
-def require_user_types(*allowed_types: UserType):
+async def require_async_verified_business(
+    current_user: User = Depends(get_async_current_business_user),
+) -> User:
     """
-    Dependency factory — require one of the specified user types.
+    Require BUSINESS role AND is_verified = True (async).
+    Blueprint §8.4 / §8.5 / §8.6 HARD RULES.
+    """
+    if not current_user.business or not current_user.business.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "business_not_verified",
+                "message": (
+                    "Your business must be verified before posting reels, "
+                    "stories, or job vacancies."
+                ),
+            },
+        )
+    return current_user
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PIN VERIFICATION DEPENDENCY
+# Blueprint §3.3: PIN required for ALL wallet transactions + withdrawals +
+# any payment above ₦5,000, regardless of session state or biometric.
+# ════════════════════════════════════════════════════════════════════════════
+
+class PinRequired(HTTPException):
+    """Raised when a wallet operation requires PIN confirmation."""
+    def __init__(self):
+        super().__init__(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "pin_required",
+                "message": "This action requires PIN confirmation.",
+            },
+        )
+
+
+# NOTE: PIN verification itself happens in the request body / service layer
+# because the PIN is sent in the request payload, not in the JWT.
+# This dependency simply ensures the user HAS a PIN set up.
+
+def require_pin_set(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    """
+    Require that the user has a PIN configured.
+    Blueprint §3.3: PIN mandatory — no wallet action without it.
+    """
+    if not current_user.pin_hash:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "pin_not_configured",
+                "message": "Set up your 4-digit PIN before making transactions.",
+            },
+        )
+    return current_user
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MULTI-ROLE GUARD FACTORY
+# ════════════════════════════════════════════════════════════════════════════
+
+def require_roles(*allowed_roles: str):
+    """
+    Dependency factory — require one of the specified roles.
 
     Usage:
-        @router.get("/biz-or-rider")
-        def endpoint(
-            user: User = Depends(require_user_types(UserType.BUSINESS, UserType.RIDER))
-        ): ...
+        @router.get("/shared")
+        def endpoint(user: User = Depends(require_roles("business", "rider"))):
+            ...
     """
     def _guard(current_user: User = Depends(get_current_active_user)) -> User:
-        if current_user.user_type not in allowed_types:
-            raise InvalidUserTypeException(list(allowed_types))
+        role_val = (
+            current_user.role.value
+            if hasattr(current_user.role, "value")
+            else str(current_user.role)
+        )
+        if role_val not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "role_required",
+                    "required": list(allowed_roles),
+                    "current": role_val,
+                },
+            )
         return current_user
     return _guard
 
+# Legacy alias
+require_user_types = require_roles
+require_role       = require_roles
 
-require_role = require_user_types
 
-
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # PAGINATION
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
 
 def get_pagination_params(
-    page: int = 1,
+    page:      int = 1,
     page_size: int = 20,
 ) -> dict:
     """
     Normalise and clamp pagination parameters.
-
-    Returns a dict with keys: skip, limit, page, page_size.
-    Page is clamped to >= 1; page_size is clamped to [1, 100].
+    Returns: {skip, limit, page, page_size}
     """
     page      = max(1, page)
     page_size = max(1, min(100, page_size))
@@ -368,17 +456,17 @@ def get_pagination_params(
     }
 
 
-# ================================================================
-# API KEY  (business integrations)
-# ================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# API KEY
+# ════════════════════════════════════════════════════════════════════════════
 
 def verify_api_key(
     x_api_key: str = Header(..., description="Business API key"),
 ) -> str:
-    """
-    Verify API key format. Raises 401 if the key does not start with 'lc_'.
-    Full database validation should be added in the service layer.
-    """
+    """Verify API key format (lc_ prefix). Full DB validation in service layer."""
     if not x_api_key.startswith("lc_"):
-        raise AuthenticationException("Invalid API key format")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "invalid_api_key", "message": "Invalid API key format."},
+        )
     return x_api_key

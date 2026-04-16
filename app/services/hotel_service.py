@@ -242,6 +242,14 @@ class HotelService:
             raise NotFoundException("Hotel business owner")
 
         try:
+            # Sanitize add_ons: SQLAlchemy serialises JSONB with stdlib json,
+            # which cannot handle Decimal. Convert every Decimal value to float
+            # before the list reaches the INSERT statement.
+            sanitized_add_ons = [
+                {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
+                for item in (add_ons or [])
+            ]
+
             booking = await hotel_booking_crud.create_booking(
                 db,
                 hotel_id=hotel_id,
@@ -251,7 +259,7 @@ class HotelService:
                 check_out=check_out,
                 number_of_rooms=number_of_rooms,
                 number_of_guests=number_of_guests,
-                add_ons=add_ons,
+                add_ons=sanitized_add_ons,
                 special_requests=special_requests,
             )
 

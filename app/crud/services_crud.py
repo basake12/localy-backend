@@ -188,9 +188,9 @@ class CRUDServiceAvailability(CRUDBase[ServiceAvailability, dict, dict]):
                     ServiceBooking.booking_date == booking_date,
                     ServiceBooking.booking_time == slot_time,
                     ServiceBooking.status.in_([
-                        BookingStatusEnum.PENDING,
-                        BookingStatusEnum.CONFIRMED,
-                        BookingStatusEnum.IN_PROGRESS
+                        BookingStatusEnum.PENDING.value,
+                        BookingStatusEnum.CONFIRMED.value,
+                        BookingStatusEnum.IN_PROGRESS.value
                     ])
                 )
             ).scalar()
@@ -233,9 +233,9 @@ class CRUDServiceAvailability(CRUDBase[ServiceAvailability, dict, dict]):
                 ServiceBooking.booking_date == booking_date,
                 ServiceBooking.booking_time == booking_time,
                 ServiceBooking.status.in_([
-                    BookingStatusEnum.PENDING,
-                    BookingStatusEnum.CONFIRMED,
-                    BookingStatusEnum.IN_PROGRESS
+                    BookingStatusEnum.PENDING.value,
+                    BookingStatusEnum.CONFIRMED.value,
+                    BookingStatusEnum.IN_PROGRESS.value
                 ])
             )
         ).scalar()

@@ -2,6 +2,7 @@
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect as sa_inspect
 from uuid import UUID
 from datetime import date, time, datetime, timezone, timedelta
 from decimal import Decimal
@@ -36,6 +37,57 @@ from app.core.constants import (
 from app.models.user_model import User
 from app.models.services_model import ServiceBooking, BookingStatusEnum
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ORM serialization helper
+#
+# jsonable_encoder fails on GeoAlchemy2 WKBElement values stored in Geography
+# columns (Business.location, ServiceProvider.provider_location). It calls
+# vars() on the geometry object, which raises:
+#     TypeError: vars() argument must have __dict__ attribute
+# then falls back to treating it as an iterable, raising:
+#     ValueError: dictionary update sequence element #0 has length 1; 2 is required
+#
+# Fix: use SQLAlchemy column inspection to iterate ONLY mapped scalar columns,
+# skip Geography/Geometry types entirely, and coerce known non-JSON types
+# (UUID, Decimal, datetime, date, time, Enum) to JSON-safe primitives.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SKIP_COLUMN_TYPES = {"Geography", "Geometry"}
+
+
+def _orm_to_dict(obj) -> "Optional[Dict[str, Any]]":
+    """
+    Convert a SQLAlchemy ORM instance to a plain JSON-serializable dict.
+
+    Skips Geography/Geometry columns to avoid WKBElement serialization errors.
+    Safe to call on None -- returns None.
+    """
+    if obj is None:
+        return None
+
+    mapper = sa_inspect(type(obj))
+    result = {}
+
+    for col_attr in mapper.column_attrs:
+        col = col_attr.columns[0]
+        # Skip spatial columns -- GeoAlchemy2 types are not JSON-serializable
+        if type(col.type).__name__ in _SKIP_COLUMN_TYPES:
+            continue
+        val = getattr(obj, col_attr.key, None)
+        if isinstance(val, UUID):
+            val = str(val)
+        elif isinstance(val, Decimal):
+            val = float(val)
+        elif isinstance(val, (datetime, date, time)):
+            val = val.isoformat()
+        elif hasattr(val, "value") and not isinstance(val, (str, int, float, bool)):
+            # SQLAlchemy Enum / Python enum -- use the string value
+            val = val.value
+        result[col_attr.key] = val
+
+    return result
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sync wallet helpers
@@ -151,12 +203,15 @@ def search_services(
         limit=limit,
     )
 
-    # provider and business are already loaded via joinedload — no extra queries
+    # provider and business are already loaded via joinedload — no extra queries.
+    # FIX: _orm_to_dict skips Geography/Geometry columns (WKBElement) that
+    # jsonable_encoder cannot serialize, coerces UUID/Decimal/datetime to
+    # JSON-safe types, and returns plain dicts Pydantic can handle.
     return [
         {
-            "service": s,
-            "provider": s.provider,
-            "business": s.provider.business if s.provider else None,
+            "service":  _orm_to_dict(s),
+            "provider": _orm_to_dict(s.provider) if s.provider else None,
+            "business": _orm_to_dict(s.provider.business) if s.provider else None,
         }
         for s in services
     ]
@@ -172,9 +227,15 @@ def get_service_details(db: Session, *, service_id: UUID) -> Dict[str, Any]:
         raise NotFoundException("ServiceProvider")
 
     from app.crud.business_crud import business_crud
-    business = business_crud.get(db, id=provider.business_id)
+    # FIX: business_crud.get() is async (AsyncCRUDBase); use get_sync() for sync Session
+    business = business_crud.get_sync(db, id=provider.business_id)
 
-    return {"service": service, "provider": provider, "business": business}
+    # FIX: use _orm_to_dict -- Geography columns cause WKBElement errors in jsonable_encoder.
+    return {
+        "service":  _orm_to_dict(service),
+        "provider": _orm_to_dict(provider),
+        "business": _orm_to_dict(business),
+    }
 
 
 def get_available_slots(
@@ -311,7 +372,7 @@ def book_and_pay(
             amount=booking.total_price,
             transaction_type=TransactionType.PAYMENT,
             description=f"Service booking – {service.name}",
-            reference_id=str(booking.id),
+            reference_id=f"svc_debit_{booking.id}",
         )
 
         # 2. Credit business wallet minus ₦100 platform fee (Blueprint 4.4)
@@ -319,7 +380,8 @@ def book_and_pay(
         business_earnings = booking.total_price - platform_fee
 
         from app.crud.business_crud import business_crud as biz_crud
-        business = biz_crud.get(db, id=provider.business_id)
+        # FIX: use get_sync() -- biz_crud.get() is async
+        business = biz_crud.get_sync(db, id=provider.business_id)
         if business and business.user_id:
             biz_wallet = _get_or_create_wallet_sync(
                 db, user_id=business.user_id
@@ -330,10 +392,10 @@ def book_and_pay(
                 amount=business_earnings,
                 transaction_type=TransactionType.CREDIT,
                 description=f"Service booking – {service.name}",
-                reference_id=str(booking.id),
+            reference_id=f"svc_credit_{booking.id}",
             )
 
-        booking.payment_status = "paid"
+        booking.payment_status = "PAID"
         booking.status = BookingStatusEnum.CONFIRMED
         # FIX: Store wallet transaction ID, not booking's own ID.
         booking.payment_reference = str(customer_txn.id)
@@ -411,7 +473,7 @@ def cancel_booking(
     booking.cancellation_reason = reason
 
     # Instant wallet refund on cancellation (Blueprint Section 4.1.2)
-    if booking.payment_status == "paid":
+    if booking.payment_status == "PAID":
         # FIX: Use sync helpers — wallet_crud methods are all async.
         customer_wallet = _get_or_create_wallet_sync(
             db, user_id=booking.customer_id
@@ -424,7 +486,7 @@ def cancel_booking(
             description="Refund for cancelled service booking",
             reference_id=f"refund_{booking.id}",
         )
-        booking.payment_status = "refunded"
+        booking.payment_status = "REFUNDED"
 
         # Reverse business wallet credit (deduct earnings that were already credited)
         platform_fee = PLATFORM_FEE_BOOKING
@@ -433,7 +495,8 @@ def cancel_booking(
         from app.crud.business_crud import business_crud as biz_crud
         provider = service_provider_crud.get(db, id=booking.provider_id)
         if provider:
-            business = biz_crud.get(db, id=provider.business_id)
+            # FIX: use get_sync() -- biz_crud.get() is async
+            business = biz_crud.get_sync(db, id=provider.business_id)
             if business and business.user_id:
                 biz_wallet = _get_or_create_wallet_sync(
                     db, user_id=business.user_id

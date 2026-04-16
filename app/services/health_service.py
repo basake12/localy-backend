@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from uuid import UUID
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timezone
 from decimal import Decimal
 
 from app.crud.health_crud import (
@@ -9,7 +9,6 @@ from app.crud.health_crud import (
     pharmacy_crud, pharmacy_order_crud,
     lab_center_crud, lab_booking_crud
 )
-from app.crud.business_crud import business_crud
 from app.core.exceptions import (
     NotFoundException, ValidationException, InsufficientBalanceException
 )
@@ -19,6 +18,7 @@ from app.core.constants import (
     PLATFORM_FEE_STANDARD,  # ₦50  — pharmacy orders (product/item fee)
 )
 from app.models.user_model import User
+from app.models.business_model import Business
 from app.models.health_model import (
     Consultation, Prescription, PharmacyOrder, LabBooking,
     ConsultationStatusEnum, PrescriptionStatusEnum
@@ -84,7 +84,7 @@ def _debit_wallet_sync(
         status=TransactionStatusEnum.COMPLETED,
         description=description,
         reference_id=reference_id,
-        completed_at=datetime.utcnow(),
+        completed_at=datetime.now(timezone.utc),
     )
     db.add(txn)
     return txn
@@ -111,7 +111,7 @@ def _credit_wallet_sync(
         status=TransactionStatusEnum.COMPLETED,
         description=description,
         reference_id=reference_id,
-        completed_at=datetime.utcnow(),
+        completed_at=datetime.now(timezone.utc),
     )
     db.add(txn)
     return txn
@@ -187,7 +187,8 @@ class HealthService:
             allergies=allergies,
             current_medications=current_medications,
             patient_dob=patient_dob,
-            patient_gender=patient_gender
+            patient_gender=patient_gender,
+            platform_fee=PLATFORM_FEE_BOOKING,
         )
 
         if payment_method == "wallet":
@@ -212,17 +213,17 @@ class HealthService:
 
             consultation.payment_status = "paid"
             consultation.status = ConsultationStatusEnum.CONFIRMED
-            consultation.confirmed_at = datetime.utcnow()
+            consultation.confirmed_at = datetime.now(timezone.utc)
 
             # FIX: Credit doctor's business wallet (amount minus platform fee).
             doctor = doctor_crud.get(db, id=doctor_id)
             if doctor:
-                doc_business = business_crud.get(db, id=doctor.business_id) if hasattr(doctor, 'business_id') else None
-                if not doc_business:
-                    # Try getting via user_id if doctor has user_id field
-                    doc_user_id = getattr(doctor, 'user_id', None)
-                else:
-                    doc_user_id = getattr(doc_business, 'user_id', None)
+                # FIX: business_crud.get() is async — use direct sync query instead.
+                doc_business = (
+                    db.query(Business).filter(Business.id == doctor.business_id).first()
+                    if getattr(doctor, 'business_id', None) else None
+                )
+                doc_user_id = getattr(doc_business, 'user_id', None)
 
                 if doc_user_id:
                     _credit_business_wallet_sync(
@@ -299,7 +300,7 @@ class HealthService:
             )
             order.payment_status = "paid"
             order.status = "confirmed"
-            order.confirmed_at = datetime.utcnow()
+            order.confirmed_at = datetime.now(timezone.utc)
 
             if prescription_id:
                 prescription = prescription_crud.get(db, id=prescription_id)
@@ -310,7 +311,11 @@ class HealthService:
             pharmacy.total_orders += 1
 
             # FIX: Credit pharmacy's business wallet (net of ₦50 platform fee).
-            pharmacy_business = business_crud.get(db, id=pharmacy.business_id) if hasattr(pharmacy, 'business_id') else None
+            # FIX: business_crud.get() is async — use direct sync query instead.
+            pharmacy_business = (
+                db.query(Business).filter(Business.id == pharmacy.business_id).first()
+                if getattr(pharmacy, 'business_id', None) else None
+            )
             if pharmacy_business and pharmacy_business.user_id:
                 net_amount = order.total_amount - PLATFORM_FEE_STANDARD
                 _credit_business_wallet_sync(
@@ -364,8 +369,9 @@ class HealthService:
         )
 
         if payment_method == "wallet":
-            # FIX: Blueprint §4.4 — ₦100 booking fee on health appointments.
-            total_charge = booking.total_amount + PLATFORM_FEE_BOOKING
+            # booking.total_amount already includes PLATFORM_FEE_BOOKING (added
+            # in lab_booking_crud.create_booking). Do not add it again here.
+            total_charge = booking.total_amount
 
             # FIX: Use sync wallet ops — wallet_crud methods are async.
             customer_wallet = _get_or_create_wallet_sync(db, user_id=current_user.id)
@@ -383,14 +389,19 @@ class HealthService:
             )
             booking.payment_status = "paid"
             booking.status = "confirmed"
-            booking.confirmed_at = datetime.utcnow()
+            booking.confirmed_at = datetime.now(timezone.utc)
 
             # FIX: Credit lab center's business wallet (net of ₦100 platform fee).
             lab_center = lab_center_crud.get(db, id=lab_center_id)
             if lab_center:
-                lab_business = business_crud.get(db, id=lab_center.business_id) if hasattr(lab_center, 'business_id') else None
+                # FIX: business_crud.get() is async — use direct sync query instead.
+                lab_business = (
+                    db.query(Business).filter(Business.id == lab_center.business_id).first()
+                    if getattr(lab_center, 'business_id', None) else None
+                )
                 if lab_business and lab_business.user_id:
-                    net_amount = booking.total_amount  # subtotal without platform fee
+                    # Deduct platform fee before crediting lab — platform keeps ₦100
+                    net_amount = booking.total_amount - PLATFORM_FEE_BOOKING
                     _credit_business_wallet_sync(
                         db,
                         business_user_id=lab_business.user_id,

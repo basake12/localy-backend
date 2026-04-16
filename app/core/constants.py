@@ -1,268 +1,299 @@
+"""
+app/core/constants.py
+
+FIXES vs previous version:
+  1.  MIN_WALLET_TOPUP: ₦500 → ₦1,000. Blueprint §5.1.
+  2.  MAX_WALLET_TOPUP_DAILY: ₦500,000 → ₦2,000,000. Blueprint §5.1.
+  3.  SubscriptionPlanType: PRO_DRIVER removed — not in blueprint.
+      Blueprint §8.1: Free / Starter / Pro / Enterprise only.
+"""
+from decimal import Decimal
 from enum import Enum
 
 
-# ============================================
-# USER TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# USER ROLES
+# Blueprint §2: exactly three mobile roles. Admin is a separate table.
+# ════════════════════════════════════════════════════════════════════════════
 
 class UserType(str, Enum):
     CUSTOMER = "customer"
     BUSINESS = "business"
-    RIDER = "rider"
-    ADMIN = "admin"
+    RIDER    = "rider"
+    # ADMIN is NOT a mobile role — admin_users table + separate JWT.
 
 
 class UserStatus(str, Enum):
-    ACTIVE = "active"
-    SUSPENDED = "suspended"
+    """
+    NOTE: Blueprint §14 user model uses is_active BOOLEAN + is_banned BOOLEAN
+    (not a status enum). This enum is kept for legacy compatibility only.
+    Do not add new status-enum logic — use the boolean fields on User.
+    """
+    ACTIVE               = "active"
+    SUSPENDED            = "suspended"
     PENDING_VERIFICATION = "pending_verification"
-    BANNED = "banned"
+    BANNED               = "banned"
 
 
-# ============================================
-# BUSINESS CATEGORIES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# BUSINESS CATEGORIES — Blueprint §1
+# Exactly 7 categories. Immutable after registration (admin override only).
+# ════════════════════════════════════════════════════════════════════════════
 
 class BusinessCategory(str, Enum):
-    LODGES = "lodges"
-    FOOD = "food"
-    SERVICES = "services"
-    PRODUCTS = "products"
-    HEALTH = "health"
-    PROPERTY_AGENT = "property_agent"
-    TICKET_SALES = "ticket_sales"
+    LODGES          = "lodges"
+    FOOD            = "food"
+    SERVICES        = "services"
+    PRODUCTS        = "products"
+    HEALTH          = "health"
+    PROPERTY_AGENT  = "property_agent"
+    TICKET_SALES    = "ticket_sales"
 
 
 class VerificationBadge(str, Enum):
-    NONE = "none"
-    STARTER = "starter"
-    PRO = "pro"
+    NONE       = "none"
+    STARTER    = "starter"
+    PRO        = "pro"
     ENTERPRISE = "enterprise"
 
 
-# ============================================
-# SUBSCRIPTION PLANS
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# SUBSCRIPTION PLANS — Blueprint §8.1
+# Four tiers only. No pro_driver.
+# Annual = 10 months price (2 months free). Blueprint §8.1.
+# ════════════════════════════════════════════════════════════════════════════
 
 class SubscriptionPlanType(str, Enum):
-    FREE = "free"
-    STARTER = "starter"
-    PRO = "pro"
+    FREE       = "free"
+    STARTER    = "starter"
+    PRO        = "pro"
     ENTERPRISE = "enterprise"
-    PRO_DRIVER = "pro_driver"
+    # PRO_DRIVER removed — not in Blueprint §8.1.
+
+
+# Tier rank integers for ORDER BY — Blueprint §7.2
+SUBSCRIPTION_TIER_RANKS: dict[str, int] = {
+    "enterprise": 4,
+    "pro":        3,
+    "starter":    2,
+    "free":       1,
+}
+
+# Blueprint §8.1 subscription prices (₦ NGN)
+STARTER_MONTHLY_PRICE    = Decimal("4500.00")
+STARTER_ANNUAL_PRICE     = Decimal("45000.00")    # 10 × 4500
+PRO_MONTHLY_PRICE        = Decimal("10000.00")
+PRO_ANNUAL_PRICE         = Decimal("100000.00")   # 10 × 10000
+ENTERPRISE_MONTHLY_PRICE = Decimal("15000.00")
+ENTERPRISE_ANNUAL_PRICE  = Decimal("150000.00")   # 10 × 15000
 
 
 class BillingCycle(str, Enum):
     MONTHLY = "monthly"
-    ANNUAL = "annual"
+    ANNUAL  = "annual"
 
 
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 # TRANSACTION TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 
 class TransactionType(str, Enum):
-    CREDIT = "credit"
-    DEBIT = "debit"
-    REFUND = "refund"
-    CASHBACK = "cashback"
+    CREDIT         = "credit"
+    DEBIT          = "debit"
+    REFUND         = "refund"
+    CASHBACK       = "cashback"
     REFERRAL_BONUS = "referral_bonus"
-    TOP_UP = "top_up"
-    PAYMENT = "payment"
+    TOP_UP         = "top_up"
+    PAYMENT        = "payment"
 
 
 class TransactionStatus(str, Enum):
-    PENDING = "pending"
+    PENDING   = "pending"
     COMPLETED = "completed"
-    FAILED = "failed"
-    REVERSED = "reversed"
+    FAILED    = "failed"
+    REVERSED  = "reversed"
 
 
-# ============================================
-# BOOKING/ORDER STATUSES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# BOOKING / ORDER STATUSES
+# ════════════════════════════════════════════════════════════════════════════
 
 class BookingStatus(str, Enum):
-    PENDING = "pending"
-    CONFIRMED = "confirmed"
-    CHECKED_IN = "checked_in"
-    CHECKED_OUT = "checked_out"
-    CANCELLED = "cancelled"
-    NO_SHOW = "no_show"
+    PENDING      = "pending"
+    CONFIRMED    = "confirmed"
+    CHECKED_IN   = "checked_in"
+    CHECKED_OUT  = "checked_out"
+    CANCELLED    = "cancelled"
+    NO_SHOW      = "no_show"
 
 
 class OrderStatus(str, Enum):
-    PENDING = "pending"
+    PENDING    = "pending"
     PROCESSING = "processing"
-    READY = "ready"
-    SHIPPED = "shipped"
-    DELIVERED = "delivered"
-    CANCELLED = "cancelled"
-    REFUNDED = "refunded"
+    READY      = "ready"
+    SHIPPED    = "shipped"
+    DELIVERED  = "delivered"
+    CANCELLED  = "cancelled"
+    REFUNDED   = "refunded"
 
 
 class PaymentStatus(str, Enum):
-    PENDING = "pending"
-    PAID = "paid"
-    FAILED = "failed"
+    PENDING  = "pending"
+    PAID     = "paid"
+    FAILED   = "failed"
     REFUNDED = "refunded"
 
 
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 # DELIVERY STATUSES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 
 class DeliveryStatus(str, Enum):
-    PENDING = "pending"
-    ASSIGNED = "assigned"
+    PENDING   = "pending"
+    ASSIGNED  = "assigned"
     PICKED_UP = "picked_up"
     IN_TRANSIT = "in_transit"
     DELIVERED = "delivered"
     CANCELLED = "cancelled"
-    FAILED = "failed"
+    FAILED    = "failed"
 
 
-# ============================================
-# MESSAGE TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# MESSAGE / CHAT — Blueprint §10
+# content_type IN ('text','image','voice_note')
+# ════════════════════════════════════════════════════════════════════════════
 
 class MessageType(str, Enum):
-    TEXT = "text"
-    IMAGE = "image"
-    VIDEO = "video"
-    AUDIO = "audio"
-    DOCUMENT = "document"
-    LOCATION = "location"
+    TEXT       = "text"
+    IMAGE      = "image"
+    VOICE_NOTE = "voice_note"
+    # Blueprint §10.2 HARD RULE: voice notes DISABLED during rider delivery.
+    # This is enforced at the router layer, not here.
 
 
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 # NOTIFICATION TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 
 class NotificationType(str, Enum):
-    BOOKING_CONFIRMED = "booking_confirmed"
-    ORDER_STATUS = "order_status"
-    DELIVERY_UPDATE = "delivery_update"
-    PAYMENT_RECEIVED = "payment_received"
-    REVIEW_POSTED = "review_posted"
-    MESSAGE_RECEIVED = "message_received"
-    PROMOTION = "promotion"
-    REMINDER = "reminder"
+    BOOKING_CONFIRMED  = "booking_confirmed"
+    ORDER_STATUS       = "order_status"
+    DELIVERY_UPDATE    = "delivery_update"
+    PAYMENT_RECEIVED   = "payment_received"
+    WALLET_CREDITED    = "wallet_credited"
+    REVIEW_POSTED      = "review_posted"
+    MESSAGE_RECEIVED   = "message_received"
+    PROMOTION          = "promotion"
+    REMINDER           = "reminder"
 
 
-# ============================================
-# FILE TYPES
-# ============================================
-
-class FileType(str, Enum):
-    IMAGE = "image"
-    VIDEO = "video"
-    DOCUMENT = "document"
-    AUDIO = "audio"
-
-
-# ============================================
-# PRODUCT TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# PRODUCT / MARKETPLACE
+# ════════════════════════════════════════════════════════════════════════════
 
 class ProductType(str, Enum):
     PHYSICAL = "physical"
-    DIGITAL = "digital"
+    DIGITAL  = "digital"
 
 
-# ============================================
-# PROPERTY TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# PROPERTY — Blueprint §6.6
+# ════════════════════════════════════════════════════════════════════════════
 
 class PropertyType(str, Enum):
-    HOUSE = "house"
-    APARTMENT = "apartment"
-    VILLA = "villa"
+    HOUSE      = "house"
+    APARTMENT  = "apartment"
+    VILLA      = "villa"
     COMMERCIAL = "commercial"
-    LAND = "land"
-    OFFICE = "office"
-    WAREHOUSE = "warehouse"
+    LAND       = "land"
+    OFFICE     = "office"
+    WAREHOUSE  = "warehouse"
 
 
 class ListingType(str, Enum):
-    SALE = "sale"
-    RENT = "rent"
+    SALE  = "sale"
+    RENT  = "rent"
     LEASE = "lease"
 
 
-# ============================================
-# TICKET CATEGORIES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# TICKET / EVENTS — Blueprint §6.7
+# ════════════════════════════════════════════════════════════════════════════
 
 class TicketCategory(str, Enum):
-    FLIGHT = "flight"
-    BUS = "bus"
-    TRAIN = "train"
+    FLIGHT  = "flight"
+    BUS     = "bus"
+    TRAIN   = "train"
     CONCERT = "concert"
-    SPORTS = "sports"
-    PARTY = "party"
-    EVENT = "event"
-    OTHER = "other"
+    SPORTS  = "sports"
+    PARTY   = "party"
+    EVENT   = "event"
+    OTHER   = "other"
 
 
-# ============================================
-# HEALTH PROVIDER TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# HEALTH — Blueprint §6.5
+# ════════════════════════════════════════════════════════════════════════════
 
 class HealthProviderType(str, Enum):
-    DOCTOR = "doctor"
+    DOCTOR   = "doctor"
     PHARMACY = "pharmacy"
-    LAB = "lab"
+    LAB      = "lab"
 
 
 class ConsultationType(str, Enum):
-    VIDEO = "video"
-    AUDIO = "audio"
-    CHAT = "chat"
+    VIDEO     = "video"
+    AUDIO     = "audio"
+    CHAT      = "chat"
     IN_PERSON = "in_person"
 
 
-# ============================================
-# ROOM STATUSES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# HOTEL / ROOM — Blueprint §6.1
+# ════════════════════════════════════════════════════════════════════════════
 
 class RoomStatus(str, Enum):
-    VACANT = "vacant"
-    OCCUPIED = "occupied"
-    DIRTY = "dirty"
-    BLOCKED = "blocked"
+    VACANT       = "vacant"
+    OCCUPIED     = "occupied"
+    DIRTY        = "dirty"
+    BLOCKED      = "blocked"
     OUT_OF_ORDER = "out_of_order"
 
 
-# ============================================
-# REEL TYPES
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
+# JOBS — Blueprint §8.6
+# JobType MUST include 'gig' — "full-time/part-time/contract/gig"
+# ════════════════════════════════════════════════════════════════════════════
 
-class ReelType(str, Enum):
-    REEL = "reel"
-    STORY = "story"
-
-
-# ============================================
-# LOCATION CONSTANTS (BLUEPRINT v2.0)
-# ============================================
-# Per Blueprint: "Location model — Radius-based (default 5 km) — no LGA dependency"
-
-DEFAULT_RADIUS_KM = 5.0      # Default discovery radius in kilometers
-MIN_RADIUS_KM = 1.0          # Minimum user-adjustable radius
-MAX_RADIUS_KM = 50.0         # Maximum user-adjustable radius
-
-# PostGIS uses meters for ST_DWithin — these constants convert km to meters
-DEFAULT_RADIUS_METERS = int(DEFAULT_RADIUS_KM * 1000)  # 5000 meters
-MIN_RADIUS_METERS = int(MIN_RADIUS_KM * 1000)          # 1000 meters
-MAX_RADIUS_METERS = int(MAX_RADIUS_KM * 1000)          # 50000 meters
+class JobType(str, Enum):
+    FULL_TIME  = "full_time"
+    PART_TIME  = "part_time"
+    CONTRACT   = "contract"
+    GIG        = "gig"           # Blueprint §8.6: required
 
 
-# ============================================
-# NIGERIA STATES (for display purposes only)
-# ============================================
-# NOTE: States/LGAs are stored in business addresses for display but 
-# NEVER used for filtering queries (Blueprint: no LGA dependency)
+# ════════════════════════════════════════════════════════════════════════════
+# LOCATION CONSTANTS — Blueprint §4.1
+# "Default radius: 5 km from device GPS position"
+# "Location permission: Mandatory on first launch."
+# "No LGA column or parameter anywhere."
+# ════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_RADIUS_KM = 5.0
+MIN_RADIUS_KM     = 1.0
+MAX_RADIUS_KM     = 50.0
+
+DEFAULT_RADIUS_METERS = int(DEFAULT_RADIUS_KM * 1000)   # 5000 m
+MIN_RADIUS_METERS     = int(MIN_RADIUS_KM * 1000)        # 1000 m
+MAX_RADIUS_METERS     = int(MAX_RADIUS_KM * 1000)        # 50000 m
+
+# NO LGA constants — Blueprint §4 HARD RULE: no LGA anywhere in codebase.
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NIGERIA STATES (display-only — NOT for filtering)
+# Blueprint §4 HARD RULE: location filtering is radius-only, never by state/LGA.
+# ════════════════════════════════════════════════════════════════════════════
 
 NIGERIA_STATES = [
     "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa",
@@ -270,29 +301,27 @@ NIGERIA_STATES = [
     "Ekiti", "Enugu", "FCT", "Gombe", "Imo", "Jigawa", "Kaduna",
     "Kano", "Katsina", "Kebbi", "Kogi", "Kwara", "Lagos", "Nasarawa",
     "Niger", "Ogun", "Ondo", "Osun", "Oyo", "Plateau", "Rivers",
-    "Sokoto", "Taraba", "Yobe", "Zamfara"
+    "Sokoto", "Taraba", "Yobe", "Zamfara",
 ]
 
 
-# ============================================
-# FINANCIAL RATES & LIMITS
-# ============================================
-from decimal import Decimal
+# ════════════════════════════════════════════════════════════════════════════
+# FINANCIAL CONSTANTS — Blueprint §5.4 / §5.1 / §9.1
+# ════════════════════════════════════════════════════════════════════════════
 
-# Platform fees per Blueprint Section 4.4
-PLATFORM_FEE_STANDARD = Decimal("50.00")     # ₦50 on products, food, tickets
-PLATFORM_FEE_BOOKING = Decimal("100.00")     # ₦100 on hotels, services, health
-PLATFORM_FEE_TICKET = Decimal("50.00")       # ₦50 per ticket
+# Platform fees — per-side amounts (Blueprint §5.4)
+# Total platform revenue = customer_fee + business_fee
+PLATFORM_FEE_STANDARD = Decimal("50.00")   # ₦50 per side (product/food orders)
+PLATFORM_FEE_BOOKING  = Decimal("100.00")  # ₦100 per side (hotel/service/health)
+PLATFORM_FEE_TICKET   = Decimal("50.00")   # ₦50 from customer only (tickets)
 
-# Referral rewards per Blueprint Section 6.1
-REFERRAL_BONUS_AMOUNT = Decimal("1000.00")         # ₦1,000 to referrer
-REFERRAL_DISCOUNT_AMOUNT = Decimal("1000.00")      # ₦1,000 off for new user
-REFERRAL_MINIMUM_ORDER = Decimal("2000.00")        # New user must spend >₦2,000
+# Referral — Blueprint §9.1
+REFERRAL_BONUS_AMOUNT    = Decimal("1000.00")  # ₦1,000 to referrer
+REFERRAL_DISCOUNT_AMOUNT = Decimal("1000.00")  # ₦1,000 off for new user
+REFERRAL_MINIMUM_ORDER   = Decimal("2000.00")  # minimum first order to trigger reward
 
-# Wallet limits
-MIN_WALLET_TOPUP = Decimal("500.00")               # Minimum top-up amount
-MAX_WALLET_TOPUP_DAILY = Decimal("500000.00")      # Daily funding limit
-MIN_WITHDRAWAL_AMOUNT = Decimal("1000.00")         # Minimum withdrawal
-MAX_WITHDRAWAL_AMOUNT = Decimal("1000000.00")      # Maximum withdrawal per day
-# Ticket service charge rate (0.00 = no percentage charge; Blueprint §4.4 uses flat ₦50 fee only)
-TICKET_SERVICE_CHARGE_RATE = Decimal("0.00")
+# Wallet — Blueprint §5.1 / §5.2
+MIN_WALLET_TOPUP       = Decimal("1000.00")      # ₦1,000 minimum top-up (was ₦500 — FIXED)
+MAX_WALLET_TOPUP_DAILY = Decimal("2000000.00")   # ₦2,000,000 daily limit (was ₦500k — FIXED)
+MIN_WITHDRAWAL_AMOUNT  = Decimal("1000.00")      # Blueprint §5.2
+MAX_WITHDRAWAL_AMOUNT  = Decimal("1000000.00")   # Blueprint §5.2

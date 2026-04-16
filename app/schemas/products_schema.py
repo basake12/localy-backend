@@ -246,18 +246,17 @@ class CartResponse(BaseModel):
 # ORDER SCHEMAS
 # ============================================
 
-# FIX: Valid payment methods as a constant — validated both here and in service.
-# "wallet" is the only supported method currently (card top-up goes through
-# Paystack then wallet balance is used at checkout).
-VALID_PAYMENT_METHODS = {"wallet", "card"}
+# FIX: "card" removed from VALID_PAYMENT_METHODS.
+# Blueprint: card payments go through Paystack to top up the wallet; checkout
+# always draws from wallet balance.  Accepting "card" here while the service
+# rejects it caused a confusing 422-at-schema vs 500-in-service split.
+# Both schema and service now agree: only "wallet" is a valid checkout method.
+VALID_PAYMENT_METHODS = {"wallet"}
 
-# FIX: Valid order status values must match the DB enum exactly (all lowercase).
-# The crash `invalid input value for enum orderstatusenum: "PROCESSING"` is caused
-# by the service layer passing uppercase. These constants give a single source of
-# truth to reference from both the schema and the service/crud.
+# Valid order status values — must match the DB enum exactly (all lowercase).
 VALID_ORDER_STATUSES = {"pending", "processing", "packed", "shipped", "delivered", "cancelled"}
 
-# FIX: Platform fee per blueprint §4.4 — ₦50 flat fee on every product order.
+# Platform fee per Blueprint §4.4 — ₦50 flat fee on every product order.
 PRODUCT_PLATFORM_FEE = Decimal("50")
 
 
@@ -271,16 +270,15 @@ class OrderCreateRequest(BaseModel):
     items: List[OrderItemCreate]
     shipping_address: str = Field(..., min_length=10)
     shipping_location: Optional[LocationSchema] = None
-    # Optional — resolved from CustomerProfile if not supplied.
-    # Provide them to override the profile values (e.g. ordering for someone else).
+    # Optional — resolved from the user's registration details (full_name,
+    # phone_number) in the service if not supplied.  Provide them to override
+    # when ordering as a gift for someone else.
     recipient_name: Optional[str] = Field(None, min_length=2, max_length=200)
     recipient_phone: Optional[str] = Field(None, min_length=10, max_length=20)
     notes: Optional[str] = None
     payment_method: str = Field(default="wallet")
     coupon_code: Optional[str] = None
 
-    # FIX: Validate payment_method — previously accepted any garbage string,
-    # which would fail silently deep in the service rather than at input boundary.
     @field_validator("payment_method")
     @classmethod
     def validate_payment_method(cls, v: str) -> str:
@@ -290,8 +288,6 @@ class OrderCreateRequest(BaseModel):
             )
         return v
 
-    # FIX: Guard empty items list — service would process it silently
-    # and produce an order with ₦0 total and no items.
     @field_validator("items")
     @classmethod
     def items_not_empty(cls, v: list) -> list:
@@ -305,7 +301,7 @@ class OrderCreateRequest(BaseModel):
             "shipping_address": "123 Main Street, Garki, Abuja",
             "payment_method": "wallet",
             # recipient_name and recipient_phone are optional —
-            # omit them to use the values from your profile
+            # omit them to use the values from your registered profile
         }
     })
 
@@ -333,16 +329,10 @@ class OrderResponse(BaseModel):
     shipping_fee: Decimal
     tax: Decimal
     discount: Decimal
-    # FIX: Blueprint §4.4 — ₦50 flat fee on every product transaction.
-    # Must be visible in checkout summary before user confirms. Default to
-    # PRODUCT_PLATFORM_FEE so existing orders without the column still serialise.
     platform_fee: Decimal = PRODUCT_PLATFORM_FEE
     total_amount: Decimal
     coupon_code: Optional[str]
     payment_method: Optional[str]
-    # FIX: Use Optional[str] with None default so that if the ORM returns
-    # a Python Enum object, Pydantic coerces it via __str__ on the .value.
-    # The real fix for enum serialisation is use_enum_values=True below.
     payment_status: str
     order_status: str
     tracking_number: Optional[str]
@@ -351,10 +341,6 @@ class OrderResponse(BaseModel):
     created_at: datetime
     items: List[OrderItemResponse]
 
-    # FIX: use_enum_values=True — when SQLAlchemy returns a Python Enum member
-    # (e.g. <OrderStatusEnum.processing: 'processing'>), Pydantic v2 will extract
-    # its .value ('processing') automatically instead of stringifying the whole
-    # object which produces "OrderStatusEnum.processing".
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
@@ -366,7 +352,6 @@ class OrderListResponse(BaseModel):
     total_items: int
     created_at: datetime
 
-    # FIX: Same use_enum_values fix as OrderResponse.
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
@@ -378,11 +363,7 @@ class OrderStatusUpdateRequest(BaseModel):
     @field_validator('status')
     @classmethod
     def validate_status(cls, v: str) -> str:
-        # FIX: Normalise to lowercase before validation so "Processing" / "PROCESSING"
-        # are accepted from the client without crashing the DB enum insert.
         v = v.lower().strip()
-        # "pending" excluded — that's the initial state set by the service on creation;
-        # a vendor cannot manually move an order back to pending.
         vendor_allowed = {"processing", "packed", "shipped", "delivered", "cancelled"}
         if v not in vendor_allowed:
             raise ValueError(
@@ -396,7 +377,6 @@ class ReturnRequest(BaseModel):
     items: List[UUID] = Field(..., description="Order item IDs to return")
     photos: List[str] = Field(default_factory=list)
 
-    # FIX: Guard empty items list — a return with no items is meaningless.
     @field_validator("items")
     @classmethod
     def items_not_empty(cls, v: list) -> list:
@@ -450,8 +430,7 @@ class ProductSearchFilters(BaseModel):
 
     Blueprint §3.1: radius-based search ONLY — no LGA filtering anywhere.
     lga_id has been removed. Location is resolved from user GPS + radius_km
-    (default 5 km per blueprint §3.1). Pass latitude/longitude inside the
-    location object.
+    (default 5 km per blueprint §3.1).
     """
     query: Optional[str] = None
     category: Optional[str] = None
@@ -462,12 +441,8 @@ class ProductSearchFilters(BaseModel):
     in_stock_only: bool = False
     sort_by: Optional[str] = "created_at"
     location: Optional[LocationSchema] = None
-    # FIX: Default is None (resolved in router as 5.0 per blueprint §3.1).
-    # Max cap stays at 50 km per blueprint slider maximum.
     radius_km: Optional[float] = Field(None, gt=0, le=50)
-    # lga_id intentionally omitted — Blueprint §3: no LGA filtering
 
-    # FIX: Validate sort_by to prevent SQL injection via unsanitised column name.
     @field_validator("sort_by")
     @classmethod
     def validate_sort_by(cls, v: Optional[str]) -> Optional[str]:
@@ -478,7 +453,6 @@ class ProductSearchFilters(BaseModel):
             raise ValueError(f"sort_by must be one of: {', '.join(sorted(allowed))}")
         return v
 
-    # FIX: Validate price range — min must not exceed max.
     @field_validator("max_price")
     @classmethod
     def max_gte_min(cls, v: Optional[Decimal], info) -> Optional[Decimal]:

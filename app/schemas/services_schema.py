@@ -234,10 +234,13 @@ class BookingCreateRequest(BaseModel):
     @field_validator('service_location_type')
     @classmethod
     def validate_location_type(cls, v):
-        valid = {"in_home", "provider_location", "virtual"}
-        if v not in valid:
-            raise ValueError(f'service_location_type must be one of {valid}')
-        return v
+        # Normalize to uppercase to match DB enum values (IN_HOME, PROVIDER_LOCATION, VIRTUAL).
+        # Clients may send lowercase (in_home) or uppercase (IN_HOME) — both accepted.
+        v_upper = v.upper()
+        valid = {"IN_HOME", "PROVIDER_LOCATION", "VIRTUAL"}
+        if v_upper not in valid:
+            raise ValueError("service_location_type must be one of: in_home, provider_location, virtual")
+        return v_upper
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -264,10 +267,11 @@ class PriceCalculateRequest(BaseModel):
     @field_validator('service_location_type')
     @classmethod
     def validate_location_type(cls, v):
-        valid = {"in_home", "provider_location", "virtual"}
-        if v not in valid:
-            raise ValueError(f'Must be one of {valid}')
-        return v
+        v_upper = v.upper()
+        valid = {"IN_HOME", "PROVIDER_LOCATION", "VIRTUAL"}
+        if v_upper not in valid:
+            raise ValueError("Must be one of: in_home, provider_location, virtual")
+        return v_upper
 
 
 class BookingResponse(BaseModel):

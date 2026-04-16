@@ -1,27 +1,62 @@
 """
-Auth schemas for Localy.
+app/schemas/auth_schema.py
+
 Pydantic v2 models for all auth request/response payloads.
 
-Blueprint v2.0 changes:
-- OAuth removed entirely (Google/Apple Sign-In removed)
-- PIN setup/verify/change added
-- date_of_birth added to customer registration
-- terms_accepted added to all registrations
-- Biometric enrollment added
+FIXES vs previous version:
+  1.  email is now Optional in _BaseRegister.
+      Blueprint §3.1 step 3: "Email address (optional, indexed for search
+      if provided)."
+
+  2.  date_of_birth in CustomerRegisterRequest is now required (not Optional).
+      Blueprint §3.1 step 3: "Date of birth (required — used for age
+      verification)."
+
+  3.  [HARD RULE] local_government removed from BusinessRegisterRequest.
+      [HARD RULE] local_government removed from RegisterRequest.
+      Blueprint §4 / §2: no LGA column or parameter anywhere.
+
+  4.  [HARD RULE] AdminRegisterRequest DELETED.
+      Blueprint §2: "Admin cannot register through mobile app or
+      self-provision an account." Admin provisioning is a separate
+      out-of-band process in the admin web app.
+
+  5.  ForgotPasswordRequest changed to phone-only.
+      Blueprint §3.2: "FORGOT PASSWORD: Enter phone number → Receive SMS OTP
+      (same Termii gateway)." No email option.
+
+  6.  OTP channel default changed from "both" → "phone" throughout.
+      Blueprint §3.1: OTP is sent via Termii SMS. Email OTP is not part
+      of the blueprint registration flow.
+
+  7.  pin field added to RegisterRequest — enables mandatory PIN collection
+      at the same time as profile details (Step 6 is mandatory).
+      Flutter must send the PIN in the registration completion payload.
+
+  8.  terms_version removed as a hardcoded string — it's looked up from the
+      DB at runtime by the service layer, not hardcoded in the schema.
+
+  9.  vehicle_type validator updated to include all 4 blueprint types:
+      motorcycle / bicycle / car / van (Blueprint §3.1 step 5b).
 """
 from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Optional, Literal, Dict, Any
+from typing import Any, Dict, Literal, Optional
+
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
-from app.core.constants import UserType, BusinessCategory
+from app.core.constants import BusinessCategory
 
 # Allowed OTP delivery channels
-OtpChannel = Literal["email", "phone", "both"]
+# Blueprint §3.1: SMS via Termii is the primary channel.
+# "phone" is the default — email is secondary/optional.
+OtpChannel = Literal["phone", "email", "both"]
 
-# ─── Subcategory map ─────────────────────────────────────────────────────
+
+# ─── Subcategory map (unchanged — no blueprint conflict) ──────────────────────
+
 SUBCATEGORIES: Dict[str, list[str]] = {
     "lodges": [
         "Hotel", "Guest House", "Motel", "Shortlet / Airbnb",
@@ -79,14 +114,29 @@ def validate_subcategory(
     return subcategory
 
 
-# ─── Shared base ─────────────────────────────────────────────────────────
+# ─── Shared base ──────────────────────────────────────────────────────────────
 
 class _BaseRegister(BaseModel):
-    email: EmailStr
-    phone: str = Field(..., min_length=10, max_length=20)
-    password: str = Field(..., min_length=8)
-    otp_channel: OtpChannel = "both"
-    terms_accepted: bool = Field(..., description="User must accept Terms & Conditions")
+    """Common fields for all registration types."""
+
+    # Blueprint §3.1 step 3: email is OPTIONAL
+    email: Optional[EmailStr] = None
+
+    # Blueprint §3.1 step 1: phone number required (primary identifier)
+    phone:    str  = Field(..., min_length=10, max_length=20)
+    password: str  = Field(..., min_length=8)
+
+    # Blueprint §3.1 step 6: PIN is MANDATORY — collected at registration
+    # "MANDATORY. Cannot be skipped. No 'do it later' option."
+    pin: str = Field(..., min_length=4, max_length=4, description="4-digit transaction PIN")
+
+    # Blueprint §3.1 step 8: T&C acceptance required
+    terms_accepted: bool = Field(
+        ..., description="User must accept Terms & Conditions"
+    )
+
+    # OTP channel: 'phone' is default per blueprint (SMS via Termii)
+    otp_channel: OtpChannel = "phone"
 
     @field_validator("password")
     @classmethod
@@ -102,45 +152,57 @@ class _BaseRegister(BaseModel):
             raise ValueError(f"Password must contain {', '.join(errors)}")
         return v
 
+    @field_validator("pin")
+    @classmethod
+    def pin_must_be_4_digits(cls, v: str) -> str:
+        if not (len(v) == 4 and v.isdigit()):
+            raise ValueError("PIN must be exactly 4 numeric digits")
+        return v
+
     @field_validator("phone")
     @classmethod
     def phone_format(cls, v: str) -> str:
         digits = v.replace("+", "").replace(" ", "").replace("-", "")
         if not digits.isdigit():
-            raise ValueError("Phone must contain only digits (and optional +/spaces/dashes)")
+            raise ValueError(
+                "Phone must contain only digits (optional +/spaces/dashes)"
+            )
         return v
 
     @field_validator("terms_accepted")
     @classmethod
     def terms_must_be_accepted(cls, v: bool) -> bool:
         if not v:
-            raise ValueError("You must accept the Terms & Conditions to register")
+            raise ValueError(
+                "You must accept the Terms & Conditions to register"
+            )
         return v
 
 
-# ─── Customer Registration ────────────────────────────────────────────────
+# ─── Customer Registration ────────────────────────────────────────────────────
 
 class CustomerRegisterRequest(_BaseRegister):
-    first_name: str = Field(..., min_length=2, max_length=100)
-    last_name:  str = Field(..., min_length=2, max_length=100)
-    date_of_birth: Optional[date] = Field(None, description="Date of birth (YYYY-MM-DD)")
+    first_name: str  = Field(..., min_length=2, max_length=100)
+    last_name:  str  = Field(..., min_length=2, max_length=100)
+
+    # Blueprint §3.1 step 3: date_of_birth REQUIRED (not Optional)
+    date_of_birth: date = Field(..., description="Date of birth (YYYY-MM-DD)")
+
     referral_code: Optional[str] = Field(None, max_length=20)
 
     @field_validator("date_of_birth")
     @classmethod
-    def validate_age(cls, v: Optional[date]) -> Optional[date]:
-        """Ensure user is at least 13 years old if date_of_birth is provided."""
-        if v is None:
-            return v
-        from datetime import date as date_type, timedelta
+    def validate_age(cls, v: date) -> date:
+        """Minimum age validation."""
+        from datetime import date as date_type
         today = date_type.today()
-        age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
+        age   = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
         if age < 13:
             raise ValueError("You must be at least 13 years old to register")
         return v
 
 
-# ─── Business Registration ────────────────────────────────────────────────
+# ─── Business Registration ────────────────────────────────────────────────────
 
 class BusinessHoursDay(BaseModel):
     open:   Optional[str] = None   # "09:00"
@@ -149,79 +211,100 @@ class BusinessHoursDay(BaseModel):
 
 
 class BusinessRegisterRequest(_BaseRegister):
-    business_name:        str = Field(..., min_length=2, max_length=200)
+    business_name:        str              = Field(..., min_length=2, max_length=200)
     business_category:    BusinessCategory
-    business_subcategory: Optional[str] = None
-    address:              str = Field(..., min_length=5, max_length=500)
-    city:                 str = Field(..., min_length=2, max_length=100)
-    local_government:     str = Field(..., min_length=2, max_length=100)
-    state:                str = Field(..., min_length=2, max_length=100)
-    latitude:             Optional[float] = Field(None, ge=-90,  le=90)
-    longitude:            Optional[float] = Field(None, ge=-180, le=180)
-    description:          Optional[str]  = Field(None, max_length=2000)
-    website:              Optional[str]  = None
-    instagram:            Optional[str]  = None
-    facebook:             Optional[str]  = None
-    whatsapp:             Optional[str]  = None
-    opening_hours:        Optional[Dict[str, BusinessHoursDay]] = None
+    business_subcategory: Optional[str]    = None
+    address:              str              = Field(..., min_length=5, max_length=500)
+    city:                 str              = Field(..., min_length=2, max_length=100)
+    # REMOVED: local_government — Blueprint HARD RULE: no LGA anywhere.
+    state:                str              = Field(..., min_length=2, max_length=100)
+
+    # GPS coordinates — used to geocode business location
+    # Blueprint §3.1 step 5a: "Address is geocoded immediately to PostGIS point
+    # via Google Geocoding API." Lat/lng sent by Flutter or geocoded server-side.
+    latitude:  Optional[float] = Field(None, ge=-90,  le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+
+    # Optional profile fields
+    description: Optional[str] = Field(None, max_length=2000)
+    website:     Optional[str] = None
+    instagram:   Optional[str] = None
+    facebook:    Optional[str] = None
+    whatsapp:    Optional[str] = None
+    opening_hours: Optional[Dict[str, BusinessHoursDay]] = None
 
     @model_validator(mode="after")
     def check_subcategory(self) -> "BusinessRegisterRequest":
-        validate_subcategory(self.business_category.value, self.business_subcategory)
+        validate_subcategory(
+            self.business_category.value, self.business_subcategory
+        )
         return self
 
 
-# ─── Rider Registration ───────────────────────────────────────────────────
+# ─── Rider Registration ───────────────────────────────────────────────────────
 
 class RiderRegisterRequest(_BaseRegister):
-    first_name:           str = Field(..., min_length=2, max_length=100)
-    last_name:            str = Field(..., min_length=2, max_length=100)
-    vehicle_type:         str = Field(..., description="bicycle | motorcycle | car | van")
-    vehicle_plate_number: str = Field(..., min_length=4, max_length=20)
-    vehicle_color:        Optional[str] = None
-    vehicle_model:        Optional[str] = None
+    first_name: str = Field(..., min_length=2, max_length=100)
+    last_name:  str = Field(..., min_length=2, max_length=100)
+
+    # Blueprint §3.1 step 5b: vehicle type + government ID
+    # vehicle_type: motorcycle | bicycle | car | van (Blueprint §3.1 step 5b)
+    vehicle_type:         str            = Field(..., description="motorcycle | bicycle | car | van")
+    vehicle_plate_number: str            = Field(..., min_length=4, max_length=20)
+    vehicle_color:        Optional[str]  = None
+    vehicle_model:        Optional[str]  = None
+    # gov_id_url stored separately after S3 upload (rider uploads doc to S3,
+    # then passes the URL in this field)
+    gov_id_url:           Optional[str]  = None
 
     @field_validator("vehicle_type")
     @classmethod
     def vehicle_type_valid(cls, v: str) -> str:
         allowed = {"bicycle", "motorcycle", "car", "van"}
         if v.lower() not in allowed:
-            raise ValueError(f"vehicle_type must be one of {allowed}")
+            raise ValueError(f"vehicle_type must be one of: {sorted(allowed)}")
         return v.lower()
 
 
-# ─── Admin Registration ───────────────────────────────────────────────────
+# REMOVED: AdminRegisterRequest
+# Blueprint §2 HARD RULE: "Admin cannot register through mobile app or
+# self-provision an account." Admin accounts are provisioned via the admin
+# web app by a super-admin — no mobile endpoint exists for this.
 
-class AdminRegisterRequest(_BaseRegister):
-    full_name: str = Field(..., min_length=2, max_length=200)
-    role:      str = Field("admin", max_length=50)
 
-
-# ─── Internal RegisterRequest (used by crud) ─────────────────────────────
+# ─── Internal RegisterRequest (used by service layer / crud) ─────────────────
 
 class RegisterRequest(BaseModel):
-    """Internal payload assembled by each endpoint before calling crud."""
-    user_type:            UserType
-    email:                EmailStr
-    phone:                str
-    password:             str
-    otp_channel:          OtpChannel = "both"
-    terms_accepted:       bool = True
-    terms_version:        str = "v1.0"  # Current terms version
+    """
+    Internal payload assembled by each registration endpoint.
+    Passed to auth_service.register_user().
+    """
+    role:           str                      # "customer" | "business" | "rider"
+    phone:          str
+    password:       str
+    pin:            str                      # 4-digit PIN — mandatory
+    terms_accepted: bool = True
+    otp_channel:    OtpChannel = "phone"
 
-    # Customer / Rider
-    first_name:           Optional[str] = None
-    last_name:            Optional[str] = None
-    date_of_birth:        Optional[date] = None
-    referral_code:        Optional[str] = None
+    # Blueprint §14 / user model fields
+    full_name:     Optional[str] = None      # for user.full_name
+    date_of_birth: Optional[date] = None     # for user.date_of_birth
+    email:         Optional[str] = None      # optional
 
-    # Business
+    # Referral
+    referral_code: Optional[str] = None
+
+    # Customer-specific
+    first_name:    Optional[str] = None
+    last_name:     Optional[str] = None
+
+    # Business-specific
     business_name:        Optional[str] = None
-    business_category:    Optional[BusinessCategory] = None
+    business_category:    Optional[str] = None
     business_subcategory: Optional[str] = None
-    address:              Optional[str] = None
+    address:              Optional[str] = None    # registered_address on business
     city:                 Optional[str] = None
-    local_government:     Optional[str] = None
+    # REMOVED: local_government — Blueprint HARD RULE: no LGA anywhere.
     state:                Optional[str] = None
     latitude:             Optional[float] = None
     longitude:            Optional[float] = None
@@ -232,18 +315,15 @@ class RegisterRequest(BaseModel):
     whatsapp:             Optional[str] = None
     opening_hours:        Optional[Dict[str, Any]] = None
 
-    # Rider extras
+    # Rider-specific
     vehicle_type:         Optional[str] = None
     vehicle_plate_number: Optional[str] = None
     vehicle_color:        Optional[str] = None
     vehicle_model:        Optional[str] = None
-
-    # Admin
-    full_name:            Optional[str] = None
-    role:                 Optional[str] = None
+    gov_id_url:           Optional[str] = None
 
 
-# ─── Login ────────────────────────────────────────────────────────────────
+# ─── Login ────────────────────────────────────────────────────────────────────
 
 def _is_email(value: str) -> bool:
     return bool(re.match(r"[^@]+@[^@]+\.[^@]+", value))
@@ -251,15 +331,14 @@ def _is_email(value: str) -> bool:
 
 class LoginRequest(BaseModel):
     """
-    Accepts email OR phone number as `identifier`.
-
-    Frontend sends: { "identifier": "user@example.com", "password": "..." }
-                or: { "identifier": "08012345678", "password": "..." }
+    Blueprint §3.2: phone number + password.
+    NOTE: The identifier field accepts phone number only per blueprint.
+    Email login is removed from the flow. The resolver is kept for
+    defensive validation but phone is the canonical method.
     """
     identifier: str = Field(..., min_length=5, max_length=255)
     password:   str
 
-    # Resolved fields — populated by validator, used by crud.authenticate()
     resolved_email: Optional[str] = None
     resolved_phone: Optional[str] = None
 
@@ -269,20 +348,15 @@ class LoginRequest(BaseModel):
         if _is_email(v):
             self.resolved_email = v.lower()
         else:
-            # Treat as phone
             self.resolved_phone = v
         return self
 
 
-# ─── PIN Management (Blueprint v2.0) ──────────────────────────────────────
+# ─── PIN Management (Blueprint §3.1 step 6 / §3.3) ───────────────────────────
 
 class SetupPinRequest(BaseModel):
-    """
-    Set up 4-digit PIN during registration flow.
-    
-    Blueprint: "Set 4-digit transaction PIN (mandatory — enables wallet and payments)"
-    """
-    pin: str = Field(..., min_length=4, max_length=4, description="4-digit PIN")
+    """Set/reset 4-digit PIN from security settings (not registration — PIN is in RegisterRequest)."""
+    pin: str = Field(..., min_length=4, max_length=4)
 
     @field_validator("pin")
     @classmethod
@@ -294,18 +368,22 @@ class SetupPinRequest(BaseModel):
 
 class VerifyPinRequest(BaseModel):
     """
-    Verify PIN for wallet transactions or PIN login.
-    
-    Blueprint: "PIN is required for all wallet transactions, withdrawals, 
-    and payments above ₦5,000"
+    Verify PIN for a wallet transaction.
+    Blueprint §3.3: required for ALL wallet transactions + withdrawals
+    + any payment above ₦5,000.
     """
     pin: str = Field(..., min_length=4, max_length=4)
 
 
 class ChangePinRequest(BaseModel):
-    """Change existing PIN — requires old PIN for security."""
+    """
+    Change PIN — requires current PIN + OTP confirmation.
+    Blueprint §3.3: "Changeable from security settings
+    (requires current PIN + OTP confirmation from registered phone)."
+    """
     old_pin: str = Field(..., min_length=4, max_length=4)
     new_pin: str = Field(..., min_length=4, max_length=4)
+    otp:     str = Field(..., min_length=6, max_length=6, description="SMS OTP from registered phone")
 
     @field_validator("new_pin")
     @classmethod
@@ -317,80 +395,64 @@ class ChangePinRequest(BaseModel):
 
 class PinLoginRequest(BaseModel):
     """
-    PIN login for quick access after first session.
-    
-    Blueprint: "PIN login (quick access after first session)"
+    Quick PIN login after first session.
+    Blueprint §3.2: "PIN login → validates against bcrypt hash → issues new session tokens."
     """
-    identifier: str = Field(..., description="Email or phone number")
-    pin: str = Field(..., min_length=4, max_length=4)
+    identifier: str = Field(..., description="Phone number")
+    pin:        str = Field(..., min_length=4, max_length=4)
 
 
-# ─── Biometric (Blueprint v2.0) ───────────────────────────────────────────
+# ─── Biometric (Blueprint §3.1 step 7 / §3.3) ────────────────────────────────
 
 class EnableBiometricRequest(BaseModel):
     """
-    Enable biometric authentication (Face ID / fingerprint).
-    
-    Blueprint: "Optional: enable biometric authentication (Face ID / fingerprint) 
-    after PIN is set"
-    
-    Note: Biometric enrollment happens client-side. This endpoint just stores
-    the flag that biometric is enabled for this user on this device.
+    Enable biometric authentication.
+    Blueprint §3.1 step 7: "Only presented AFTER PIN is confirmed active."
+    Server stores only biometric_flag BOOLEAN — no biometric data reaches server.
     """
-    device_id: str = Field(..., description="Unique device identifier")
-    biometric_type: Literal["face_id", "fingerprint", "other"] = Field(
-        ..., description="Type of biometric authentication"
-    )
+    device_id:      str                                      = Field(..., description="Unique device identifier")
+    biometric_type: Literal["face_id", "fingerprint", "other"] = Field(...)
 
 
 class DisableBiometricRequest(BaseModel):
     """Disable biometric authentication."""
-    device_id: Optional[str] = None  # If None, disable for all devices
+    device_id: Optional[str] = None
 
 
-# ─── Verification ─────────────────────────────────────────────────────────
-
-class VerifyEmailRequest(BaseModel):
-    otp: str = Field(..., min_length=6, max_length=6)
-
+# ─── OTP Verification ─────────────────────────────────────────────────────────
 
 class VerifyPhoneRequest(BaseModel):
+    """Verify phone OTP — 6-digit code from Termii SMS."""
     otp: str = Field(..., min_length=6, max_length=6)
 
 
 class ResendOTPRequest(BaseModel):
-    channel: OtpChannel = "both"
+    """Resend OTP — Blueprint §3.1: resend available after 60 seconds."""
+    channel: OtpChannel = "phone"
 
 
-# ─── Password Reset ───────────────────────────────────────────────────────
+# ─── Password Reset — Blueprint §3.2: phone only ─────────────────────────────
 
 class ForgotPasswordRequest(BaseModel):
-    """At least one of email or phone must be provided."""
-    email:   Optional[EmailStr] = None
-    phone:   Optional[str]      = None
-    channel: OtpChannel         = "email"
-
-    @model_validator(mode="after")
-    def at_least_one(self) -> "ForgotPasswordRequest":
-        if not self.email and not self.phone:
-            raise ValueError("Provide either email or phone")
-        return self
+    """
+    Blueprint §3.2: "FORGOT PASSWORD: Enter phone number →
+    Receive SMS OTP (same Termii gateway, same TTL rules)."
+    Phone only — no email option.
+    """
+    phone: str = Field(..., min_length=10, max_length=20)
 
 
 class VerifyResetOTPRequest(BaseModel):
-    """Validate the password-reset OTP and exchange it for a reset_token."""
-    email: Optional[EmailStr] = None
-    phone: Optional[str]      = None
+    """Validate password-reset OTP (sent to phone) and return a reset_token."""
+    phone: str = Field(..., min_length=10, max_length=20)
     otp:   str = Field(..., min_length=6, max_length=6)
-
-    @model_validator(mode="after")
-    def at_least_one(self) -> "VerifyResetOTPRequest":
-        if not self.email and not self.phone:
-            raise ValueError("Provide either email or phone")
-        return self
 
 
 class ResetPasswordRequest(BaseModel):
+    """
+    Set new password using the reset_token.
+    Blueprint §3.2: "All existing session tokens invalidated on password reset."
+    """
     reset_token:      str
     new_password:     str = Field(..., min_length=8)
     confirm_password: str
@@ -402,7 +464,7 @@ class ResetPasswordRequest(BaseModel):
         return self
 
 
-# ─── Token Response ───────────────────────────────────────────────────────
+# ─── Token Response ───────────────────────────────────────────────────────────
 
 class TokenResponse(BaseModel):
     access_token:  str

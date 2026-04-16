@@ -1,33 +1,62 @@
 """
 app/schemas/stories_schema.py
 
-FIX:
-  StoryOut now includes business_name and business_avatar_url.
-  StoriesViewerScreen renders these in the story header (business name +
-  avatar). Without them the header was always blank — the Story ORM model
-  has no business_name column; the value must be injected by the CRUD
-  feed query (which joins Business) and carried through to the schema.
-  Both fields are Optional so single-story GET endpoints still validate.
+FIXES vs previous version:
+  1.  story_type → media_type.
+      Values: 'photo' | 'video' ONLY.
+      Blueprint §14: "media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('photo','video'))"
+      'image' and 'text' are wrong values — removed.
+
+  2.  tags JSONB added for product/service tagging.
+      Blueprint §8.5: "Product and service tagging (same tap-to-tag mechanic
+      as reels)" — stories support tappable listing overlays.
+
+  3.  pinned_until: Optional[datetime] added.
+      Blueprint §14 / §8.5: "Enterprise: can pin a story to profile for
+      up to 7 days (stories.pinned_until TIMESTAMPTZ, NULL for unpinned)."
+      Only Enterprise accounts can set this. Enforced at service layer.
+
+  4.  view_count → views_count. Blueprint §14 field name.
 """
-from pydantic import BaseModel, Field, ConfigDict, field_validator
-from typing import Optional, List, Literal
+from __future__ import annotations
+
 from datetime import datetime
+from typing import List, Literal, Optional
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# ============================================================
-# STORY SCHEMAS
-# ============================================================
+from app.schemas.reels_schema import ReelTag   # reuse same tappable tag structure
+
+
+# ─── Story create / update ────────────────────────────────────────────────────
 
 class StoryCreate(BaseModel):
-    story_type:       Literal["image", "video", "text"]
-    media_url:        Optional[str] = None
-    thumbnail_url:    Optional[str] = None
-    text_content:     Optional[str] = Field(None, max_length=500)
-    background_color: str           = "#000000"
-    duration_seconds: int           = Field(5, ge=1, le=30)  # Blueprint §5.3: 30 s max
-    cta_text:         Optional[str] = Field(None, max_length=50)
-    cta_url:          Optional[str] = None
+    """
+    Create a story.
+    Blueprint §8.5: "Photo or video — up to 30 seconds per story."
+    Blueprint §14: media_type IN ('photo','video').
+    """
+    # Blueprint §14 HARD RULE: media_type IN ('photo','video') only.
+    # 'image' is wrong — blueprint uses 'photo'. 'text' is not supported.
+    media_type: Literal["photo", "video"] = Field(
+        ..., description="'photo' or 'video' (Blueprint §14)"
+    )
+    media_url:  str = Field(..., description="S3/R2 URL of the photo or video")
+    thumbnail_url: Optional[str] = None
+
+    # Blueprint §8.5: "up to 30 seconds per story"
+    duration_s: int = Field(5, ge=1, le=30, description="Display duration in seconds")
+
+    # Blueprint §8.5: "Product and service tagging (same tap-to-tag mechanic as reels)"
+    tags: List[ReelTag] = Field(
+        default_factory=list,
+        description="Tappable listing overlays [{timestamp_ms, listing_id, x_position, y_position}]",
+    )
+
+    # Optional call-to-action
+    cta_text: Optional[str] = Field(None, max_length=50)
+    cta_url:  Optional[str] = None
 
 
 class StoryUpdate(BaseModel):
@@ -36,39 +65,64 @@ class StoryUpdate(BaseModel):
     cta_url:   Optional[str]  = None
 
 
+# ─── Story output ─────────────────────────────────────────────────────────────
+
 class StoryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id:               UUID
-    business_id:      UUID
-    story_type:       str
-    media_url:        Optional[str] = None
-    thumbnail_url:    Optional[str] = None
-    text_content:     Optional[str] = None
-    background_color: Optional[str] = None
-    duration_seconds: int
-    view_count:       int
-    expires_at:       datetime
-    is_active:        bool
-    cta_text:         Optional[str] = None
-    cta_url:          Optional[str] = None
-    created_at:       datetime
+    id:          UUID
+    business_id: UUID
 
-    # FIX: business info injected by feed CRUD — needed by StoriesViewerScreen
-    # header. Not a real DB column; set as a dynamic attribute on the ORM
-    # object by stories_crud.get_feed() after the Business join.
+    # Blueprint §14: media_type IN ('photo','video')
+    media_type:    str
+    media_url:     str
+    thumbnail_url: Optional[str] = None
+
+    duration_s: int
+
+    # Blueprint §8.5: tappable product tags
+    tags: List[ReelTag] = Field(default_factory=list)
+
+    # Blueprint §14 / §8.5: views_count (not view_count)
+    views_count: int = 0
+
+    expires_at: datetime
+    is_active:  bool
+
+    # Blueprint §14 / §8.5: Enterprise only — pin story for up to 7 days
+    pinned_until: Optional[datetime] = None
+
+    cta_text: Optional[str] = None
+    cta_url:  Optional[str] = None
+    created_at: datetime
+
+    # Business display info — injected by CRUD feed query after Business join
     business_name:       Optional[str] = None
     business_avatar_url: Optional[str] = None
 
-    # Viewer context — injected by service, not persisted on the ORM object
+    # Viewer context — injected by service layer
     viewed_by_me: bool = False
 
-    @field_validator("background_color", mode="before")
+    @field_validator("views_count", mode="before")
     @classmethod
-    def coerce_bg_color(cls, v: Optional[str]) -> str:
-        """Coerce NULL from legacy DB rows to a safe default."""
-        return v if v is not None else "#000000"
+    def coerce_none_to_zero(cls, v):
+        return v if v is not None else 0
 
+    @field_validator("tags", mode="before")
+    @classmethod
+    def parse_tags(cls, v):
+        if not v:
+            return []
+        result = []
+        for item in v:
+            if isinstance(item, dict):
+                result.append(ReelTag(**item))
+            elif isinstance(item, ReelTag):
+                result.append(item)
+        return result
+
+
+# ─── Feed ─────────────────────────────────────────────────────────────────────
 
 class StoryFeedItem(BaseModel):
     """Stories grouped by business for the horizontal story-ring row."""

@@ -77,13 +77,30 @@ class CRUDDoctor(CRUDBase[Doctor, dict, dict]):
             ))
 
         if is_online is not None:
-            query = query.filter(Doctor.is_online == is_online)
+            # FIX: New doctors default is_online=False even when they offer remote
+            # consultations (video/chat/phone). Treat any doctor with a remote fee
+            # set as effectively online so they appear in online searches.
+            if is_online:
+                query = query.filter(or_(
+                    Doctor.is_online == True,
+                    Doctor.consultation_fee_video.isnot(None),
+                    Doctor.consultation_fee_chat.isnot(None),
+                    Doctor.consultation_fee_phone.isnot(None),
+                ))
+            else:
+                query = query.filter(Doctor.is_online == False)
 
         if min_experience is not None:
             query = query.filter(Doctor.years_of_experience >= min_experience)
 
         if min_rating is not None:
-            query = query.filter(Doctor.average_rating >= min_rating)
+            # FIX: New doctors start with average_rating=0.00 and total_reviews=0.
+            # A rating of 0 means "unrated", not "poorly rated". Exclude them from
+            # the rating penalty so they still appear in rating-filtered searches.
+            query = query.filter(or_(
+                Doctor.average_rating >= min_rating,
+                Doctor.total_reviews == 0
+            ))
 
         if is_verified is not None:
             query = query.filter(Doctor.is_verified == is_verified)
@@ -94,8 +111,15 @@ class CRUDDoctor(CRUDBase[Doctor, dict, dict]):
             "in_person": Doctor.consultation_fee_in_person,
             "phone": Doctor.consultation_fee_phone
         }
-        if max_fee and consultation_type and consultation_type in fee_column_map:
-            query = query.filter(fee_column_map[consultation_type] <= max_fee)
+        if consultation_type and consultation_type in fee_column_map:
+            # FIX: Always filter by consultation_type when provided — ensure the
+            # doctor actually offers that consultation mode (fee is set).
+            # Previously this only ran when max_fee was also provided, meaning
+            # consultation_type alone had no effect on search results.
+            fee_col = fee_column_map[consultation_type]
+            query = query.filter(fee_col.isnot(None))
+            if max_fee:
+                query = query.filter(fee_col <= max_fee)
 
         return query.order_by(
             Doctor.is_verified.desc(),
@@ -195,7 +219,9 @@ class CRUDConsultation(CRUDBase[Consultation, dict, dict]):
         allergies: Optional[str] = None,
         current_medications: Optional[List[str]] = None,
         patient_dob: Optional[date] = None,
-        patient_gender: Optional[str] = None
+        patient_gender: Optional[str] = None,
+        platform_fee: Decimal = Decimal("0"),
+        total_amount: Optional[Decimal] = None
     ) -> Consultation:
         doctor = doctor_crud.get(db, id=doctor_id)
         if not doctor or not doctor.is_active:
@@ -239,7 +265,9 @@ class CRUDConsultation(CRUDBase[Consultation, dict, dict]):
             medical_history=medical_history,
             allergies=allergies,
             current_medications=current_medications or [],
-            consultation_fee=fee
+            consultation_fee=fee,
+            platform_fee=platform_fee,
+            total_amount=total_amount if total_amount is not None else fee + platform_fee
         )
         db.add(consultation)
         db.commit()

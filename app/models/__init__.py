@@ -1,4 +1,17 @@
-"""Centralized SQLAlchemy model exports for metadata loading and app imports."""
+"""
+app/models/__init__.py
+
+Centralized SQLAlchemy model exports.
+
+CHANGES:
+  - AdminUser replaces Admin (admin_users table is now separate from users)
+  - UserAgreement added (Blueprint §14 / §3 step 8)
+  - UserRoleEnum replaces UserTypeEnum (no 'admin' in mobile role enum)
+  - CouponRedemption replaces CouponUsage (renamed per Blueprint §9.2)
+  - ReelView / ReelLike / ReelComment kept
+  - StoryView.viewer_user_id field (renamed from viewer_id per Blueprint §14)
+  - CryptoTopUp REMOVED — not in blueprint
+"""
 
 from app.models.analytics_model import DailyAnalyticsSnapshot
 from app.models.base_model import BaseModel
@@ -6,20 +19,22 @@ from app.models.business_model import (
     Business,
     BusinessCategoryEnum,
     BusinessHours,
-    VerificationBadgeEnum,
 )
-
 from app.models.address_model import CustomerAddress
-
 from app.models.chat_model import (
     Conversation,
     ConversationTypeEnum,
     Message,
-    MessageTypeEnum,
     TypingIndicator,
     UserPresence,
 )
-from app.models.coupon_model import Coupon, CouponStatus, CouponType, CouponUsage
+from app.models.coupon_model import (
+    Coupon,
+    CouponRedemption,
+    CouponStatus,
+    CouponType,
+    CouponUsage,   # alias for backward compat
+)
 from app.models.delivery_model import (
     Delivery,
     DeliveryStatusEnum,
@@ -129,7 +144,7 @@ from app.models.properties_model import (
     SavedProperty,
     ViewingStatusEnum,
 )
-from app.models.referrals_model import Referral, ReferralCode, ReferralStatus
+from app.models.referrals_model import Referral, ReferralCode
 from app.models.reels_model import Reel, ReelComment, ReelLike, ReelView
 from app.models.reviews_model import (
     Review,
@@ -172,10 +187,14 @@ from app.models.tickets_model import (
     TicketTier,
     TransportTypeEnum,
 )
-from app.models.user_model import Admin, CustomerProfile, User, UserStatusEnum, UserTypeEnum
+from app.models.user_model import (
+    AdminUser,
+    CustomerProfile,
+    User,
+    UserAgreement,
+    UserRoleEnum,
+)
 from app.models.wallet_model import (
-    CryptoTopUp,
-    CryptoTopUpStatusEnum,
     PlatformRevenue,
     TransactionStatus,
     TransactionStatusEnum,
@@ -186,82 +205,103 @@ from app.models.wallet_model import (
 )
 
 __all__ = [
-    "Admin",
-    "ApplicationStatus",
+    # Admin
+    "AdminUser",
+    # Analytics
+    "DailyAnalyticsSnapshot",
+    # Base
     "BaseModel",
-    "BillingCycleEnum",
+    # Business
     "Business",
     "BusinessCategoryEnum",
     "BusinessHours",
-    "CartItem",
-    "Consultation",
-    "ConsultationStatusEnum",
-    "ConsultationTypeEnum",
+    # Address
+    "CustomerAddress",
+    # Chat
     "Conversation",
     "ConversationTypeEnum",
-    "CookingBooking",
-    "CookingService",
-    "CookingServiceStatusEnum",
+    "Message",
+    "TypingIndicator",
+    "UserPresence",
+    # Coupon
     "Coupon",
+    "CouponRedemption",
     "CouponStatus",
     "CouponType",
     "CouponUsage",
-    "CryptoTopUp",
-    "CryptoTopUpStatusEnum",
-    "CustomerProfile",
-    "DailyAnalyticsSnapshot",
+    # Delivery
     "Delivery",
     "DeliveryPaymentStatusEnum",
     "DeliveryStatusEnum",
     "DeliveryTracking",
     "DeliveryTypeEnum",
     "DeliveryZone",
-    "DeviceToken",
-    "Doctor",
-    "DoctorAvailability",
-    "DoctorSpecializationEnum",
-    "DriverSubscriptionPlan",
-    "EventCategoryEnum",
-    "EventTypeEnum",
-    "ExperienceLevel",
+    "RiderEarnings",
+    "RiderShift",
+    "VehicleTypeEnum",
+    # Favorites
     "Favorite",
+    # Food
+    "CookingBooking",
+    "CookingService",
+    "CookingServiceStatusEnum",
+    "CuisineTypeEnum",
     "FoodOrder",
     "FoodOrderItem",
     "FoodOrderStatusEnum",
-    "Hotel",
-    "HotelBooking",
-    "HotelBookingStatusEnum",
-    "HotelPaymentStatusEnum",
-    "HotelService",
-    "JobApplication",
-    "JobPosting",
-    "JobStatus",
-    "JobType",
+    "MenuCategory",
+    "MenuItem",
+    "ReservationStatusEnum",
+    "Restaurant",
+    "TableReservation",
+    "TableStatusEnum",
+    # Health
+    "Consultation",
+    "ConsultationStatusEnum",
+    "ConsultationTypeEnum",
+    "Doctor",
+    "DoctorAvailability",
+    "DoctorSpecializationEnum",
     "LabBooking",
     "LabBookingStatusEnum",
     "LabCenter",
     "LabResult",
     "LabTest",
     "LabTestCategoryEnum",
-    "ListingTypeEnum",
-    "MenuCategory",
-    "MenuItem",
-    "Message",
-    "MessageTypeEnum",
-    "Notification",
-    "NotificationCategoryEnum",
-    "NotificationChannelEnum",
-    "NotificationPreference",
-    "NotificationStatusEnum",
-    "OfferStatusEnum",
-    "OrderItem",
     "Pharmacy",
     "PharmacyOrder",
     "PharmacyOrderItem",
     "PharmacyOrderStatusEnum",
     "PharmacyProduct",
-    "PlatformRevenue",
-    "PricingTypeEnum",
+    "Prescription",
+    "PrescriptionStatusEnum",
+    # Hotels
+    "Hotel",
+    "HotelBooking",
+    "HotelBookingStatusEnum",
+    "HotelPaymentStatusEnum",
+    "HotelService",
+    "Room",
+    "RoomStatusEnum",
+    "RoomType",
+    "ServiceStatusEnum",
+    # Jobs
+    "ApplicationStatus",
+    "ExperienceLevel",
+    "JobApplication",
+    "JobPosting",
+    "JobStatus",
+    "JobType",
+    # Notifications
+    "DeviceToken",
+    "Notification",
+    "NotificationCategoryEnum",
+    "NotificationChannelEnum",
+    "NotificationPreference",
+    "NotificationStatusEnum",
+    # Products
+    "CartItem",
+    "OrderItem",
     "Product",
     "ProductOrder",
     "ProductOrderStatusEnum",
@@ -269,10 +309,17 @@ __all__ = [
     "ProductTypeEnum",
     "ProductVariant",
     "ProductVendor",
+    "Wishlist",
+    # Promotions
     "Promotion",
     "PromotionRedemption",
     "PromotionStatus",
     "PromotionType",
+    "StreakActionType",
+    "StreakProgress",
+    # Properties
+    "ListingTypeEnum",
+    "OfferStatusEnum",
     "Property",
     "PropertyAgent",
     "PropertyInquiry",
@@ -281,30 +328,30 @@ __all__ = [
     "PropertySubtypeEnum",
     "PropertyTypeEnum",
     "PropertyViewing",
+    "SavedProperty",
+    "ViewingStatusEnum",
+    # Referrals
     "Referral",
     "ReferralCode",
-    "ReferralStatus",
+    # Reels
     "Reel",
     "ReelComment",
     "ReelLike",
     "ReelView",
-    "ReservationStatusEnum",
-    "Restaurant",
+    # Reviews
     "Review",
     "ReviewContextEnum",
     "ReviewHelpfulVote",
     "ReviewResponse",
     "ReviewStatusEnum",
     "ReviewableTypeEnum",
+    # Rider
+    "DriverSubscriptionPlan",
     "Rider",
-    "RiderEarnings",
-    "RiderShift",
-    "Room",
-    "RoomStatusEnum",
-    "RoomType",
-    "SavedProperty",
+    # Search
     "SearchQuery",
-    "SeatMap",
+    # Services
+    "PricingTypeEnum",
     "Service",
     "ServiceAvailability",
     "ServiceBooking",
@@ -313,38 +360,38 @@ __all__ = [
     "ServicePackage",
     "ServicePaymentStatusEnum",
     "ServiceProvider",
-    "ServiceStatusEnum",
+    # Stories
     "Story",
     "StoryTypeEnum",
     "StoryView",
-    "StreakActionType",
-    "StreakProgress",
+    # Subscriptions
+    "BillingCycleEnum",
     "Subscription",
     "SubscriptionPlan",
     "SubscriptionPlanTypeEnum",
     "SubscriptionStatusEnum",
-    "TableReservation",
-    "TableStatusEnum",
+    # Tickets
+    "EventCategoryEnum",
+    "EventTypeEnum",
+    "SeatMap",
     "TicketBooking",
     "TicketBookingStatusEnum",
     "TicketEvent",
     "TicketPaymentStatusEnum",
     "TicketStatusEnum",
     "TicketTier",
+    "TransportTypeEnum",
+    # Users
+    "CustomerProfile",
+    "User",
+    "UserAgreement",
+    "UserRoleEnum",
+    # Wallet
+    "PlatformRevenue",
     "TransactionStatus",
     "TransactionStatusEnum",
     "TransactionType",
     "TransactionTypeEnum",
-    "TransportTypeEnum",
-    "TypingIndicator",
-    "User",
-    "UserPresence",
-    "UserStatusEnum",
-    "UserTypeEnum",
-    "VehicleTypeEnum",
-    "VerificationBadgeEnum",
-    "ViewingStatusEnum",
     "Wallet",
     "WalletTransaction",
-    "Wishlist",
 ]

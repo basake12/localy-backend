@@ -284,6 +284,8 @@ class Consultation(BaseModel):
 
     # Pricing
     consultation_fee = Column(Numeric(10, 2), nullable=False)
+    platform_fee = Column(Numeric(10, 2), nullable=False, default=0)
+    total_amount = Column(Numeric(10, 2), nullable=False, default=0)
     payment_status = Column(String(20), default="pending")
     payment_reference = Column(String(100), nullable=True)
 

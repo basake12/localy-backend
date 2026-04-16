@@ -48,6 +48,7 @@ from sqlalchemy import select, func
 from typing import List, Optional, Annotated
 from uuid import UUID
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 from app.core.database import get_async_db
 from app.dependencies import (
@@ -89,8 +90,29 @@ from app.core.exceptions import (
 # only a safety net for any ORM object that slips through (e.g. BookingResponse
 # that loads the hotel relationship).
 _GEO_ENCODER = {
-    WKBElement: lambda v: {"latitude": to_shape(v).y, "longitude": to_shape(v).x}
+    WKBElement: lambda v: {"latitude": to_shape(v).y, "longitude": to_shape(v).x},
+    # Decimal columns (NUMERIC) are not JSON-serializable by default.
+    # This covers any Decimal that slips through into response payloads,
+    # e.g. add_ons JSONB list items built before hotel_service converts them.
+    Decimal: float,
 }
+
+
+def _sanitize_add_ons(add_ons) -> list:
+    """
+    Convert any Decimal values inside the add_ons list to float before the
+    list is stored as JSONB.  SQLAlchemy serialises JSONB with stdlib json,
+    which does not support Decimal → TypeError at INSERT time.
+
+    Usage in hotel_service.py (or wherever the booking dict is assembled):
+        booking_data["add_ons"] = _sanitize_add_ons(add_ons)
+    """
+    if not add_ons:
+        return []
+    return [
+        {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
+        for item in add_ons
+    ]
 
 router = APIRouter()
 
@@ -425,6 +447,49 @@ async def update_my_hotel(
     await db.refresh(hotel)
     return {"success": True, "data": hotel}
 
+
+@router.patch("/my/hotel", response_model=SuccessResponse[HotelResponse])
+async def patch_my_hotel(
+    *,
+    db: AsyncSession = Depends(get_async_db),
+    update_in: HotelCreateRequest,
+    current_user: User = Depends(require_business),
+) -> dict:
+    """
+    Partially update the authenticated business's hotel profile.
+
+    Unlike PUT, only the fields you include in the request body are updated —
+    omitted fields are left unchanged.  Accepts the same fields as PUT:
+    star_rating, total_rooms, check_in_time, check_out_time, facilities,
+    policies, cancellation_policy.
+
+    Example — update star_rating only:
+        PATCH /api/v1/hotels/my/hotel
+        {"star_rating": 5}
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    business = await business_crud.get_by_user_id(db, user_id=current_user.id)
+    if not business:
+        raise NotFoundException("Business")
+
+    hotel = await hotel_crud.get_by_business_id(db, business_id=business.id)
+    if not hotel:
+        raise NotFoundException("Hotel")
+
+    # exclude_unset=True means only fields explicitly sent in the body are
+    # applied — this is what makes PATCH semantically different from PUT.
+    update_data = update_in.model_dump(exclude_unset=True)
+
+    for field, value in update_data.items():
+        setattr(hotel, field, value)
+        if isinstance(value, (list, dict)):
+            flag_modified(hotel, field)
+
+    db.add(hotel)
+    await db.commit()
+    await db.refresh(hotel)
+    return {"success": True, "data": hotel}
 
 
 # ============================================

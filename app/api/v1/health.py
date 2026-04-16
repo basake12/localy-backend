@@ -33,7 +33,7 @@ from app.crud.health_crud import (
     pharmacy_order_crud, lab_center_crud, lab_test_crud,
     lab_booking_crud, lab_result_crud
 )
-from app.crud.business_crud import business_crud
+from app.models.business_model import Business
 from app.models.user_model import User
 from app.models.health_model import (
     LabResult, Consultation as ConsultModel,
@@ -61,6 +61,20 @@ def _utcnow() -> datetime:
 
 
 # ────────────────────────────────────────────
+# FIX: SYNC BUSINESS LOOKUP
+# ────────────────────────────────────────────
+# business_crud is an AsyncCRUDBase — calling its methods without `await`
+# in a sync router returns a coroutine object, not the Business instance.
+# Accessing any attribute on that coroutine (e.g. .category, .id) raises:
+#   AttributeError: 'coroutine' object has no attribute 'category'
+# Fix: query Business directly with the sync Session everywhere in this router.
+
+def _get_business_sync(db: Session, user_id: UUID) -> Optional[Business]:
+    """Sync Business lookup by user_id — safe to call from a sync router."""
+    return db.query(Business).filter(Business.user_id == user_id).first()
+
+
+# ────────────────────────────────────────────
 # INLINE REQUEST SCHEMAS FOR SIMPLE PAYLOADS
 # ────────────────────────────────────────────
 
@@ -83,7 +97,6 @@ class CancelRequest(BaseModel):
     reason: Optional[str] = None
 
 
-# FIX: mutable fields for PUT /pharmacies/products/{id} must come from body
 class PharmacyProductUpdateRequest(BaseModel):
     price: Optional[Decimal] = Field(None, gt=0)
     stock_quantity: Optional[int] = Field(None, ge=0)
@@ -105,7 +118,7 @@ def get_specializations() -> dict:
 
 @router.post(
     "/doctors/search",
-    response_model=SuccessResponse[List[dict]]
+    response_model=SuccessResponse[List[DoctorResponse]]
 )
 def search_doctors(
     *,
@@ -136,7 +149,7 @@ def search_doctors(
     return {"success": True, "data": doctors}
 
 
-@router.get("/doctors/{doctor_id}", response_model=SuccessResponse[dict])
+@router.get("/doctors/{doctor_id}", response_model=SuccessResponse[DoctorResponse])
 def get_doctor_details(
     *, db: Session = Depends(get_db), doctor_id: UUID
 ) -> dict:
@@ -176,7 +189,10 @@ def get_my_doctor_profile(
     *, db: Session = Depends(get_db),
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
@@ -194,7 +210,8 @@ def create_doctor(
     doctor_in: DoctorCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
     if not business:
         raise NotFoundException("Business")
     if business.category != "health":
@@ -227,7 +244,10 @@ def add_availability(
     avail_in: DoctorAvailabilityCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
@@ -246,7 +266,10 @@ def get_my_availabilities(
     *, db: Session = Depends(get_db),
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
@@ -262,7 +285,10 @@ def update_online_status(
     is_available_for_instant: bool = Query(default=False),
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
@@ -297,7 +323,10 @@ def get_doctor_consultations(
     consultation_status: Optional[str] = Query(None),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
@@ -327,13 +356,16 @@ def start_consultation(
     if not consultation:
         raise NotFoundException("Consultation")
 
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor or consultation.doctor_id != doctor.id:
         raise PermissionDeniedException()
 
     consultation.status = "in_progress"
-    consultation.started_at = _utcnow()  # FIX: was datetime.utcnow()
+    consultation.started_at = _utcnow()
 
     if consultation.consultation_type in ["video", "chat"]:
         consultation.room_id = str(_uuid.uuid4())
@@ -358,7 +390,10 @@ def end_consultation(
     if not consultation:
         raise NotFoundException("Consultation")
 
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor or consultation.doctor_id != doctor.id:
         raise PermissionDeniedException()
@@ -367,7 +402,7 @@ def end_consultation(
         raise ValidationException("Consultation is not in progress")
 
     consultation.status = "completed"
-    consultation.ended_at = _utcnow()  # FIX: was datetime.utcnow()
+    consultation.ended_at = _utcnow()
     db.commit()
     db.refresh(consultation)
     return {"success": True, "data": consultation}
@@ -388,7 +423,10 @@ def add_consultation_notes(
     if not consultation:
         raise NotFoundException("Consultation")
 
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor or consultation.doctor_id != doctor.id:
         raise PermissionDeniedException()
@@ -424,7 +462,10 @@ def issue_prescription(
     prescription_in: PrescriptionCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     doctor = doctor_crud.get_by_business_id(db, business_id=business.id)
     if not doctor:
         raise NotFoundException("Doctor profile")
@@ -523,7 +564,7 @@ def cancel_consultation(
         raise ValidationException("Cannot cancel this consultation")
 
     consultation.status = "cancelled"
-    consultation.cancelled_at = _utcnow()  # FIX: was datetime.utcnow()
+    consultation.cancelled_at = _utcnow()
     consultation.cancellation_reason = body.reason
     db.commit()
     db.refresh(consultation)
@@ -619,7 +660,7 @@ def search_pharmacies(
 
 @router.get(
     "/pharmacies/{pharmacy_id}",
-    response_model=SuccessResponse[dict]
+    response_model=SuccessResponse[PharmacyResponse]
 )
 def get_pharmacy_details(
     *, db: Session = Depends(get_db), pharmacy_id: UUID
@@ -670,7 +711,8 @@ def create_pharmacy(
     pharmacy_in: PharmacyCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
     if not business or business.category != "health":
         raise ValidationException(
             "Only health category businesses can create pharmacies"
@@ -698,7 +740,10 @@ def add_pharmacy_product(
     product_in: PharmacyProductCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     pharmacy = pharmacy_crud.get_by_business_id(db, business_id=business.id)
     if not pharmacy:
         raise NotFoundException("Pharmacy")
@@ -717,11 +762,13 @@ def update_pharmacy_product(
     *,
     db: Session = Depends(get_db),
     product_id: UUID,
-    # FIX: mutable fields must come from request body, not query params
     update_in: PharmacyProductUpdateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     pharmacy = pharmacy_crud.get_by_business_id(db, business_id=business.id)
     if not pharmacy:
         raise NotFoundException("Pharmacy")
@@ -746,7 +793,10 @@ def get_pharmacy_orders_business(
     order_status: Optional[str] = Query(None),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     pharmacy = pharmacy_crud.get_by_business_id(db, business_id=business.id)
     if not pharmacy:
         raise NotFoundException("Pharmacy")
@@ -787,7 +837,7 @@ def mark_order_ready(
     if not order:
         raise NotFoundException("Order")
     order.status = "ready"
-    order.prepared_at = _utcnow()  # FIX: was datetime.utcnow()
+    order.prepared_at = _utcnow()
     db.commit()
     return {"success": True, "data": {"status": "ready"}}
 
@@ -920,7 +970,8 @@ def create_lab_center(
     lab_in: LabCenterCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
     if not business or business.category != "health":
         raise ValidationException(
             "Only health category businesses can create lab centers"
@@ -947,7 +998,10 @@ def add_lab_test(
     test_in: LabTestCreateRequest,
     current_user: User = Depends(require_business)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     lab = lab_center_crud.get_by_business_id(db, business_id=business.id)
     if not lab:
         raise NotFoundException("Lab center")
@@ -970,7 +1024,10 @@ def get_lab_bookings_business(
     booking_status: Optional[str] = Query(None),
     pagination: dict = Depends(get_pagination_params)
 ) -> dict:
-    business = business_crud.get_by_user_id(db, user_id=current_user.id)
+    # FIX: use sync query instead of async business_crud.get_by_user_id()
+    business = _get_business_sync(db, current_user.id)
+    if not business:
+        raise NotFoundException("Business")
     lab = lab_center_crud.get_by_business_id(db, business_id=business.id)
     if not lab:
         raise NotFoundException("Lab center")
@@ -997,7 +1054,7 @@ def mark_sample_collected(
     if not booking:
         raise NotFoundException("Booking")
     booking.status = "sample_collected"
-    booking.sample_collected_at = _utcnow()  # FIX: was datetime.utcnow()
+    booking.sample_collected_at = _utcnow()
     db.commit()
     return {"success": True, "data": {"status": "sample_collected"}}
 

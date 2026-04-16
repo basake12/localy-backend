@@ -429,7 +429,9 @@ class PropertySearchFilters(BaseModel):
 
     city: Optional[str] = None
     state: Optional[str] = None
-    local_government: Optional[str] = None
+    # local_government DELETED from search filters — Blueprint §2/§4 HARD RULE:
+    # "No LGA filtering anywhere in the codebase."
+    # local_government may appear in response schemas for display only.
     location: Optional[LocationSchema] = None
     radius_km: Optional[float] = Field(None, gt=0, le=200)
 

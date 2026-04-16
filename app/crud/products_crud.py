@@ -3,17 +3,20 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_, func, desc
 from uuid import UUID
 from decimal import Decimal
+from datetime import datetime, timezone, timedelta
 
 from app.crud.base_crud import CRUDBase
 from app.models.products_model import (
     ProductVendor, Product, ProductVariant,
-    ProductOrder, OrderItem, CartItem, Wishlist
+    ProductOrder, OrderItem, CartItem, Wishlist,
+    OrderStatusEnum, ProductReturn, ReturnStatusEnum,
 )
 from app.models.business_model import Business
 from app.core.exceptions import (
     NotFoundException,
     ValidationException,
     OutOfStockException,
+    PermissionDeniedException,
 )
 
 
@@ -46,7 +49,8 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             max_price: Optional[Decimal] = None,
             in_stock_only: bool = False,
             location: Optional[Tuple[float, float]] = None,
-            radius_km: float = 10.0,
+            # Blueprint §3.1 — default radius is 5 km.
+            radius_km: float = 5.0,
             sort_by: str = "created_at",
             skip: int = 0,
             limit: int = 20
@@ -255,6 +259,30 @@ class CRUDProductVariant(CRUDBase[ProductVariant, dict, dict]):
             ProductVariant.is_active == True
         ).all()
 
+    def get_by_attributes(
+            self,
+            db: Session,
+            *,
+            product_id: UUID,
+            attributes: dict,
+            exclude_id: Optional[UUID] = None,
+    ) -> Optional[ProductVariant]:
+        """
+        Return an active variant whose attributes JSONB matches the supplied
+        dict exactly, optionally skipping `exclude_id` (used in update checks
+        to exclude the variant being edited from the duplicate search).
+
+        PostgreSQL JSONB equality (==) is exact — key order does not matter.
+        """
+        query = db.query(ProductVariant).filter(
+            ProductVariant.product_id == product_id,
+            ProductVariant.is_active == True,
+            ProductVariant.attributes == attributes,
+        )
+        if exclude_id:
+            query = query.filter(ProductVariant.id != exclude_id)
+        return query.first()
+
 
 class CRUDCart(CRUDBase[CartItem, dict, dict]):
 
@@ -272,8 +300,7 @@ class CRUDCart(CRUDBase[CartItem, dict, dict]):
 
         Used after add/update operations so the router can compute item_total and
         build a complete CartItemResponse dict without triggering lazy-load or a
-        detached-instance error. Always call this before building the response —
-        never pass a post-refresh CartItem directly to the serializer.
+        detached-instance error.
         """
         return db.query(CartItem).options(
             joinedload(CartItem.product).joinedload(Product.vendor),
@@ -288,7 +315,7 @@ class CRUDCart(CRUDBase[CartItem, dict, dict]):
         """
         Insert or increment a cart item. Returns the raw CartItem after commit.
         Callers should follow up with get_cart_item_with_relations() to build the
-        full response — this method intentionally stays narrow (persist only).
+        full response.
         """
         existing = db.query(CartItem).filter(and_(
             CartItem.customer_id == customer_id,
@@ -316,8 +343,8 @@ class CRUDCart(CRUDBase[CartItem, dict, dict]):
     def update_quantity(self, db: Session, *, cart_item_id: UUID, quantity: int) -> CartItem:
         """
         Update quantity. Returns raw CartItem after commit.
-        Callers should follow up with get_cart_item_with_relations() to build the
-        full response.
+        Callers should follow up with get_cart_item_with_relations() to build
+        the full response.
         """
         cart_item = self.get(db, id=cart_item_id)
         if not cart_item:
@@ -342,6 +369,8 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
             recipient_name: str,
             recipient_phone: str,
             payment_method: str,
+            platform_fee: Decimal = Decimal('50.00'),
+            shipping_fee: Decimal = Decimal('2000.00'),
             coupon_code: Optional[str] = None,
             notes: Optional[str] = None
     ) -> ProductOrder:
@@ -405,10 +434,9 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
                 'product_snapshot': product_snapshot
             })
 
-        shipping_fee = Decimal('2000.00')  # TODO: calculate from distance
         tax = Decimal('0.00')
         discount = Decimal('0.00')
-        total_amount = subtotal + shipping_fee + tax - discount
+        total_amount = subtotal + shipping_fee + platform_fee + tax - discount
 
         order = ProductOrder(
             customer_id=customer_id,
@@ -419,6 +447,7 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
             shipping_fee=shipping_fee,
             tax=tax,
             discount=discount,
+            platform_fee=platform_fee,
             total_amount=total_amount,
             payment_method=payment_method,
             coupon_code=coupon_code,
@@ -480,15 +509,22 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         if not order:
             raise NotFoundException("Order")
 
-        order.order_status = new_status
+        # FIX: Assign via OrderStatusEnum member so SQLAlchemy stores the
+        # correct lowercase .value in the DB enum column — never a raw string.
+        try:
+            order.order_status = OrderStatusEnum(new_status.lower())
+        except ValueError:
+            raise ValidationException(
+                f"Invalid order status '{new_status}'. "
+                f"Valid values: {[e.value for e in OrderStatusEnum]}"
+            )
 
         if tracking_number:
             order.tracking_number = tracking_number
         if estimated_delivery:
             order.estimated_delivery = estimated_delivery
 
-        from datetime import datetime, timezone
-        if new_status == "delivered":
+        if order.order_status == OrderStatusEnum.DELIVERED:
             order.delivered_at = datetime.now(timezone.utc)
 
         db.commit()
@@ -504,11 +540,18 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
             raise NotFoundException("Order")
 
         if customer_id and order.customer_id != customer_id:
-            from app.core.exceptions import PermissionDeniedException
             raise PermissionDeniedException()
 
-        if order.order_status in ["delivered", "cancelled", "refunded"]:
-            raise ValidationException(f"Cannot cancel order in '{order.order_status}' status")
+        # FIX: Compare against enum members, not raw strings, and assign via enum.
+        non_cancellable = {
+            OrderStatusEnum.DELIVERED,
+            OrderStatusEnum.CANCELLED,
+            OrderStatusEnum.REFUNDED,
+        }
+        if order.order_status in non_cancellable:
+            raise ValidationException(
+                f"Cannot cancel order in '{order.order_status.value}' status"
+            )
 
         for item in order.items:
             product_crud.restore_stock(
@@ -518,7 +561,8 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
                 quantity=item.quantity
             )
 
-        order.order_status = "cancelled"
+        # FIX: Use enum member — not the raw string "cancelled".
+        order.order_status = OrderStatusEnum.CANCELLED
         db.commit()
         db.refresh(order)
         return order
@@ -530,12 +574,109 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
             ProductOrder.tracking_number == tracking_number
         ).first()
 
+    def create_return_request(
+            self, db: Session, *,
+            order_id: UUID,
+            customer_id: UUID,
+            reason: str,
+            item_ids: List[UUID],
+            photos: List[str],
+    ) -> ProductReturn:
+        """
+        Validate and persist a return request for a delivered order.
+
+        Blueprint §11.4 / §13.1:
+          - Only the customer who placed the order may request a return.
+          - Order must be in DELIVERED status.
+          - Disputes must be raised within 48 hours of delivery.
+          - All item_ids must belong to this order.
+          - One active return per order — previous rejected requests are
+            replaced so the customer can resubmit after a rejection.
+          - Actual refund credit is applied by admin after review, not here.
+
+        Raises:
+          NotFoundException         — order not found
+          PermissionDeniedException — order belongs to a different customer
+          ValidationException       — wrong status, outside 48-hour window,
+                                      invalid item IDs, or duplicate request
+        """
+        order = (
+            db.query(ProductOrder)
+            .options(joinedload(ProductOrder.items))
+            .filter(ProductOrder.id == order_id)
+            .first()
+        )
+        if not order:
+            raise NotFoundException("Order")
+
+        if order.customer_id != customer_id:
+            raise PermissionDeniedException()
+
+        # Only delivered orders can be returned
+        if order.order_status != OrderStatusEnum.DELIVERED:
+            raise ValidationException(
+                f"Returns are only accepted for delivered orders. "
+                f"Current status: {order.order_status.value}"
+            )
+
+        # Blueprint §13.1 — disputes must be raised within 48 hours
+        if order.delivered_at:
+            deadline = order.delivered_at + timedelta(hours=48)
+            if datetime.now(timezone.utc) > deadline:
+                raise ValidationException(
+                    "Return window has closed. "
+                    "Disputes must be raised within 48 hours of delivery."
+                )
+
+        # Validate that all supplied item_ids belong to this order
+        valid_item_ids = {item.id for item in order.items}
+        invalid = [str(iid) for iid in item_ids if iid not in valid_item_ids]
+        if invalid:
+            raise ValidationException(
+                f"The following item IDs do not belong to this order: "
+                f"{', '.join(invalid)}"
+            )
+
+        # Check for an existing return — allow resubmission only after rejection
+        existing = (
+            db.query(ProductReturn)
+            .filter(ProductReturn.order_id == order_id)
+            .first()
+        )
+        if existing:
+            if existing.status != ReturnStatusEnum.REJECTED:
+                raise ValidationException(
+                    f"A return request for this order already exists "
+                    f"(status: {existing.status.value}). "
+                    "Please wait for admin review before submitting another."
+                )
+            # Previous request was rejected — delete it so a new one can be inserted
+            db.delete(existing)
+            db.flush()
+
+        return_record = ProductReturn(
+            order_id=order_id,
+            customer_id=customer_id,
+            reason=reason,
+            item_ids=[str(iid) for iid in item_ids],
+            photos=photos,
+            status=ReturnStatusEnum.PENDING,
+        )
+        db.add(return_record)
+        db.commit()
+        db.refresh(return_record)
+        return return_record
+
 
 class CRUDWishlist(CRUDBase[Wishlist, dict, dict]):
 
     def get_by_customer(self, db: Session, *, customer_id: UUID) -> List[Wishlist]:
+        # FIX: joinedload Product.vendor in addition to Wishlist.product.
+        # The router's _build_wishlist_item_dict accesses p.vendor.store_name.
+        # Without the nested joinedload, every wishlist fetch triggers an N+1
+        # lazy-load per item, or DetachedInstanceError if the session is closed.
         return db.query(Wishlist).options(
-            joinedload(Wishlist.product)
+            joinedload(Wishlist.product).joinedload(Product.vendor)
         ).filter(Wishlist.customer_id == customer_id).all()
 
     def add(self, db: Session, *, customer_id: UUID, product_id: UUID) -> Wishlist:

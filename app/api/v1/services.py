@@ -129,8 +129,18 @@ def create_service_provider(
     provider_in: ServiceProviderCreateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    """Create service provider profile. Business must be in 'services' category."""
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    """
+    Create service provider profile. Business must be in 'services' category.
+
+    FIX: business_crud inherits from AsyncCRUDBase — all its methods expect
+    AsyncSession. This route uses a sync Session from get_db(). Calling
+    business_crud.get_by_user_id(sync_db) causes db.execute() to return a
+    ChunkedIteratorResult directly; awaiting it then raises TypeError.
+
+    Fix: use get_by_user_id_sync() which accepts a sync Session and uses
+    db.query() — consistent with services_crud.py throughout this module.
+    """
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
     if not biz:
         raise NotFoundException("Business")
     if biz.category != "services":
@@ -164,7 +174,7 @@ def get_my_provider(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
     if not biz:
         raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
@@ -188,12 +198,14 @@ def create_service(
     service_in: ServiceCreateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
     if not biz:
         raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
-        raise NotFoundException("Service provider — create one first via POST /services/providers")
+        raise NotFoundException(
+            "Service provider — create one first via POST /services/providers"
+        )
 
     service_data = service_in.model_dump()
     service_data["provider_id"] = provider.id
@@ -212,7 +224,7 @@ def get_my_services(
     pagination: dict = Depends(get_pagination_params),
     active_only: bool = Query(True),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
     if not biz:
         raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
@@ -241,7 +253,9 @@ def update_service(
     if not service:
         raise NotFoundException("Service")
 
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider or service.provider_id != provider.id:
         raise PermissionDeniedException("You do not own this service")
@@ -261,7 +275,9 @@ def toggle_service(
     current_user: User = Depends(require_business),
 ) -> dict:
     """Enable or disable a service offering."""
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
         raise NotFoundException("Service provider")
@@ -286,7 +302,9 @@ def delete_service(
     if not service:
         raise NotFoundException("Service")
 
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider or service.provider_id != provider.id:
         raise PermissionDeniedException()
@@ -311,7 +329,9 @@ def create_availability(
     availability_in: AvailabilityCreateRequest,
     current_user: User = Depends(require_business),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
         raise NotFoundException("Service provider")
@@ -331,7 +351,9 @@ def get_my_availability(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
         raise NotFoundException("Service provider")
@@ -356,7 +378,9 @@ def delete_availability(
     if not avail:
         raise NotFoundException("Availability slot")
 
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider or avail.provider_id != provider.id:
         raise PermissionDeniedException()
@@ -466,17 +490,19 @@ def get_my_bookings(
     result = []
     for b in bookings:
         provider = service_provider_crud.get(db, id=b.provider_id)
-        biz = business_crud.get(db, id=provider.business_id) if provider else None
+        # FIX: business_crud.get() is async (AsyncCRUDBase). Use get_sync()
+        # to stay on the sync Session used throughout this module.
+        biz = business_crud.get_sync(db, id=provider.business_id) if provider else None
         result.append({
-            "id":            b.id,
-            "service_name":  b.service.name if b.service else "N/A",
-            "provider_name": biz.business_name if biz else "N/A",
-            "booking_date":  b.booking_date,
-            "booking_time":  b.booking_time,
-            "total_price":   b.total_price,
-            "status":        b.status,
+            "id":             b.id,
+            "service_name":   b.service.name if b.service else "N/A",
+            "provider_name":  biz.business_name if biz else "N/A",
+            "booking_date":   b.booking_date,
+            "booking_time":   b.booking_time,
+            "total_price":    b.total_price,
+            "status":         b.status,
             "payment_status": b.payment_status,
-            "created_at":    b.created_at,
+            "created_at":     b.created_at,
         })
 
     return {"success": True, "data": result}
@@ -500,7 +526,9 @@ def get_booking_details(
         if booking.customer_id != current_user.id:
             raise PermissionDeniedException()
     elif current_user.user_type == "business":
-        biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+        biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+        if not biz:
+            raise NotFoundException("Business")
         provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
         if not provider or booking.provider_id != provider.id:
             raise PermissionDeniedException()
@@ -543,7 +571,9 @@ def get_provider_bookings(
     date_to: Optional[date] = Query(None),
     booking_status: Optional[str] = Query(None),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
         raise NotFoundException("Service provider")
@@ -570,7 +600,9 @@ def start_service(
     booking_id: UUID,
     current_user: User = Depends(require_business),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
         raise NotFoundException("Service provider")
@@ -591,7 +623,9 @@ def complete_service(
     booking_id: UUID,
     current_user: User = Depends(require_business),
 ) -> dict:
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
+    if not biz:
+        raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)
     if not provider:
         raise NotFoundException("Service provider")
@@ -616,7 +650,7 @@ def get_service_analytics(
     Provider analytics: total bookings, revenue, completion rate,
     revenue trend (last 7 days), top services by booking count.
     """
-    biz = business_crud.get_by_user_id(db, user_id=current_user.id)
+    biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
     if not biz:
         raise NotFoundException("Business")
     provider = service_provider_crud.get_by_business_id(db, business_id=biz.id)

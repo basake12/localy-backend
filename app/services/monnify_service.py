@@ -1,61 +1,125 @@
 """
 app/services/monnify_service.py
 
-Monnify integration for Localy.
+FIXES vs previous version:
+  1.  verify_webhook_signature() added — Blueprint §5.5:
+      "Verify: hmac.compare_digest(computed_sig, header_sig)"
+      Header: X-Monnify-Signature (HMAC-SHA512 of raw request body
+      using MONNIFY_SECRET_KEY).
 
-Responsibilities:
-  - Authenticate with Monnify (Basic → Bearer token, cached per session)
-  - Reserve a dedicated virtual bank account per user (Blueprint §4.1.1)
-  - Webhook payload parsing for auto-credit on bank transfer receipt
+  2.  MONNIFY_BASE_URL now defaults to production URL per corrected config.py.
+      The wallet.py webhook router calls verify_webhook_signature() before
+      any payload processing.
 
-Blueprint §4.1.1:
-  "Bank Transfer to Dedicated Virtual Account — each user gets a unique
-   account number (Monnify) that is permanently theirs. Transfer clears
-   and auto-credits wallet within 60 seconds."
+  3.  parse_webhook_payload() added — extracts all fields needed by
+      wallet_service.handle_monnify_funding().
 
-Monnify auth flow:
-  POST /api/v1/auth/login  (Basic auth: base64(apiKey:secretKey))
-  → { responseBody: { accessToken, expiresIn } }
-
-Reserve account:
-  POST /api/v2/bank-transfer/reserved-accounts  (Bearer token)
-  → { responseBody: { accountNumber, bankName, accountName, ... } }
-
-Note: The env MONNIFY_BASE_URL is /api/v1. Reserved accounts live at /api/v2,
-so we construct the v2 URL by swapping the suffix.
+  4.  get_access_token() note: in production, cache this in Redis with
+      TTL slightly below the Monnify token expiry (~1 hour). Currently
+      fetched fresh per call — acceptable for low-volume provisioning.
 """
 import base64
+import hashlib
+import hmac
 import logging
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 import httpx
 
 from app.config import settings
-from app.core.exceptions import ServiceUnavailableException
 
 logger = logging.getLogger(__name__)
 
 
 class MonnifyService:
-    """Async Monnify payment gateway integration."""
+    """
+    Async Monnify payment gateway integration.
+
+    Blueprint §5 / §16.1:
+    - Primary bank transfer + virtual account provider.
+    - MONNIFY_API_KEY, MONNIFY_SECRET_KEY, MONNIFY_CONTRACT_CODE,
+      MONNIFY_BASE_URL required in .env.
+    """
 
     def __init__(self) -> None:
-        self.api_key:       str = getattr(settings, "MONNIFY_API_KEY", "")
-        self.secret_key:    str = getattr(settings, "MONNIFY_SECRET_KEY", "")
-        self.contract_code: str = getattr(settings, "MONNIFY_CONTRACT_CODE", "")
-        # e.g. https://sandbox.monnify.com/api/v1
-        self._base_v1: str = getattr(settings, "MONNIFY_BASE_URL", "https://sandbox.monnify.com/api/v1")
-        # Strip /api/v1 to get root so we can build /api/v2 paths
+        self.api_key:       str = settings.MONNIFY_API_KEY
+        self.secret_key:    str = settings.MONNIFY_SECRET_KEY
+        self.contract_code: str = settings.MONNIFY_CONTRACT_CODE
+        # Production URL per corrected config: https://api.monnify.com/api/v1
+        self._base_v1: str = settings.MONNIFY_BASE_URL
+        # Strip /api/v1 suffix to get root for /api/v2 paths
         self._root: str = self._base_v1.rstrip("/").rsplit("/api/", 1)[0]
+
+    # ── Webhook Signature Verification — Blueprint §5.5 ─────────────────────
+
+    def verify_webhook_signature(
+        self, raw_body: bytes, signature_header: str
+    ) -> bool:
+        """
+        Blueprint §5.5:
+          "Verify: hmac.compare_digest(computed_sig, header_sig)"
+          Header: X-Monnify-Signature (HMAC-SHA512)
+          Secret: MONNIFY_SECRET_KEY
+
+        Returns True if the signature is valid, False otherwise.
+        The wallet webhook router MUST call this before processing any payload.
+        """
+        if not signature_header:
+            logger.warning("Monnify webhook: missing X-Monnify-Signature header")
+            return False
+
+        computed = hmac.new(
+            self.secret_key.encode("utf-8"),
+            raw_body,
+            hashlib.sha512,
+        ).hexdigest()
+
+        is_valid = hmac.compare_digest(computed, signature_header)
+        if not is_valid:
+            logger.warning(
+                "Monnify webhook: HMAC mismatch. "
+                "computed=%s... header=%s...",
+                computed[:16], signature_header[:16],
+            )
+        return is_valid
+
+    @staticmethod
+    def parse_webhook_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract fields from a Monnify collection webhook payload.
+
+        Blueprint §5.1: Monnify sends amountPaid in Naira (not kobo).
+        Returns a normalised dict for wallet_service.handle_monnify_funding().
+        """
+        source = payload.get("paymentSource") or {}
+        acct   = payload.get("reservedAccountInfo") or {}
+
+        return {
+            "payment_status":   payload.get("paymentStatus", ""),
+            "monnify_reference": payload.get("transactionReference", ""),
+            # Destination virtual account number
+            "virtual_account_number": (
+                payload.get("destinationAccountNumber")
+                or acct.get("accountNumber", "")
+            ),
+            # Amount in Naira (not kobo — no conversion needed)
+            "amount_ngn":  payload.get("amountPaid", 0),
+            "sender_bank": source.get("bankName", ""),
+            "sender_name": source.get("accountName", ""),
+            "currency":    payload.get("currency", "NGN"),
+        }
+
+    @staticmethod
+    def is_successful_payment(payload: Dict[str, Any]) -> bool:
+        """Return True only when Monnify confirms the payment is PAID/settled."""
+        return payload.get("paymentStatus") == "PAID"
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     async def _get_access_token(self) -> str:
         """
-        Obtain a short-lived Bearer token from Monnify via Basic auth.
-        Monnify tokens expire in ~1 hour. In production you should cache this
-        in Redis with a TTL slightly below the expiry. For now we fetch fresh
-        on each call — acceptable for low-volume operations like wallet creation.
+        Obtain a short-lived Bearer token via Basic auth.
+        NOTE: In production, cache this in Redis (TTL ≈ 3500s).
         """
         credentials = base64.b64encode(
             f"{self.api_key}:{self.secret_key}".encode()
@@ -77,10 +141,9 @@ class MonnifyService:
             raise ServiceUnavailableException(
                 detail=f"Monnify auth failed: {data.get('responseMessage', 'Unknown error')}"
             )
-
         return data["responseBody"]["accessToken"]
 
-    # ── Virtual Account ───────────────────────────────────────────────────────
+    # ── Virtual Account Provisioning ──────────────────────────────────────────
 
     async def reserve_virtual_account(
         self,
@@ -91,32 +154,24 @@ class MonnifyService:
     ) -> Dict[str, Any]:
         """
         Reserve a permanent dedicated virtual account for a user.
+        Blueprint §5.1: "Each user gets a unique, permanent Monnify virtual
+        account at registration. Account number never changes."
 
         Args:
-            account_reference: Unique identifier (use user_id as string).
-                               Monnify uses this to prevent duplicate reservations.
-            account_name:      Display name on the account (user's full name).
-            customer_email:    Optional — stored by Monnify for dispute resolution.
-            customer_name:     Optional — stored by Monnify.
+            account_reference: Unique identifier (use str(user_id)).
+                               Monnify deduplicates on this — safe to retry.
+            account_name:      Display name on the account.
 
-        Returns:
-            responseBody dict containing:
-                accountNumber  — the virtual NUBAN account number
-                bankName       — the issuing bank name (e.g. "Wema Bank")
-                accountName    — the account display name
-                accountReference — mirrors what we sent
-
-        Raises:
-            ServiceUnavailableException if Monnify is unreachable or returns an error.
+        Returns responseBody containing accountNumber, bankName, accountName.
         """
         token = await self._get_access_token()
 
         payload: Dict[str, Any] = {
-            "accountReference": account_reference,
-            "accountName":      account_name,
-            "currencyCode":     "NGN",
-            "contractCode":     self.contract_code,
-            "getAllAvailableBanks": True,   # Required by Monnify sandbox — returns all available banks
+            "accountReference":    account_reference,
+            "accountName":         account_name,
+            "currencyCode":        "NGN",
+            "contractCode":        self.contract_code,
+            "getAllAvailableBanks": True,
         }
         if customer_email:
             payload["customerEmail"] = customer_email
@@ -141,51 +196,57 @@ class MonnifyService:
             )
 
         data = response.json()
-
         if not data.get("requestSuccessful"):
             raise ServiceUnavailableException(
                 detail=f"Monnify reserve account failed: {data.get('responseMessage', 'Unknown error')}"
             )
-
         return data["responseBody"]
 
-    async def get_reserved_account(self, account_reference: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch an existing reserved account by reference.
-        Useful for re-syncing account_number/bank_name if the wallet row
-        was created before Monnify provisioning succeeded.
-        """
-        token = await self._get_access_token()
-        url   = f"{self._root}/api/v2/bank-transfer/reserved-accounts/{account_reference}"
-
+    async def get_reserved_account(
+        self, account_reference: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch existing reserved account by reference (re-sync on failure)."""
         try:
+            token = await self._get_access_token()
+            url   = f"{self._root}/api/v2/bank-transfer/reserved-accounts/{account_reference}"
             async with httpx.AsyncClient(timeout=15) as client:
                 response = await client.get(
                     url,
                     headers={"Authorization": f"Bearer {token}"},
                 )
-        except httpx.RequestError:
+            data = response.json()
+            if data.get("requestSuccessful"):
+                return data.get("responseBody")
+            return None
+        except Exception:
             return None
 
-        data = response.json()
-        if not data.get("requestSuccessful"):
-            return None
-        return data.get("responseBody")
-
-    # ── Webhook Parsing ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def parse_webhook_amount(payload: Dict[str, Any]) -> Optional[float]:
+    async def suspend_virtual_account(self, account_reference: str) -> bool:
         """
-        Extract the credited NGN amount from a Monnify collection webhook.
-        Monnify sends `amountPaid` in Naira (not kobo) — no conversion needed.
+        Suspend virtual account on user ban.
+        Blueprint §5.5: "Virtual account suspended on ban, reactivated on unban."
         """
-        return payload.get("amountPaid") or payload.get("paidOn")
+        try:
+            token = await self._get_access_token()
+            url   = f"{self._root}/api/v2/bank-transfer/reserved-accounts/limit/{account_reference}"
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.put(
+                    url,
+                    json={"reservedAccountType": "GENERAL", "restrictPaymentSource": True},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return response.json().get("requestSuccessful", False)
+        except Exception as exc:
+            logger.warning("Monnify suspend failed for ref=%s: %s", account_reference, exc)
+            return False
 
-    @staticmethod
-    def is_successful_payment(payload: Dict[str, Any]) -> bool:
-        """Return True only when Monnify confirms the payment is settled."""
-        return payload.get("paymentStatus") == "PAID"
+
+# ── Exception ─────────────────────────────────────────────────────────────────
+
+class ServiceUnavailableException(Exception):
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
 
 
 # Singleton
