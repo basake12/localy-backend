@@ -18,8 +18,8 @@ FIXES:
   - business.owner_id does not exist on Business model — replaced with business.user_id.
   - cooking booking payment: cooking_service_crud.get(id=service.restaurant_id) was
     using the wrong CRUD class — fixed to restaurant_crud.get(id=service.restaurant_id).
-  - TransactionType.ORDER_PAYMENT / BOOKING_PAYMENT don't exist in TransactionTypeEnum —
-    replaced with TransactionTypeEnum.PAYMENT / CREDIT from wallet_model.
+  - TransactionType.ORDER_PAYMENT / BOOKING_PAYMENT don't exist in TransactionType —
+    replaced with TransactionType.PAYMENT / CREDIT from wallet_model.
   - All notification_service.send() calls wrapped in try/except — non-fatal.
     A Redis/Celery outage must never roll back a completed, paid order.
 """
@@ -28,10 +28,11 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from uuid import UUID
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timezone
 from decimal import Decimal
 import logging
 import secrets
+import uuid as _uuid
 
 from app.crud.food_crud import (
     restaurant_crud,
@@ -48,8 +49,8 @@ from app.models.food_model import FoodOrder, Restaurant
 from app.models.wallet_model import (
     Wallet,
     WalletTransaction,
-    TransactionTypeEnum,
-    TransactionStatusEnum,
+    TransactionType,
+    TransactionStatus,
 )
 from app.core.exceptions import (
     NotFoundException,
@@ -76,14 +77,15 @@ class FoodService:
     def _get_or_create_wallet_sync(db: Session, *, user_id: UUID) -> Wallet:
         """Get wallet by user, creating one if it doesn't exist (sync)."""
         from app.models.wallet_model import generate_wallet_number
-        wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+        wallet = db.query(Wallet).filter(Wallet.owner_id == user_id).first()
         if not wallet:
             wallet = Wallet(
-                user_id=user_id,
+                owner_id=user_id,
+                owner_type="customer",
                 wallet_number=generate_wallet_number(),
                 balance=Decimal("0.00"),
                 currency="NGN",
-                is_active=True,
+                is_suspended=False,
             )
             db.add(wallet)
             db.commit()
@@ -97,9 +99,14 @@ class FoodService:
         wallet_id: UUID,
         amount: Decimal,
         description: str,
-        reference_id: Optional[str] = None,
+        external_reference: Optional[str] = None,    # Blueprint §14: external_reference
+        idempotency_key: Optional[str] = None,       # Blueprint §5.6: idempotency_key
     ) -> WalletTransaction:
-        """Debit a wallet synchronously. Raises InsufficientBalanceException if low."""
+        """Debit a wallet synchronously. Raises InsufficientBalanceException if low.
+        Blueprint §14: external_reference (not reference_id).
+        Blueprint §5.6: idempotency_key NOT NULL.
+        Blueprint §16.4: datetime.now(timezone.utc).
+        """
         wallet = db.query(Wallet).filter(Wallet.id == wallet_id).first()
         if not wallet:
             raise NotFoundException("Wallet")
@@ -111,14 +118,15 @@ class FoodService:
 
         txn = WalletTransaction(
             wallet_id=wallet_id,
-            transaction_type=TransactionTypeEnum.PAYMENT,
+            transaction_type=TransactionType.PAYMENT,
             amount=amount,
             balance_before=balance_before,
             balance_after=wallet.balance,
-            status=TransactionStatusEnum.COMPLETED,
+            status=TransactionStatus.COMPLETED,
             description=description,
-            reference_id=reference_id or f"FOOD_{secrets.token_hex(6).upper()}",
-            completed_at=datetime.utcnow(),
+            external_reference=external_reference or f"FOOD_{secrets.token_hex(6).upper()}",
+            idempotency_key=idempotency_key or f"FOOD_{_uuid.uuid4().hex.upper()}",
+            completed_at=datetime.now(timezone.utc),
         )
         db.add(txn)
         return txn  # caller commits
@@ -130,9 +138,14 @@ class FoodService:
         wallet_id: UUID,
         amount: Decimal,
         description: str,
-        reference_id: Optional[str] = None,
+        external_reference: Optional[str] = None,    # Blueprint §14
+        idempotency_key: Optional[str] = None,       # Blueprint §5.6
     ) -> WalletTransaction:
-        """Credit a wallet synchronously."""
+        """Credit a wallet synchronously.
+        Blueprint §14: external_reference (not reference_id).
+        Blueprint §5.6: idempotency_key NOT NULL.
+        Blueprint §16.4: datetime.now(timezone.utc).
+        """
         wallet = db.query(Wallet).filter(Wallet.id == wallet_id).first()
         if not wallet:
             raise NotFoundException("Wallet")
@@ -142,14 +155,15 @@ class FoodService:
 
         txn = WalletTransaction(
             wallet_id=wallet_id,
-            transaction_type=TransactionTypeEnum.CREDIT,
+            transaction_type=TransactionType.CREDIT,
             amount=amount,
             balance_before=balance_before,
             balance_after=wallet.balance,
-            status=TransactionStatusEnum.COMPLETED,
+            status=TransactionStatus.COMPLETED,
             description=description,
-            reference_id=reference_id or f"FOOD_CR_{secrets.token_hex(6).upper()}",
-            completed_at=datetime.utcnow(),
+            external_reference=external_reference or f"FOOD_CR_{secrets.token_hex(6).upper()}",
+            idempotency_key=idempotency_key or f"FOOD_CR_{_uuid.uuid4().hex.upper()}",
+            completed_at=datetime.now(timezone.utc),
         )
         db.add(txn)
         return txn  # caller commits
@@ -352,7 +366,8 @@ class FoodService:
                 wallet_id=customer_wallet.id,
                 amount=order.total_amount,
                 description=f"Food order #{str(order.id)[:8].upper()}",
-                reference_id=str(order.id),
+                external_reference=f"FOOD_DEBIT_{order.id}",
+                idempotency_key=f"FOOD_D_{_uuid.uuid4().hex.upper()}",
             )
 
             # BLUEPRINT v2.0: Credit business wallet (total - platform fee)
@@ -365,7 +380,12 @@ class FoodService:
                 business_wallet = self._get_or_create_wallet_sync(
                     db, user_id=business.user_id
                 )
-                amount_to_credit = order.total_amount - order.platform_fee
+                # Blueprint §5.4: ₦50 from EACH side.
+                # Customer paid ₦50 (in total_amount). Business also pays ₦50.
+                # Platform earns ₦100 per food order.
+                from app.core.constants import PLATFORM_FEE_STANDARD
+                business_fee = PLATFORM_FEE_STANDARD  # ₦50
+                amount_to_credit = order.total_amount - order.platform_fee - business_fee
                 self._credit_wallet_sync(
                     db,
                     wallet_id=business_wallet.id,
@@ -374,7 +394,8 @@ class FoodService:
                         f"Food order #{str(order.id)[:8].upper()} "
                         f"(after ₦{float(order.platform_fee)} platform fee)"
                     ),
-                    reference_id=f"BIZ_{order.id}",
+                    external_reference=f"FOOD_BIZ_{order.id}",
+                idempotency_key=f"FOOD_BIZ_D_{_uuid.uuid4().hex.upper()}",
                 )
 
             order.payment_status = "paid"
@@ -559,7 +580,8 @@ class FoodService:
                 wallet_id=customer_wallet.id,
                 amount=deposit_amount,
                 description=f"Reservation deposit - {restaurant_id}",
-                reference_id=str(reservation.id),
+                external_reference=f"FOOD_RES_{reservation.id}",
+                idempotency_key=f"FOOD_R_{_uuid.uuid4().hex.upper()}",
             )
             reservation.deposit_paid = True
             db.commit()
@@ -653,7 +675,8 @@ class FoodService:
             wallet_id=customer_wallet.id,
             amount=booking.total_price,
             description=f"Cooking service booking #{str(booking.id)[:8].upper()}",
-            reference_id=str(booking.id),
+            external_reference=f"FOOD_COOK_{booking.id}",   # Blueprint §14
+            idempotency_key=f"FOOD_COOK_D_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6  # Blueprint §5.6
         )
 
         # Credit business (total - platform fee)
@@ -668,7 +691,10 @@ class FoodService:
                 business_wallet = self._get_or_create_wallet_sync(
                     db, user_id=business.user_id
                 )
-                amount_to_credit = booking.total_price - booking.platform_fee
+                # Blueprint §5.4: Service bookings = ₦100 per side.
+                from app.core.constants import PLATFORM_FEE_BOOKING
+                biz_cook_fee = PLATFORM_FEE_BOOKING  # ₦100
+                amount_to_credit = booking.total_price - booking.platform_fee - biz_cook_fee
                 self._credit_wallet_sync(
                     db,
                     wallet_id=business_wallet.id,
@@ -677,7 +703,8 @@ class FoodService:
                         f"Cooking booking #{str(booking.id)[:8].upper()} "
                         f"(after ₦{float(booking.platform_fee)} platform fee)"
                     ),
-                    reference_id=f"BIZ_{booking.id}",
+                    external_reference=f"FOOD_COOK_BIZ_{booking.id}",
+                idempotency_key=f"FOOD_CK_D_{_uuid.uuid4().hex.upper()}",
                 )
 
         booking.payment_status = "paid"
@@ -718,7 +745,7 @@ class FoodService:
                     and_(
                         Coupon.code == promo_code.upper(),
                         Coupon.is_active == True,
-                        Coupon.expires_at >= datetime.utcnow(),
+                        Coupon.expires_at >= datetime.now(timezone.utc),
                     )
                 )
                 .first()
@@ -758,7 +785,7 @@ class FoodService:
             "business_id":                   str(restaurant.business_id),
             "name":                          business.business_name,
             "description":                   business.description,
-            "address":                       business.address,
+            "address":                       business.registered_address,
             "phone":                         getattr(business, "business_phone", None),
             "cover_image_url":               getattr(business, "logo", None),
             "is_verified":                   business.is_verified,

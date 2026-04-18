@@ -2,7 +2,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import random
 import string
@@ -286,7 +286,7 @@ class CRUDDelivery(CRUDBase[Delivery, dict, dict]):
 
         delivery.rider_id = rider_id
         delivery.status = DeliveryStatusEnum.ASSIGNED
-        delivery.assigned_at = datetime.utcnow()
+        delivery.assigned_at = datetime.now(timezone.utc)
 
         # rider stays online — they're now on a job
 
@@ -320,9 +320,9 @@ class CRUDDelivery(CRUDBase[Delivery, dict, dict]):
         delivery.status = new_status
 
         if new_status == DeliveryStatusEnum.PICKED_UP:
-            delivery.picked_up_at = datetime.utcnow()
+            delivery.picked_up_at = datetime.now(timezone.utc)
         elif new_status == DeliveryStatusEnum.DELIVERED:
-            delivery.delivered_at = datetime.utcnow()
+            delivery.delivered_at = datetime.now(timezone.utc)
             if delivery.rider_id:
                 # FIX: use db.get() — deprecated .get() removed
                 rider = db.get(Rider, delivery.rider_id)
@@ -431,7 +431,7 @@ class CRUDDelivery(CRUDBase[Delivery, dict, dict]):
 
         delivery.rider_id = rider_id
         delivery.status = DeliveryStatusEnum.ASSIGNED
-        delivery.assigned_at = datetime.utcnow()
+        delivery.assigned_at = datetime.now(timezone.utc)
 
         tracking = DeliveryTracking(
             delivery_id=job_id,
@@ -478,11 +478,11 @@ class CRUDDelivery(CRUDBase[Delivery, dict, dict]):
         delivery.status = status_map.get(new_status, new_status)
 
         if new_status == "picked_up":
-            delivery.picked_up_at = datetime.utcnow()
+            delivery.picked_up_at = datetime.now(timezone.utc)
         elif new_status == "delivered":
-            delivery.delivered_at = datetime.utcnow()
+            delivery.delivered_at = datetime.now(timezone.utc)
         elif new_status == "cancelled":
-            delivery.cancelled_at = datetime.utcnow()
+            delivery.cancelled_at = datetime.now(timezone.utc)
             delivery.cancelled_by = "rider"
 
         tracking = DeliveryTracking(

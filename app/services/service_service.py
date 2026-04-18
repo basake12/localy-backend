@@ -1,5 +1,6 @@
 # app/services/service_service.py
 
+import uuid as _uuid
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect as sa_inspect
@@ -20,8 +21,7 @@ from app.crud.services_crud import (
 from app.models.wallet_model import (
     Wallet,
     WalletTransaction,
-    TransactionTypeEnum,
-    TransactionStatusEnum,
+    TransactionStatus,   # Blueprint §14: correct name
     generate_wallet_number,
 )
 from app.core.exceptions import (
@@ -35,7 +35,7 @@ from app.core.constants import (
     PLATFORM_FEE_BOOKING,  # ₦100 for service bookings (Blueprint Section 4.4)
 )
 from app.models.user_model import User
-from app.models.services_model import ServiceBooking, BookingStatusEnum
+from app.models.services_model import ServiceBooking, BookingStatusEnum, PaymentStatusEnum
 
 
 
@@ -97,14 +97,15 @@ def _orm_to_dict(obj) -> "Optional[Dict[str, Any]]":
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _get_or_create_wallet_sync(db: Session, *, user_id: UUID) -> Wallet:
-    wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+    wallet = db.query(Wallet).filter(Wallet.owner_id == user_id).first()  # Blueprint §14
     if not wallet:
         wallet = Wallet(
-            user_id=user_id,
+            owner_id=user_id,          # Blueprint §14: owner_id
+            owner_type="customer",     # Blueprint §14: owner_type
             wallet_number=generate_wallet_number(),
             balance=Decimal("0.00"),
             currency="NGN",
-            is_active=True,
+            is_suspended=False,        # Blueprint §14: is_suspended
         )
         db.add(wallet)
         db.flush()
@@ -116,9 +117,10 @@ def _debit_wallet_sync(
     *,
     wallet: Wallet,
     amount: Decimal,
-    transaction_type: TransactionTypeEnum,
+    transaction_type,               # TransactionType from constants (Blueprint §14)
     description: str,
-    reference_id: str,
+    external_reference: str,        # Blueprint §14: external_reference (not reference_id)
+    idempotency_key: str = "",      # Blueprint §5.6 HARD RULE
 ) -> WalletTransaction:
     if wallet.balance < amount:
         raise InsufficientBalanceException()
@@ -130,9 +132,10 @@ def _debit_wallet_sync(
         amount=amount,
         balance_before=balance_before,
         balance_after=wallet.balance,
-        status=TransactionStatusEnum.COMPLETED,
+        status=TransactionStatus.COMPLETED,     # Blueprint §14: TransactionStatus
         description=description,
-        reference_id=reference_id,
+        external_reference=external_reference,  # Blueprint §14
+        idempotency_key=idempotency_key or f"SVC_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         completed_at=datetime.now(timezone.utc),
     )
     db.add(txn)
@@ -144,9 +147,10 @@ def _credit_wallet_sync(
     *,
     wallet: Wallet,
     amount: Decimal,
-    transaction_type: TransactionTypeEnum,
+    transaction_type,               # TransactionType from constants (Blueprint §14)
     description: str,
-    reference_id: str,
+    external_reference: str,        # Blueprint §14: external_reference
+    idempotency_key: str = "",      # Blueprint §5.6 HARD RULE
 ) -> WalletTransaction:
     balance_before = wallet.balance
     wallet.balance += amount
@@ -156,9 +160,10 @@ def _credit_wallet_sync(
         amount=amount,
         balance_before=balance_before,
         balance_after=wallet.balance,
-        status=TransactionStatusEnum.COMPLETED,
+        status=TransactionStatus.COMPLETED,     # Blueprint §14: TransactionStatus
         description=description,
-        reference_id=reference_id,
+        external_reference=external_reference,  # Blueprint §14
+        idempotency_key=idempotency_key or f"SVC_CR_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         completed_at=datetime.now(timezone.utc),
     )
     db.add(txn)
@@ -277,13 +282,19 @@ def calculate_booking_price(
     travel_fee = (
         provider.travel_fee if service_location_type == "in_home" else Decimal("0.00")
     )
-    total_price = service.base_price + add_ons_price + travel_fee
+    # Blueprint §5.4: ₦100 from EACH side (customer + business).
+    # Customer's ₦100 is added to total_price so it is included in their debit.
+    # Business's ₦100 is deducted from business_credit in book_and_pay().
+    # Platform earns: ₦100 + ₦100 = ₦200 per service booking.
+    customer_platform_fee = PLATFORM_FEE_BOOKING   # ₦100
+    total_price = service.base_price + add_ons_price + travel_fee + customer_platform_fee
 
     return {
-        "base_price":    service.base_price,
-        "add_ons_price": add_ons_price,
-        "travel_fee":    travel_fee,
-        "total_price":   total_price,
+        "base_price":           service.base_price,
+        "add_ons_price":        add_ons_price,
+        "travel_fee":           travel_fee,
+        "customer_platform_fee": customer_platform_fee,
+        "total_price":          total_price,   # includes customer's ₦100 fee
     }
 
 
@@ -372,15 +383,19 @@ def book_and_pay(
             amount=booking.total_price,
             transaction_type=TransactionType.PAYMENT,
             description=f"Service booking – {service.name}",
-            reference_id=f"svc_debit_{booking.id}",
+            external_reference=f"SVC_DEBIT_{booking.id}",   # Blueprint §14
+            idempotency_key=f"SVC_D_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         )
 
         # 2. Credit business wallet minus ₦100 platform fee (Blueprint 4.4)
-        platform_fee = PLATFORM_FEE_BOOKING          # ₦100
-        business_earnings = booking.total_price - platform_fee
+        # Blueprint §5.4: ₦100 from EACH side (two-sided fee).
+        # total_price already includes customer's ₦100 (added in calculate_booking_price).
+        # business_earnings = total_price - customer_fee - business_fee = total_price - ₦200
+        customer_fee     = PLATFORM_FEE_BOOKING   # ₦100 (customer side — in total_price)
+        business_fee     = PLATFORM_FEE_BOOKING   # ₦100 (business side — deducted separately)
+        business_earnings = booking.total_price - customer_fee - business_fee
 
         from app.crud.business_crud import business_crud as biz_crud
-        # FIX: use get_sync() -- biz_crud.get() is async
         business = biz_crud.get_sync(db, id=provider.business_id)
         if business and business.user_id:
             biz_wallet = _get_or_create_wallet_sync(
@@ -392,10 +407,11 @@ def book_and_pay(
                 amount=business_earnings,
                 transaction_type=TransactionType.CREDIT,
                 description=f"Service booking – {service.name}",
-            reference_id=f"svc_credit_{booking.id}",
+                external_reference=f"SVC_BIZ_{booking.id}",   # Blueprint §14
+                idempotency_key=f"SVC_BIZ_D_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
             )
 
-        booking.payment_status = "PAID"
+        booking.payment_status = PaymentStatusEnum.PAID.value   # Blueprint §14: lowercase "paid"
         booking.status = BookingStatusEnum.CONFIRMED
         # FIX: Store wallet transaction ID, not booking's own ID.
         booking.payment_reference = str(customer_txn.id)
@@ -473,7 +489,7 @@ def cancel_booking(
     booking.cancellation_reason = reason
 
     # Instant wallet refund on cancellation (Blueprint Section 4.1.2)
-    if booking.payment_status == "PAID":
+    if booking.payment_status == PaymentStatusEnum.PAID.value:  # Blueprint §14: lowercase
         # FIX: Use sync helpers — wallet_crud methods are all async.
         customer_wallet = _get_or_create_wallet_sync(
             db, user_id=booking.customer_id
@@ -484,24 +500,25 @@ def cancel_booking(
             amount=booking.total_price,
             transaction_type=TransactionType.REFUND,
             description="Refund for cancelled service booking",
-            reference_id=f"refund_{booking.id}",
+            external_reference=f"SVC_REFUND_{booking.id}",   # Blueprint §14
+            idempotency_key=f"SVC_REF_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         )
-        booking.payment_status = "REFUNDED"
+        booking.payment_status = PaymentStatusEnum.REFUNDED.value  # Blueprint §14: lowercase
 
         # Reverse business wallet credit (deduct earnings that were already credited)
-        platform_fee = PLATFORM_FEE_BOOKING
-        business_earnings = booking.total_price - platform_fee
+        # Blueprint §5.4: reverse business earnings (total_price - ₦100 customer - ₦100 business)
+        customer_fee     = PLATFORM_FEE_BOOKING
+        business_fee     = PLATFORM_FEE_BOOKING
+        business_earnings = booking.total_price - customer_fee - business_fee
 
         from app.crud.business_crud import business_crud as biz_crud
         provider = service_provider_crud.get(db, id=booking.provider_id)
         if provider:
-            # FIX: use get_sync() -- biz_crud.get() is async
             business = biz_crud.get_sync(db, id=provider.business_id)
             if business and business.user_id:
                 biz_wallet = _get_or_create_wallet_sync(
                     db, user_id=business.user_id
                 )
-                # Only reverse if business wallet has sufficient balance
                 if biz_wallet.balance >= business_earnings:
                     _debit_wallet_sync(
                         db,
@@ -509,7 +526,8 @@ def cancel_booking(
                         amount=business_earnings,
                         transaction_type=TransactionType.REFUND,
                         description="Reversal for cancelled booking",
-                        reference_id=f"biz_refund_{booking.id}",
+                        external_reference=f"SVC_BIZ_REFUND_{booking.id}",  # Blueprint §14
+                        idempotency_key=f"SVC_BREF_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
                     )
 
     db.commit()

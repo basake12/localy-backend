@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
@@ -19,9 +19,9 @@ from app.dependencies import (
     get_current_active_user,
     require_customer,
     require_rider,
-    require_admin,
     get_pagination_params,
 )
+from app.admin_dependencies import require_admin
 from app.schemas.common_schema import SuccessResponse
 from app.schemas.delivery_schema import (
     DeliveryCreateRequest,
@@ -231,7 +231,7 @@ def cancel_delivery(
         raise ValidationException("Cannot cancel a delivered or already-cancelled delivery")
 
     delivery.status = "cancelled"
-    delivery.cancelled_at = datetime.utcnow()
+    delivery.cancelled_at = datetime.now(timezone.utc)
     delivery.cancellation_reason = reason
     delivery.cancelled_by = "customer"
 
@@ -264,10 +264,10 @@ def get_delivery_details(
     if not delivery:
         raise NotFoundException("Delivery")
 
-    if current_user.user_type == "customer":
+    if current_user.role.value == "customer":
         if delivery.customer_id != current_user.id:
             raise PermissionDeniedException()
-    elif current_user.user_type == "rider":
+    elif current_user.role.value == "rider":
         rider = db.query(Rider).filter(Rider.user_id == current_user.id).first()
         if not rider or delivery.rider_id != rider.id:
             raise PermissionDeniedException()

@@ -4,8 +4,6 @@ from uuid import UUID
 from datetime import datetime
 from decimal import Decimal
 
-from app.models.rider_model import DriverSubscriptionPlan
-
 
 class RiderBase(BaseModel):
     first_name: str = Field(..., min_length=2, max_length=100)
@@ -40,9 +38,8 @@ class RiderOut(RiderBase):
     user_id: UUID
     phone: Optional[str] = None
     profile_picture: Optional[str] = None
-    subscription_plan: DriverSubscriptionPlan
-    is_pro: bool
-    pro_subscription_end: Optional[datetime] = None
+    # DriverSubscriptionPlan removed — riders have no subscription (Blueprint §5.3)
+    # subscription_plan, is_pro, pro_subscription_end removed from model
     service_radius_km: Decimal
     average_rating: Decimal
     total_deliveries: int

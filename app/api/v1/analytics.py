@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.core.database import get_db
-from app.dependencies import require_admin
+from app.core.admin_deps import require_admin
 from app.models.user_model import User
 from app.schemas.common_schema import SuccessResponse
 from app.services.analytics_service import analytics_service
@@ -28,7 +28,7 @@ def get_revenue_analytics(
         user: User = Depends(require_admin),
 ):
     """Get revenue analytics for last N days (admin only)."""
-    end_date = datetime.utcnow()
+    end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days)
 
     stats = analytics_service.get_revenue_stats(

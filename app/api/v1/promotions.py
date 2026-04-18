@@ -54,9 +54,9 @@ async def get_active_promotions(
     user: User         = Depends(get_async_current_active_user),
 ):
     promotions = await promotions_service.get_active_promotions(db)
-    # Filter to public only for non-admin users
-    if user.user_type != "admin":
-        promotions = [p for p in promotions if p.is_public]
+    # Mobile endpoint — admin never reaches here (Blueprint §2.2 HARD RULE).
+    # Always filter to public-only promotions.
+    promotions = [p for p in promotions if p.is_public]
 
     return {
         "success": True,

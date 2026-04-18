@@ -2,7 +2,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_, func
 from uuid import UUID
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timezone
 from decimal import Decimal
 import secrets
 import string
@@ -515,11 +515,11 @@ class CRUDFoodOrder(CRUDBase[FoodOrder, dict, dict]):
 
         # Update timestamps
         if new_status == OrderStatusEnum.CONFIRMED:
-            order.confirmed_at = datetime.utcnow()
+            order.confirmed_at = datetime.now(timezone.utc)
         elif new_status == OrderStatusEnum.PREPARING:
-            order.prepared_at = datetime.utcnow()
+            order.prepared_at = datetime.now(timezone.utc)
         elif new_status == OrderStatusEnum.DELIVERED:
-            order.delivered_at = datetime.utcnow()
+            order.delivered_at = datetime.now(timezone.utc)
 
             # Update restaurant stats
             restaurant = restaurant_crud.get(db, id=order.restaurant_id)
@@ -556,7 +556,7 @@ class CRUDFoodOrder(CRUDBase[FoodOrder, dict, dict]):
 
         order.order_status = OrderStatusEnum.CANCELLED
         order.cancellation_reason = reason
-        order.cancelled_at = datetime.utcnow()
+        order.cancelled_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(order)
         return order

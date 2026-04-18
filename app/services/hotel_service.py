@@ -3,29 +3,46 @@ app/services/hotel_service.py
 
 Hotel booking orchestration service with payment processing.
 
-Per Blueprint Section 11.1 - Hotels Module:
+Per Blueprint Section 6.1 — Hotels Module:
 - Real-time availability checking
 - Instant booking with ₦100 platform fee
 - Wallet payment with atomic transactions
 - Instant refunds on cancellation
 - Transaction atomicity via transaction_service
 
-FIX (v2):
-  search_hotels() previously built each result as:
-    { "hotel": <ORM Hotel>, "business": <ORM Business>,
-      "available_room_types": [], "room_types": <ORM list> }
+BUG FIXES IN THIS VERSION:
+────────────────────────────
+BUG-01 FIX (hotel_service.py — AttributeError on AddOnItem.items()):
+  In create_booking_and_pay(), the sanitized_add_ons list comprehension called
+  item.items() on each element of the add_ons argument.  The router passes
+  List[AddOnItem] — Pydantic v2 models — which do NOT have an .items() method.
+  This raised AttributeError on every booking that included an add-on.
 
-  This caused three bugs in every list/search response:
-    1. `business` duplicated — nested inside `hotel` (eager-loaded) AND at top level.
-    2. `room_types` duplicated the same way.
-    3. `available_room_types` / `room_types` key inconsistency depending on
-       whether date params were supplied.
-    4. Raw ORM objects passed to jsonable_encoder caused PydanticSerializationError
-       on PostGIS WKBElement fields and lazy-loaded relationships.
+  Root cause traced: the BookingCreateRequest schema defines
+      add_ons: List[AddOnItem]
+  The router passes booking_in.add_ons directly to the service without
+  converting to dicts.  The CRUD (hotels_crud.py) already handles this
+  correctly with:
+      item if isinstance(item, dict) else item.model_dump()
+  The service sanitization step needed the same treatment.
 
-  Fix: return a flat plain-dict per hotel every time. No ORM objects.
-  Single key `room_types` always present (availability-filtered when dates
-  supplied, full list otherwise). `business` is a single flat nested dict.
+  Fix: Convert each AddOnItem to a dict via model_dump() before iterating
+  with .items().  The conversion also handles any Decimal price values so
+  the JSONB INSERT does not raise TypeError.
+
+BUG-03 FIX (hotel_service.py — 'local_government' LGA field in _business_to_dict):
+  Blueprint Section 2.2 HARD RULE: "Location is radius-based exclusively.
+  There is no local government area (LGA) filtering anywhere in the codebase.
+  No LGA column exists in any database table.  Remove immediately if discovered
+  in legacy code."
+  _business_to_dict() included "local_government": getattr(biz, ...) in the
+  projected dict.  This surfaces LGA data in every hotel search result and
+  every hotel detail response that calls this helper.  Removed.
+
+Original FIX note (v2):
+  search_hotels() previously returned raw ORM objects with duplicated keys
+  and PydanticSerializationError on PostGIS WKBElement fields.
+  Now returns flat plain dicts.  No ORM objects in any response shape.
 """
 import logging
 from typing import List, Dict, Any, Optional, Tuple
@@ -55,7 +72,7 @@ class HotelService:
 
     All payment operations use transaction_service to ensure:
     - Atomic transactions (all-or-nothing)
-    - Platform fee deduction (₦100 for hotel bookings)
+    - Platform fee deduction (₦100 for hotel bookings per Blueprint §5.4)
     - Wallet balance management
     - Revenue tracking
     """
@@ -64,7 +81,15 @@ class HotelService:
 
     @staticmethod
     def _business_to_dict(biz) -> Optional[Dict[str, Any]]:
-        """Project a Business ORM object to a plain serialisable dict."""
+        """
+        Project a Business ORM object to a plain serialisable dict.
+
+        BUG-03 FIX: 'local_government' has been removed.
+        Blueprint Section 2.2 HARD RULE: no LGA column exists anywhere in the
+        codebase.  The original helper included:
+            "local_government": getattr(biz, "local_government", None)
+        which surfaced LGA data in every search result.  Removed.
+        """
         if biz is None:
             return None
         return {
@@ -73,9 +98,9 @@ class HotelService:
             "category": biz.category,
             "subcategory": getattr(biz, "subcategory", None),
             "description": getattr(biz, "description", None),
-            "address": biz.address,
+            "address": biz.registered_address,
             "city": getattr(biz, "city", None),
-            "local_government": getattr(biz, "local_government", None),
+            # BUG-03 FIX: "local_government" field removed — LGA HARD RULE.
             "state": getattr(biz, "state", None),
             "latitude": getattr(biz, "latitude", None),
             "longitude": getattr(biz, "longitude", None),
@@ -124,7 +149,7 @@ class HotelService:
         Project a Hotel ORM object + pre-built sub-dicts to a flat plain dict.
 
         No nested ORM objects — safe for jsonable_encoder and Flutter parsing.
-        Single `room_types` key always present (never `available_room_types`).
+        Single 'room_types' key always present (never 'available_room_types').
         """
         return {
             "id": hotel.id,
@@ -165,7 +190,7 @@ class HotelService:
 
         Always returns a list of flat plain dicts — no ORM objects, no
         duplicated keys, consistent shape regardless of whether date params
-        are supplied.
+        are supplied.  Single 'room_types' key always present.
         """
         radius_meters = int(radius_km * 1000)
 
@@ -183,11 +208,8 @@ class HotelService:
 
         results: List[Dict[str, Any]] = []
         for hotel in hotels:
-            # ── Room types ─────────────────────────────────────────────────
-            # With dates → run availability query (crud already returns dicts
-            # with an `available_rooms` count).
-            # Without dates → project eagerly-loaded ORM list to plain dicts.
             if check_in and check_out:
+                # Availability-filtered room types (already plain dicts from CRUD).
                 room_types: List[Dict[str, Any]] = (
                     await room_type_crud.get_available_room_types(
                         db,
@@ -199,6 +221,7 @@ class HotelService:
                     )
                 )
             else:
+                # Project eagerly-loaded ORM list to plain dicts.
                 room_types = [
                     self._room_type_to_dict(rt)
                     for rt in (hotel.room_types or [])
@@ -225,13 +248,24 @@ class HotelService:
         check_out: date,
         number_of_rooms: int,
         number_of_guests: int,
-        add_ons: List[dict],
+        add_ons: List[Any],
         special_requests: Optional[str] = None,
     ) -> Tuple[HotelBooking, WalletTransaction, WalletTransaction, PlatformRevenue]:
         """
         Create booking and process payment atomically.
 
         Returns: (booking, customer_txn, business_txn, revenue)
+
+        BUG-01 FIX (add_ons AttributeError):
+          The add_ons list may contain either Pydantic AddOnItem instances (from
+          the router) or plain dicts (from internal callers / tests).  The
+          previous implementation called item.items() unconditionally, raising
+          AttributeError on Pydantic model instances (Pydantic v2 models have
+          no .items() method).
+
+          Fix: normalise each item to a plain dict first via model_dump() if it
+          is not already a dict, then handle Decimal→float conversion.  This is
+          the same defensive pattern already used in hotels_crud.create_booking().
         """
         hotel = await hotel_crud.get(db, id=hotel_id)
         if not hotel:
@@ -242,11 +276,22 @@ class HotelService:
             raise NotFoundException("Hotel business owner")
 
         try:
-            # Sanitize add_ons: SQLAlchemy serialises JSONB with stdlib json,
-            # which cannot handle Decimal. Convert every Decimal value to float
-            # before the list reaches the INSERT statement.
+            # BUG-01 FIX: Normalise add_ons items to plain dicts before
+            # iterating with .items().
+            #
+            # Before (broken): item.items() — raises AttributeError when item is
+            # an AddOnItem Pydantic model (the type coming from the router).
+            #
+            # After (correct): convert to dict first, then convert Decimal values
+            # to float so stdlib json (used by SQLAlchemy for JSONB) can serialise
+            # them without TypeError.
             sanitized_add_ons = [
-                {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
+                {
+                    k: float(v) if isinstance(v, Decimal) else v
+                    for k, v in (
+                        item if isinstance(item, dict) else item.model_dump()
+                    ).items()
+                }
                 for item in (add_ons or [])
             ]
 
@@ -291,7 +336,9 @@ class HotelService:
             await db.refresh(booking)
 
             logger.info(
-                f"Booking created: {booking.id}, Amount: ₦{booking.total_price}, Fee: ₦100"
+                "Booking created: %s | Amount: ₦%s | Platform fee: ₦100",
+                booking.id,
+                booking.total_price,
             )
 
             return booking, customer_txn, business_txn, revenue
@@ -301,7 +348,7 @@ class HotelService:
             raise
         except Exception as e:
             await db.rollback()
-            logger.error(f"Booking failed: {str(e)}")
+            logger.error("Booking failed for hotel %s: %s", hotel_id, e)
             raise ValidationException(f"Booking failed: {str(e)}")
 
     async def cancel_booking_and_refund(
@@ -325,10 +372,10 @@ class HotelService:
             raise ValidationException("You can only cancel your own bookings")
 
         if booking.status in [BookingStatusEnum.CHECKED_IN, BookingStatusEnum.CHECKED_OUT]:
-            raise ValidationException("Cannot cancel checked-in or completed booking")
+            raise ValidationException("Cannot cancel a booking that is checked-in or already completed")
 
         if booking.status == BookingStatusEnum.CANCELLED:
-            raise ValidationException("Booking already cancelled")
+            raise ValidationException("Booking is already cancelled")
 
         hotel = await hotel_crud.get(db, id=booking.hotel_id)
         if not hotel:
@@ -364,13 +411,17 @@ class HotelService:
             await db.commit()
             await db.refresh(booking)
 
-            logger.info(f"Booking cancelled: {booking_id}, Refund: ₦{booking.total_price}")
+            logger.info(
+                "Booking cancelled: %s | Refund: ₦%s",
+                booking_id,
+                booking.total_price,
+            )
 
             return booking, customer_refund, business_debit, reversed_revenue
 
         except Exception as e:
             await db.rollback()
-            logger.error(f"Cancellation failed: {str(e)}")
+            logger.error("Cancellation failed for booking %s: %s", booking_id, e)
             raise ValidationException(f"Cancellation failed: {str(e)}")
 
 

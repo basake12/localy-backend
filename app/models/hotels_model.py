@@ -6,6 +6,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import enum
 
+from decimal import Decimal
 from datetime import time as dt_time
 from app.models.base_model import BaseModel
 
@@ -23,9 +24,10 @@ class RoomStatusEnum(str, enum.Enum):
 
 
 class BookingStatusEnum(str, enum.Enum):
-    # FIX: Values changed from UPPERCASE to lowercase to match every other module.
-    # All other models (services, tickets, products, food) use lowercase enum values.
-    # Uppercase values made cross-module status comparisons and admin analytics impossible.
+    # FIX (original): Values changed from UPPERCASE to lowercase to match every
+    # other module.  All other models (services, tickets, products, food) use
+    # lowercase enum values.  Uppercase values made cross-module status
+    # comparisons and admin analytics impossible.
     # MIGRATION REQUIRED — run spatial_and_enum_migration.sql before deploying.
     PENDING = "pending"
     CONFIRMED = "confirmed"
@@ -36,7 +38,7 @@ class BookingStatusEnum(str, enum.Enum):
 
 
 class PaymentStatusEnum(str, enum.Enum):
-    # FIX: Same lowercase fix as BookingStatusEnum above.
+    # FIX (original): Same lowercase fix as BookingStatusEnum above.
     PENDING = "pending"
     PAID = "paid"
     COD_PENDING = "cod_pending"
@@ -167,9 +169,9 @@ class Room(BaseModel):
         nullable=False,
         index=True
     )
-    # FIX: store hotel_id directly so room number uniqueness can be enforced
-    # at hotel scope, not just room_type scope (room "101" should be unique
-    # across the whole hotel, not just within a room type).
+    # hotel_id stored directly so room number uniqueness is enforced at hotel
+    # scope rather than room_type scope — "101" must be unique across the whole
+    # hotel, not just within a room type.
     hotel_id = Column(
         UUID(as_uuid=True),
         ForeignKey("hotels.id", ondelete="CASCADE"),
@@ -188,10 +190,12 @@ class Room(BaseModel):
     last_cleaned = Column(DateTime(timezone=True), nullable=True)
     notes = Column(Text, nullable=True)
 
+    # Relationships
     room_type = relationship("RoomType", back_populates="rooms")
 
     __table_args__ = (
-        # FIX: scope uniqueness to hotel, not room_type
+        # Uniqueness scoped to hotel, not room_type — a room number identifies a
+        # physical room in a building, not a category.
         UniqueConstraint('hotel_id', 'room_number', name='unique_room_number_per_hotel'),
     )
 
@@ -233,7 +237,9 @@ class HotelBooking(BaseModel):
     number_of_guests = Column(Integer, nullable=False)
 
     base_price = Column(Numeric(10, 2), nullable=False)
-    add_ons_price = Column(Numeric(10, 2), default=0.00)
+    # FIX: Use Decimal("0.00") as the Python-side default so the column default
+    # is always a Decimal — not a float — matching the NUMERIC(10,2) column type.
+    add_ons_price = Column(Numeric(10, 2), default=Decimal("0.00"))
     total_price = Column(Numeric(10, 2), nullable=False)
 
     # Add-ons as JSONB e.g. [{'type': 'breakfast', 'quantity': 2, 'price': 5000}]
@@ -268,7 +274,7 @@ class HotelBooking(BaseModel):
     room_type = relationship("RoomType", back_populates="bookings")
     customer = relationship("User", foreign_keys=[customer_id])
     services = relationship(
-        "HotelService",
+        "HotelInStayRequest",
         back_populates="booking",
         cascade="all, delete-orphan"
     )
@@ -285,13 +291,28 @@ class HotelBooking(BaseModel):
 
 
 # ============================================
-# HOTEL SERVICE MODEL
+# IN-STAY SERVICE REQUEST MODEL
 # ============================================
 
-class HotelService(BaseModel):
-    """In-stay service requests"""
+# BUG-13 FIX: Renamed from HotelService → HotelInStayRequest.
+#
+# Root cause: the original name "HotelService" directly collided with the
+# HotelService orchestration class in hotel_service.py.  The router worked
+# around this with `from app.models.hotels_model import HotelService as
+# HotelServiceModel`, but that alias is a symptom of the naming conflict, not
+# a fix.  Renaming the model to HotelInStayRequest (which accurately describes
+# what it is — a guest request during a stay) eliminates the ambiguity and
+# removes the need for the import alias.
+#
+# MIGRATION: ALTER TABLE hotel_services RENAME TO hotel_in_stay_requests;
+# (or keep the __tablename__ = "hotel_services" if the DB table name is fine —
+# the tablename below is preserved so no SQL migration is required for the table
+# itself, only the Python symbol changes.)
 
-    __tablename__ = "hotel_services"
+class HotelInStayRequest(BaseModel):
+    """In-stay service requests (room service, housekeeping, maintenance, etc.)"""
+
+    __tablename__ = "hotel_services"  # preserved — no DB migration needed
 
     booking_id = Column(
         UUID(as_uuid=True),
@@ -319,4 +340,4 @@ class HotelService(BaseModel):
     booking = relationship("HotelBooking", back_populates="services")
 
     def __repr__(self):
-        return f"<HotelService {self.service_type} - {self.status}>"
+        return f"<HotelInStayRequest {self.service_type} - {self.status}>"

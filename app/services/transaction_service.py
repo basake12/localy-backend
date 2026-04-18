@@ -62,7 +62,7 @@ from app.crud.wallet_crud import (
 )
 from app.models.wallet_model import (
     PlatformRevenue,
-    TransactionType,
+    TransactionTypeEnum,
     WalletTransaction,
 )
 from app.core.exceptions import (
@@ -230,7 +230,7 @@ class TransactionService:
                 db,
                 wallet_id=customer_wallet.id,
                 amount=customer_total,
-                transaction_type=TransactionType.PAYMENT,
+                transaction_type=TransactionTypeEnum.PAYMENT,
                 description=f"Payment: {description}",
                 idempotency_key=reference,            # UNIQUE NOT NULL
                 related_order_id=related_order_id,
@@ -250,7 +250,7 @@ class TransactionService:
                 db,
                 wallet_id=business_wallet.id,
                 amount=business_net,
-                transaction_type=TransactionType.CREDIT,
+                transaction_type=TransactionTypeEnum.CREDIT,
                 description=f"Payment received: {description}",
                 idempotency_key=f"{reference}_BUSINESS",    # UNIQUE NOT NULL
                 related_order_id=related_order_id,
@@ -392,7 +392,7 @@ class TransactionService:
                 db,
                 wallet_id=original_customer_txn.wallet_id,
                 amount=customer_refund_amount,
-                transaction_type=TransactionType.REFUND,
+                transaction_type=TransactionTypeEnum.REFUND,
                 description=description or f"Refund: {original.description}",
                 idempotency_key=refund_reference,
                 metadata={**(metadata or {}), "original_reference": original_reference},
@@ -403,7 +403,7 @@ class TransactionService:
                 db,
                 wallet_id=original_business_txn.wallet_id,
                 amount=business_debit_amount,
-                transaction_type=TransactionType.DEBIT,
+                transaction_type=TransactionTypeEnum.DEBIT,
                 description=description or f"Refund issued: {original.description}",
                 idempotency_key=f"{refund_reference}_BUSINESS",
                 metadata={**(metadata or {}), "original_reference": original_reference},

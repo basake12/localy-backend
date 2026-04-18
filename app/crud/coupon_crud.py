@@ -4,7 +4,7 @@ from typing import Optional, List
 from uuid import UUID
 from decimal import Decimal
 
-from app.models.coupon_model import Coupon, CouponUsage, CouponStatus
+from app.models.coupon_model import Coupon, CouponRedemption, CouponStatus
 from app.schemas.coupon_schema import CouponCreate, CouponUpdate, CouponUsageCreate
 
 
@@ -127,10 +127,10 @@ async def get_user_usage_count(
     db: AsyncSession, coupon_id: UUID, user_id: UUID
 ) -> int:
     result = await db.execute(
-        select(func.count(CouponUsage.id)).where(
+        select(func.count(CouponRedemption.id)).where(
             and_(
-                CouponUsage.coupon_id == coupon_id,
-                CouponUsage.user_id == user_id,
+                CouponRedemption.coupon_id == coupon_id,
+                CouponRedemption.user_id == user_id,
             )
         )
     )
@@ -141,8 +141,8 @@ async def record_usage(
     db: AsyncSession,
     user_id: UUID,
     data: CouponUsageCreate,
-) -> CouponUsage:
-    usage = CouponUsage(user_id=user_id, **data.model_dump())
+) -> CouponRedemption:
+    usage = CouponRedemption(user_id=user_id, **data.model_dump())
     db.add(usage)
 
     # Atomically increment use counter on the coupon
@@ -160,11 +160,11 @@ async def list_user_usages(
     user_id: UUID,
     skip: int = 0,
     limit: int = 20,
-) -> List[CouponUsage]:
+) -> List[CouponRedemption]:
     result = await db.execute(
-        select(CouponUsage)
-        .where(CouponUsage.user_id == user_id)
-        .order_by(CouponUsage.created_at.desc())
+        select(CouponRedemption)
+        .where(CouponRedemption.user_id == user_id)
+        .order_by(CouponRedemption.created_at.desc())
         .offset(skip)
         .limit(limit)
     )
@@ -174,7 +174,7 @@ async def list_user_usages(
 async def get_pending_cashback_usages(
     db: AsyncSession,
     limit: int = 100,
-) -> List[CouponUsage]:
+) -> List[CouponRedemption]:
     """
     Fetch usage records for CASHBACK coupons where cashback has not yet been credited.
     Called by Celery task to process pending cashback credits.
@@ -182,13 +182,13 @@ async def get_pending_cashback_usages(
     from app.models.coupon_model import CouponType
 
     result = await db.execute(
-        select(CouponUsage)
-        .join(Coupon, CouponUsage.coupon_id == Coupon.id)
+        select(CouponRedemption)
+        .join(Coupon, CouponRedemption.coupon_id == Coupon.id)
         .where(
             and_(
                 Coupon.coupon_type == CouponType.CASHBACK,
-                CouponUsage.cashback_credited == False,
-                CouponUsage.cashback_amount > 0,
+                CouponRedemption.cashback_credited == False,
+                CouponRedemption.cashback_amount > 0,
             )
         )
         .limit(limit)

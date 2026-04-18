@@ -329,8 +329,8 @@ class TicketService:
         seat_hold_key = f"seat_hold:{event_id}:{tier_id}"
         redis = None
         try:
-            from app.core.redis import get_redis_client
-            redis = get_redis_client()
+            from app.core.cache import get_redis
+            redis = get_redis()
             hold_acquired = redis.set(
                 seat_hold_key, str(current_user.id), nx=True, ex=600
             )

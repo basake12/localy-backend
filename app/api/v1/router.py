@@ -1,3 +1,23 @@
+"""
+app/api/v1/router.py
+
+FIXES:
+  [AUDIT BUG-8 FIX] webhooks router added at prefix "/webhooks".
+
+  Root cause:
+    Monnify and Paystack webhook endpoints were inside wallet.py, which is
+    mounted at prefix "/wallet". Actual paths were:
+      /api/v1/wallet/webhooks/monnify/funding   ← WRONG (404 from Monnify)
+      /api/v1/wallet/webhooks/paystack/payment  ← WRONG (404 from Paystack)
+
+    Blueprint §15 requires:
+      POST /api/v1/webhooks/monnify/funding     ← CORRECT
+      POST /api/v1/webhooks/paystack/payment    ← CORRECT
+
+  Fix:
+    - New webhooks.py router imported and mounted at "/webhooks".
+    - wallet.py no longer contains any webhook routes.
+"""
 from fastapi import APIRouter
 
 from app.api.v1 import auth
@@ -27,6 +47,9 @@ from app.api.v1 import coupons
 from app.api.v1 import favorites
 from app.api.v1 import referrals
 from app.api.v1 import promotions
+# [BUG-8 FIX] — Dedicated webhooks router at /webhooks prefix.
+# Blueprint §15: POST /webhooks/monnify/funding + POST /webhooks/paystack/payment
+from app.api.v1 import webhooks
 
 api_router = APIRouter()
 
@@ -34,6 +57,11 @@ api_router = APIRouter()
 api_router.include_router(auth.router,           prefix="/auth",          tags=["Authentication"])
 api_router.include_router(users.router,          prefix="/users",         tags=["Users"])
 api_router.include_router(wallet.router,         prefix="/wallet",        tags=["Wallet & Payments"])
+
+# [BUG-8 FIX] Webhooks at /webhooks — NOT nested under /wallet.
+# Blueprint §15: these endpoints accept no JWT — HMAC signature verification only.
+# include_in_schema=False is set per-endpoint in webhooks.py (not needed here).
+api_router.include_router(webhooks.router,       prefix="/webhooks",      tags=["Webhooks"])
 
 # ── User Management ───────────────────────────────────────────────────────────
 api_router.include_router(businesses.router,     prefix="/businesses",    tags=["Businesses"])

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query, status, Body
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from uuid import UUID
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from app.core.database import get_db
 from app.dependencies import (
@@ -455,9 +455,9 @@ def create_food_order(
             if not customer_name:
                 customer_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
             if not customer_phone:
-                customer_phone = current_user.phone or ""
+                customer_phone = current_user.phone_number or ""
     customer_name = customer_name or "Customer"
-    customer_phone = customer_phone or current_user.phone or ""
+    customer_phone = customer_phone or current_user.phone_number or ""
 
     order = food_service.create_order_and_pay(
         db,
@@ -636,10 +636,10 @@ def create_reservation(
             if not reservation_data.get("customer_name"):
                 reservation_data["customer_name"] = f"{profile.first_name or ''} {profile.last_name or ''}".strip() or "Customer"
             if not reservation_data.get("customer_phone"):
-                reservation_data["customer_phone"] = current_user.phone or ""
+                reservation_data["customer_phone"] = current_user.phone_number or ""
         else:
             reservation_data["customer_name"] = reservation_data.get("customer_name") or "Customer"
-            reservation_data["customer_phone"] = reservation_data.get("customer_phone") or current_user.phone or ""
+            reservation_data["customer_phone"] = reservation_data.get("customer_phone") or current_user.phone_number or ""
 
     reservation = food_service.make_reservation(
         db,
@@ -804,7 +804,7 @@ def get_food_analytics(
         raise NotFoundException("Restaurant")
 
     days = int(period.replace("d", ""))
-    since = datetime.utcnow() - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
 
     # Revenue chart
     daily_revenue = (

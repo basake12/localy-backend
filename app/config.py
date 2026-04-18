@@ -1,67 +1,45 @@
 """
 app/config.py
 
-FIXES vs previous version:
-  1.  [HARD RULE] GOOGLE_CLIENT_ID and APPLE_APP_BUNDLE_ID DELETED.
-      Blueprint §P05: "Google Sign-In and Apple Sign-In are removed from all
-      authentication flows. Phone number and password only."
+FIXES:
+  [AUDIT BUG-11] JWT_ADMIN_SECRET_KEY: str = "" — catastrophically insecure default.
 
-  2.  ACCESS_TOKEN_EXPIRE_MINUTES: 30 → 15.
-      Blueprint §3.2: "JWT access token (15 min)".
+  Root cause:
+    JWT_ADMIN_SECRET_KEY defaulted to empty string "". With HS256, an empty key
+    means any attacker can forge admin JWT tokens with no knowledge of the secret:
+      jwt.encode({"role": "admin", "admin_id": "..."}, "", algorithm="HS256")
+    This would grant full admin access to the platform — read/write to every
+    entity, transaction, and user account.
 
-  3.  REFRESH_TOKEN_EXPIRE_DAYS: 7 → 30.
-      Blueprint §3.2: "refresh token (30 days)".
+  Fix:
+    Added @field_validator("JWT_ADMIN_SECRET_KEY") that:
+      1. Raises ValueError if the key is empty in production.
+      2. Logs a WARNING if the key is empty in non-production (dev/test may omit it).
+      3. Requires minimum 32-character length (same policy as SECRET_KEY).
 
-  4.  DEFAULT_SEARCH_RADIUS_KM: 10.0 → 5.0.
-      Blueprint §4.1: "Default radius: 5 km from device GPS position."
+  All other fixes from previous version retained (see changelog below).
 
-  5.  STARTER_MONTHLY_PRICE: 5500.0 → 4500.0. Blueprint §8.1.
-      PRO_MONTHLY_PRICE: 16500.0 → 10000.0. Blueprint §8.1.
-      ENTERPRISE_MONTHLY_PRICE: 55000.0 → 15000.0. Blueprint §8.1.
-
-  6.  REFERRAL_BONUS_AMOUNT: 500.0 → 1000.0.
-      Blueprint §9.1: "Referrer reward: ₦1,000."
-
-  7.  WALLET_MIN_TOPUP: 500.0 → 1000.0.
-      Blueprint §5.1: "Minimum top-up: ₦1,000."
-
-  8.  WALLET_DAILY_FUNDING_LIMIT: 500_000.0 → 2_000_000.0.
-      Blueprint §5.1: "Daily funding: ₦2,000,000."
-
-  9.  REEL_MAX_DURATION_SECONDS: 60 → 90.
-      Blueprint §8.4: "up to 90 seconds."
-
-  10. [HARD RULE] LOCAL_GOVERNMENT_RESTRICTION DELETED.
-      Blueprint §4: "No LGA logic anywhere in the codebase."
-
-  11. NOWPAYMENTS_* settings DELETED.
-      Blueprint §5: Monnify + Paystack ONLY. No crypto payments.
-
-  12. OTP_EXPIRE_MINUTES = 5 added.
-      Blueprint §3.1 Step 1: "OTP is 6-digit, TTL = 5 minutes."
-
-  13. OTP_MAX_ATTEMPTS = 5, OTP_LOCKOUT_MINUTES = 30 added.
-      Blueprint §3.1 Step 2.
-
-  14. OTP_RESEND_COOLDOWN_SECONDS = 60 added.
-      Blueprint §3.1 Step 1: "Resend available after 60 seconds."
-
-  15. PIN_MAX_ATTEMPTS = 5, PIN_LOCKOUT_SECONDS = 1800 added.
-      Blueprint §3.3: "5 consecutive wrong PIN attempts: 30-minute lockout."
-
-  16. Monnify settings updated — MONNIFY_BASE_URL points to production.
-      Blueprint §5: Monnify is primary bank transfer provider.
-
-  17. NEW_USER_DISCOUNT_AMOUNT = 1000.0 added. Blueprint §5.1.
-      NEW_USER_DISCOUNT_MIN_ORDER = 2000.0 added. Blueprint §5.1.
-
-  18. Subscription annual prices corrected:
-      Annual = 10 months price (2 months free). Blueprint §8.1.
+PREVIOUS FIXES (retained):
+  1.  GOOGLE_CLIENT_ID and APPLE_APP_BUNDLE_ID DELETED — Blueprint §P05.
+  2.  ACCESS_TOKEN_EXPIRE_MINUTES: 30 → 15. Blueprint §3.2.
+  3.  REFRESH_TOKEN_EXPIRE_DAYS: 7 → 30. Blueprint §3.2.
+  4.  DEFAULT_SEARCH_RADIUS_KM: 10.0 → 5.0. Blueprint §4.1.
+  5.  STARTER/PRO/ENTERPRISE prices corrected. Blueprint §8.1.
+  6.  REFERRAL_BONUS_AMOUNT: 500 → 1000. Blueprint §9.1.
+  7.  WALLET_MIN_TOPUP: 500 → 1000. Blueprint §5.1.
+  8.  WALLET_DAILY_FUNDING_LIMIT: 500k → 2,000,000. Blueprint §5.1.
+  9.  REEL_MAX_DURATION_SECONDS: 60 → 90. Blueprint §8.4.
+  10. LOCAL_GOVERNMENT_RESTRICTION DELETED. Blueprint §4 HARD RULE.
+  11. NOWPAYMENTS_* DELETED. Blueprint §5.
+  12. OTP/PIN/Monnify settings added. Blueprint §3.1 / §3.3.
 """
+import logging
 from typing import List, Optional, Union
 
 from pydantic import PostgresDsn, RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -90,7 +68,7 @@ class Settings(BaseSettings):
 
     # ── JWT / Security ────────────────────────────────────────────────────────
     # SECRET_KEY has NO default — must be set in .env.
-    # Generate once: python -c "import secrets; print(secrets.token_urlsafe(64))"
+    # Generate: python -c "import secrets; print(secrets.token_urlsafe(64))"
     SECRET_KEY: str
     ALGORITHM:  str = "HS256"
 
@@ -103,6 +81,16 @@ class Settings(BaseSettings):
     # REMOVED: GOOGLE_CLIENT_ID — Blueprint §P05 HARD RULE: OAuth deleted.
     # REMOVED: APPLE_APP_BUNDLE_ID — same reason.
 
+    # ── Admin JWT (separate secret, separate issuance endpoint) ───────────────
+    # Blueprint §3.2 / §13.3: admin tokens use a SEPARATE secret key.
+    # Admin tokens are NEVER accepted by mobile API endpoints.
+    # Admin token claim: { role: "admin", admin_id: uuid }
+    #
+    # [BUG-11 FIX] Default changed from "" to require non-empty in production.
+    # See @field_validator("JWT_ADMIN_SECRET_KEY") below.
+    # Generate separately: python -c "import secrets; print(secrets.token_urlsafe(64))"
+    JWT_ADMIN_SECRET_KEY: str = ""
+
     # ── CORS ──────────────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: Union[str, List[str]] = "http://localhost:3000,http://localhost:19006"
 
@@ -112,6 +100,11 @@ class Settings(BaseSettings):
     AWS_ACCESS_KEY_ID:      str = ""
     AWS_SECRET_ACCESS_KEY:  str = ""
     AWS_REGION:             str = "us-east-1"
+
+    # Cloudinary — image/video upload (upload_service.py)
+    CLOUDINARY_CLOUD_NAME:      str = ""
+    CLOUDINARY_API_KEY:         str = ""
+    CLOUDINARY_API_SECRET:      str = ""
 
     # Cloudflare R2 — alternative CDN-backed storage (Blueprint §16.1)
     CLOUDFLARE_R2_BUCKET:          str = ""
@@ -130,50 +123,44 @@ class Settings(BaseSettings):
     TERMII_API_URL:    str = "https://api.ng.termii.com/api"
 
     # ── OTP Rules — Blueprint §3.1 ────────────────────────────────────────────
-    # Step 1: TTL = 5 minutes
-    OTP_EXPIRE_MINUTES: int = 5            # Redis TTL for otp:{phone}
+    # Step 1: TTL = 5 minutes — stored in Redis: otp:{phone}
+    OTP_EXPIRE_MINUTES: int = 5
 
     # Step 1: resend cooldown
-    OTP_RESEND_COOLDOWN_SECONDS: int = 60  # minimum gap between OTP sends
+    OTP_RESEND_COOLDOWN_SECONDS: int = 60
 
     # Step 2: max attempts per phone per hour
     OTP_MAX_ATTEMPTS:    int = 5
-    OTP_LOCKOUT_MINUTES: int = 30          # phone locked after 5 failures
+    OTP_LOCKOUT_MINUTES: int = 30
 
     # ── PIN Rules — Blueprint §3.3 ────────────────────────────────────────────
-    PIN_MAX_ATTEMPTS:    int = 5           # consecutive wrong attempts before lockout
-    PIN_LOCKOUT_SECONDS: int = 1800        # 30 minutes — Redis TTL for pin_lockout:{user_id}
+    # Blueprint §16.3: pin_lockout:{user_id} TTL = 1800s
+    PIN_MAX_ATTEMPTS:    int = 5
+    PIN_LOCKOUT_SECONDS: int = 1800
 
     # ── Payment — Monnify (primary) + Paystack (card) ─────────────────────────
-    # Blueprint §1 / §5 / §16.1: Monnify = bank transfer + virtual accounts
     MONNIFY_API_KEY:       str = ""
-    MONNIFY_SECRET_KEY:    str = ""        # HMAC-SHA512 webhook signature key
+    MONNIFY_SECRET_KEY:    str = ""
     MONNIFY_CONTRACT_CODE: str = ""
-    MONNIFY_BASE_URL:      str = "https://api.monnify.com/api/v1"  # production
+    MONNIFY_BASE_URL:      str = "https://api.monnify.com/api/v1"
 
     # Blueprint §1 / §5: Paystack = card payments
     PAYSTACK_SECRET_KEY:   str
     PAYSTACK_PUBLIC_KEY:   str
     PAYSTACK_CALLBACK_URL: Optional[str] = None
 
-    # REMOVED: NOWPAYMENTS_* — Blueprint §5 specifies Monnify + Paystack ONLY.
-    # Crypto top-up is not in the blueprint.
+    # REMOVED: NOWPAYMENTS_* — Blueprint §5: Monnify + Paystack ONLY.
 
     # ── Google APIs ───────────────────────────────────────────────────────────
     # Geocoding only — NOT OAuth. Blueprint §16.1 + §3.1 step 5a.
     GOOGLE_GEOCODING_API_KEY: str = ""
 
     # ── FCM Push Notifications ────────────────────────────────────────────────
-    FCM_SERVER_KEY: str = ""               # Blueprint §16.1
-
-    # ── Admin JWT (separate from mobile JWT) ──────────────────────────────────
-    # Blueprint §3.2 / §13.3: admin tokens use a SEPARATE secret.
-    # They are never accepted by mobile API endpoints.
-    JWT_ADMIN_SECRET_KEY: str = ""
+    FCM_SERVER_KEY: str = ""
 
     # ── Discovery / Search ────────────────────────────────────────────────────
     # Blueprint §4.1: default 5 km, adjustable 1–50 km
-    DEFAULT_SEARCH_RADIUS_KM: float = 5.0    # was 10.0 — FIXED
+    DEFAULT_SEARCH_RADIUS_KM: float = 5.0
     MAX_SEARCH_RADIUS_KM:     float = 50.0
     MIN_SEARCH_RADIUS_KM:     float = 1.0
 
@@ -200,43 +187,46 @@ class Settings(BaseSettings):
 
     # ── Subscription Plans (₦ NGN) — Blueprint §8.1 ──────────────────────────
     # Annual = 10 months price (2 months free). Blueprint §8.1.
-    STARTER_MONTHLY_PRICE: float = 4_500.0     # was 5500 — FIXED
-    STARTER_ANNUAL_PRICE:  float = 45_000.0    # 10 × 4500
+    STARTER_MONTHLY_PRICE: float = 4_500.0
+    STARTER_ANNUAL_PRICE:  float = 45_000.0    # 10 × 4,500
 
-    PRO_MONTHLY_PRICE: float = 10_000.0        # was 16500 — FIXED
-    PRO_ANNUAL_PRICE:  float = 100_000.0       # 10 × 10000
+    PRO_MONTHLY_PRICE: float = 10_000.0
+    PRO_ANNUAL_PRICE:  float = 100_000.0       # 10 × 10,000
 
-    ENTERPRISE_MONTHLY_PRICE: float = 15_000.0  # was 55000 — FIXED
-    ENTERPRISE_ANNUAL_PRICE:  float = 150_000.0 # 10 × 15000
+    ENTERPRISE_MONTHLY_PRICE: float = 15_000.0
+    ENTERPRISE_ANNUAL_PRICE:  float = 150_000.0 # 10 × 15,000
 
-    # ── Wallet Rules — Blueprint §5.1 ─────────────────────────────────────────
-    WALLET_MIN_TOPUP:         float = 1_000.0        # was 500 — FIXED
-    WALLET_MAX_BALANCE:       float = 10_000_000.0
-    WALLET_DAILY_FUNDING_LIMIT: float = 2_000_000.0  # was 500k — FIXED
+    # ── Wallet Rules — Blueprint §5.1 / §5.2 ─────────────────────────────────
+    WALLET_MIN_TOPUP:           float = 1_000.0
+    WALLET_MAX_BALANCE:         float = 10_000_000.0
+    WALLET_DAILY_FUNDING_LIMIT: float = 2_000_000.0
 
-    # Blueprint §3.3: PIN required for wallet transactions above ₦5,000
+    # Blueprint §3.3: PIN required for all wallet transactions above ₦5,000
     WALLET_PIN_THRESHOLD: float = 5_000.0
 
     # ── Referral & Discount — Blueprint §9.1 / §5.1 ──────────────────────────
-    REFERRAL_BONUS_AMOUNT:       float = 1_000.0   # was 500 — FIXED
-    NEW_USER_DISCOUNT_AMOUNT:    float = 1_000.0   # Blueprint §5.1
-    NEW_USER_DISCOUNT_MIN_ORDER: float = 2_000.0   # Blueprint §5.1 + §9.1
+    REFERRAL_BONUS_AMOUNT:       float = 1_000.0
+    NEW_USER_DISCOUNT_AMOUNT:    float = 1_000.0
+    NEW_USER_DISCOUNT_MIN_ORDER: float = 2_000.0
 
     # ── Platform Fees — Blueprint §5.4 ────────────────────────────────────────
-    PLATFORM_FEE_ORDER:   int = 50    # ₦50 for product/food orders (per side)
-    PLATFORM_FEE_BOOKING: int = 100   # ₦100 for service/hotel/health (per side)
-    PLATFORM_FEE_TICKET:  int = 50    # ₦50 per ticket (customer only)
+    # Product/food orders: ₦50 flat (₦50 from business + ₦50 from customer)
+    PLATFORM_FEE_ORDER:   int = 50
+    # Service/hotel/health bookings: ₦100 flat (₦100 each side)
+    PLATFORM_FEE_BOOKING: int = 100
+    # Ticket purchases: ₦50 flat (from customer only)
+    PLATFORM_FEE_TICKET:  int = 50
 
     # ── Content Rules — Blueprint §8.4 / §8.5 ────────────────────────────────
-    REEL_MAX_DURATION_SECONDS:  int = 90   # was 60 — FIXED. Blueprint §8.4.
-    STORY_MAX_DURATION_SECONDS: int = 30   # Blueprint §8.5.
-    STORY_EXPIRE_HOURS:         int = 24   # Blueprint §8.5.
+    REEL_MAX_DURATION_SECONDS:  int = 90   # Blueprint §8.4: up to 90 seconds
+    STORY_MAX_DURATION_SECONDS: int = 30   # Blueprint §8.5: up to 30 seconds
+    STORY_EXPIRE_HOURS:         int = 24   # Blueprint §8.5: 24-hour expiry
 
     # ── Pagination ────────────────────────────────────────────────────────────
     DEFAULT_PAGE_SIZE: int = 20
     MAX_PAGE_SIZE:     int = 100
 
-    # ── Deep link (for email CTAs) ────────────────────────────────────────────
+    # ── Deep link ─────────────────────────────────────────────────────────────
     APP_DEEP_LINK: str = "https://localy.ng"
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -255,6 +245,42 @@ class Settings(BaseSettings):
     def validate_secret_key(cls, v: str) -> str:
         if len(v) < 32:
             raise ValueError("SECRET_KEY must be at least 32 characters")
+        return v
+
+    @field_validator("JWT_ADMIN_SECRET_KEY")
+    @classmethod
+    def validate_admin_secret_key(cls, v: str, info) -> str:
+        """
+        [BUG-11 FIX] Enforce non-empty JWT_ADMIN_SECRET_KEY in production.
+
+        Root cause: defaulting to "" allows trivial admin token forgery with HS256.
+        An empty admin secret = no admin security whatsoever.
+
+        Policy:
+          - Production (APP_ENV="production"): MUST be set and at least 32 chars.
+          - Development/staging: logs a WARNING but allows empty (for local dev).
+        """
+        app_env = info.data.get("APP_ENV", "development") if info.data else "development"
+
+        if not v:
+            if app_env == "production":
+                raise ValueError(
+                    "JWT_ADMIN_SECRET_KEY must be set in production. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+                )
+            else:
+                # In development, log a loud warning but don't crash
+                logger.warning(
+                    "⚠️  JWT_ADMIN_SECRET_KEY is not set. Admin JWT security is disabled. "
+                    "Set this in .env before deploying to production."
+                )
+            return v
+
+        if len(v) < 32:
+            raise ValueError(
+                "JWT_ADMIN_SECRET_KEY must be at least 32 characters. "
+                "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+            )
         return v
 
     @field_validator("ALLOWED_ORIGINS", mode="before")

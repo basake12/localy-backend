@@ -1,3 +1,4 @@
+import uuid as _uuid
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -30,8 +31,7 @@ from app.models.health_model import (
 from app.models.wallet_model import (
     Wallet,
     WalletTransaction,
-    TransactionTypeEnum,
-    TransactionStatusEnum,
+    TransactionStatus,    # Blueprint §14: correct name
     generate_wallet_number,
 )
 
@@ -48,14 +48,15 @@ def _get_or_create_wallet_sync(db: Session, *, user_id: UUID) -> Wallet:
     sync service without await. This inline replacement is functionally
     equivalent and safe to use with a sync Session.
     """
-    wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+    wallet = db.query(Wallet).filter(Wallet.owner_id == user_id).first()  # Blueprint §14: owner_id
     if not wallet:
         wallet = Wallet(
-            user_id=user_id,
+            owner_id=user_id,          # Blueprint §14: owner_id
+            owner_type="customer",     # Blueprint §14: owner_type
             wallet_number=generate_wallet_number(),
             balance=Decimal("0.00"),
             currency="NGN",
-            is_active=True,
+            is_suspended=False,        # Blueprint §14: is_suspended
         )
         db.add(wallet)
         db.flush()
@@ -68,22 +69,28 @@ def _debit_wallet_sync(
     wallet: Wallet,
     amount: Decimal,
     description: str,
-    reference_id: str,
+    external_reference: str,          # Blueprint §14: external_reference (not reference_id)
+    idempotency_key: str = "",        # Blueprint §5.6 HARD RULE: idempotency_key NOT NULL
 ) -> WalletTransaction:
-    """Sync wallet debit. Caller must commit."""
+    """Sync wallet debit. Caller must commit.
+    Blueprint §14: external_reference (not reference_id).
+    Blueprint §5.6: idempotency_key NOT NULL.
+    Blueprint §16.4: datetime.now(timezone.utc).
+    """
     if wallet.balance < amount:
         raise InsufficientBalanceException()
     balance_before = wallet.balance
     wallet.balance -= amount
     txn = WalletTransaction(
         wallet_id=wallet.id,
-        transaction_type=TransactionTypeEnum.PAYMENT,
+        transaction_type=TransactionType.PAYMENT,   # Blueprint §14: TransactionType
         amount=amount,
         balance_before=balance_before,
         balance_after=wallet.balance,
-        status=TransactionStatusEnum.COMPLETED,
+        status=TransactionStatus.COMPLETED,          # Blueprint §14: TransactionStatus
         description=description,
-        reference_id=reference_id,
+        external_reference=external_reference,       # Blueprint §14
+        idempotency_key=idempotency_key or f"HLT_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         completed_at=datetime.now(timezone.utc),
     )
     db.add(txn)
@@ -95,11 +102,15 @@ def _credit_wallet_sync(
     *,
     wallet: Wallet,
     amount: Decimal,
-    transaction_type: TransactionTypeEnum,
+    transaction_type,                 # TransactionType from constants (Blueprint §14)
     description: str,
-    reference_id: str,
+    external_reference: str,          # Blueprint §14: external_reference
+    idempotency_key: str = "",        # Blueprint §5.6 HARD RULE
 ) -> WalletTransaction:
-    """Sync wallet credit. Caller must commit."""
+    """Sync wallet credit. Caller must commit.
+    Blueprint §14: external_reference (not reference_id).
+    Blueprint §5.6: idempotency_key NOT NULL.
+    """
     balance_before = wallet.balance
     wallet.balance += amount
     txn = WalletTransaction(
@@ -108,9 +119,10 @@ def _credit_wallet_sync(
         amount=amount,
         balance_before=balance_before,
         balance_after=wallet.balance,
-        status=TransactionStatusEnum.COMPLETED,
+        status=TransactionStatus.COMPLETED,          # Blueprint §14: TransactionStatus
         description=description,
-        reference_id=reference_id,
+        external_reference=external_reference,       # Blueprint §14
+        idempotency_key=idempotency_key or f"HLT_CR_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         completed_at=datetime.now(timezone.utc),
     )
     db.add(txn)
@@ -123,7 +135,8 @@ def _credit_business_wallet_sync(
     business_user_id: UUID,
     amount: Decimal,
     description: str,
-    reference_id: str,
+    external_reference: str,          # Blueprint §14: external_reference
+    idempotency_key: str = "",        # Blueprint §5.6 HARD RULE
 ) -> None:
     """
     Credit a vendor's wallet after a successful health payment.
@@ -142,9 +155,10 @@ def _credit_business_wallet_sync(
             db,
             wallet=biz_wallet,
             amount=amount,
-            transaction_type=TransactionTypeEnum.CREDIT,
+            transaction_type=TransactionType.CREDIT,   # Blueprint §14
             description=description,
-            reference_id=f"biz_{reference_id}",
+            external_reference=f"HLT_BIZ_{external_reference}",  # Blueprint §14
+            idempotency_key=idempotency_key or f"HLT_BIZ_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
         )
     except Exception:
         import logging
@@ -208,7 +222,8 @@ class HealthService:
                 wallet=customer_wallet,
                 amount=total_charge,
                 description=f"Consultation with Dr. {consultation.doctor.last_name}",
-                reference_id=str(consultation.id),
+                external_reference=f"HLT_CONS_{consultation.id}",   # Blueprint §14
+                idempotency_key=f"HLT_CD_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
             )
 
             consultation.payment_status = "paid"
@@ -226,12 +241,16 @@ class HealthService:
                 doc_user_id = getattr(doc_business, 'user_id', None)
 
                 if doc_user_id:
+                    # Blueprint §5.4: ₦100 from EACH side. Customer paid ₦100 (in total_charge).
+                    # Business also pays ₦100 — deduct from their credit.
+                    # Platform earns: ₦100 (customer) + ₦100 (business) = ₦200 per consultation.
                     _credit_business_wallet_sync(
                         db,
                         business_user_id=doc_user_id,
-                        amount=consultation.consultation_fee,  # net of platform fee
-                        description=f"Consultation booking payment",
-                        reference_id=str(consultation.id),
+                        amount=consultation.consultation_fee - PLATFORM_FEE_BOOKING,  # Blueprint §5.4
+                        description="Consultation booking payment",
+                        external_reference=f"HLT_CONS_BIZ_{consultation.id}",  # Blueprint §14
+                        idempotency_key=f"HLT_CBD_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
                     )
 
                 doctor.total_consultations += 1
@@ -296,7 +315,8 @@ class HealthService:
                 wallet=customer_wallet,
                 amount=order.total_amount,
                 description=f"Pharmacy order at {order.pharmacy.name}",
-                reference_id=str(order.id),
+                external_reference=f"HLT_PHARM_{order.id}",   # Blueprint §14
+                idempotency_key=f"HLT_PD_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
             )
             order.payment_status = "paid"
             order.status = "confirmed"
@@ -317,13 +337,18 @@ class HealthService:
                 if getattr(pharmacy, 'business_id', None) else None
             )
             if pharmacy_business and pharmacy_business.user_id:
-                net_amount = order.total_amount - PLATFORM_FEE_STANDARD
+                # Blueprint §5.4: ₦50 from EACH side (product orders).
+                # total_amount = subtotal + delivery + ₦50 (customer fee).
+                # Business also pays ₦50 — deduct from their credit.
+                # Platform earns: ₦50 (customer) + ₦50 (business) = ₦100 per order.
+                net_amount = order.total_amount - PLATFORM_FEE_STANDARD - PLATFORM_FEE_STANDARD
                 _credit_business_wallet_sync(
                     db,
                     business_user_id=pharmacy_business.user_id,
                     amount=max(net_amount, Decimal("0")),
-                    description=f"Pharmacy order payment",
-                    reference_id=str(order.id),
+                    description="Pharmacy order payment",
+                    external_reference=f"HLT_PHARM_BIZ_{order.id}",  # Blueprint §14
+                    idempotency_key=f"HLT_PBD_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
                 )
 
             db.commit()
@@ -385,7 +410,8 @@ class HealthService:
                 wallet=customer_wallet,
                 amount=total_charge,
                 description=f"Lab test at {booking.lab_center.name}",
-                reference_id=str(booking.id),
+                external_reference=f"HLT_LAB_{booking.id}",   # Blueprint §14
+                idempotency_key=f"HLT_LD_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
             )
             booking.payment_status = "paid"
             booking.status = "confirmed"
@@ -401,13 +427,18 @@ class HealthService:
                 )
                 if lab_business and lab_business.user_id:
                     # Deduct platform fee before crediting lab — platform keeps ₦100
-                    net_amount = booking.total_amount - PLATFORM_FEE_BOOKING
+                    # Blueprint §5.4: ₦100 from EACH side (health bookings).
+                    # total_amount = subtotal + home_fee + ₦100 (customer fee).
+                    # Business also pays ₦100 — deduct from their credit.
+                    # Platform earns: ₦100 (customer) + ₦100 (business) = ₦200 per lab booking.
+                    net_amount = booking.total_amount - PLATFORM_FEE_BOOKING - PLATFORM_FEE_BOOKING
                     _credit_business_wallet_sync(
                         db,
                         business_user_id=lab_business.user_id,
                         amount=max(net_amount, Decimal("0")),
-                        description=f"Lab booking payment",
-                        reference_id=str(booking.id),
+                        description="Lab booking payment",
+                        external_reference=f"HLT_LAB_BIZ_{booking.id}",  # Blueprint §14
+                        idempotency_key=f"HLT_LBD_{_uuid.uuid4().hex.upper()}",  # Blueprint §5.6
                     )
 
             db.commit()

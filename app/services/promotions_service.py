@@ -37,7 +37,7 @@ from app.models.promotions_model import (
     PromotionStatus,
     StreakActionType,
 )
-from app.models.wallet_model import TransactionType, TransactionStatus
+from app.models.wallet_model import TransactionTypeEnum, TransactionStatusEnum
 from app.schemas.promotions_schema import (
     PromotionCreate,
     PromotionUpdate,
@@ -221,7 +221,7 @@ class PromotionsService:
                 amount=bonus,
                 description=f"Promo bonus: {promo.title}",
                 reference=reference,
-                transaction_type=TransactionType.CASHBACK,
+                transaction_type=TransactionTypeEnum.CASHBACK,
             )
 
             # Record redemption
@@ -320,7 +320,7 @@ class PromotionsService:
                 amount=cashback,
                 description=f"Cashback: {promo.title}",
                 reference=reference,
-                transaction_type=TransactionType.CASHBACK,
+                transaction_type=TransactionTypeEnum.CASHBACK,
             )
 
             await promotion_redemption_crud.create(
@@ -412,7 +412,7 @@ class PromotionsService:
                     amount=reward,
                     description=f"Streak reward: {promo.title}",
                     reference=reference,
-                    transaction_type=TransactionType.CASHBACK,
+                    transaction_type=TransactionTypeEnum.CASHBACK,
                 )
 
                 await promotion_redemption_crud.create(
@@ -508,7 +508,7 @@ class PromotionsService:
             amount=extra_amount,
             description=f"Referral bonus: {multiplier_info.promotion.title}",
             reference=reference,
-            transaction_type=TransactionType.REFERRAL_BONUS,
+            transaction_type=TransactionTypeEnum.REFERRAL_BONUS,
         )
 
         await promotion_redemption_crud.create(
@@ -578,7 +578,7 @@ class PromotionsService:
         amount: Decimal,
         description: str,
         reference: str,
-        transaction_type: TransactionType,
+        transaction_type: TransactionTypeEnum,
     ):
         """
         Credit promotion bonus to user wallet.
@@ -605,7 +605,7 @@ class PromotionsService:
                 amount=amount,
                 transaction_type=transaction_type,
                 description=description,
-                reference_id=reference,
+                external_reference=reference,
                 metadata={"source": "promotion"},
             )
             return txn

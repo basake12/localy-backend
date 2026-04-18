@@ -40,6 +40,14 @@ from app.models.base_model import BaseModel
 
 # ─── Referral Code ────────────────────────────────────────────────────────────
 
+import enum
+
+class ReferralStatus(str, enum.Enum):
+    PENDING   = "pending"
+    COMPLETED = "completed"
+    REWARDED  = "rewarded"
+    EXPIRED   = "expired"
+
 class ReferralCode(BaseModel):
     """
     One referral code per user — created at registration.

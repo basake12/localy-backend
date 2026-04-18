@@ -35,6 +35,16 @@ FIXES vs previous version:
 
   14. CustomerProfile local_government column removed (Blueprint HARD RULE:
       no LGA anywhere).
+
+  15. [NEW FIX] Dead OTP DB columns removed from User model.
+      Blueprint §3.1: "OTP is 6-digit, TTL = 5 minutes (stored in Redis
+      with key otp:{phone})." OTP is NEVER stored in the database.
+      Columns phone_verification_otp, otp_expires_at, password_reset_otp,
+      password_reset_expires were always NULL (auth_service correctly uses
+      Redis) and created dual-truth confusion. Removed to enforce single
+      source of truth: Redis only.
+      NOTE: If these columns exist in your DB, create an Alembic migration
+      to drop them: op.drop_column('users', 'phone_verification_otp') etc.
 """
 from sqlalchemy import (
     Column,
@@ -86,7 +96,7 @@ class User(BaseModel):
     phone_number  = Column(String(20), unique=True, nullable=False, index=True)
     password_hash = Column(Text, nullable=False)
 
-    # Blueprint §14: full_name VARCHAR(255) NOT NULL — on users, not only profile
+    # Blueprint §14: full_name VARCHAR(255) NOT NULL
     full_name     = Column(String(255), nullable=False)
 
     # Blueprint §14: date_of_birth DATE NOT NULL — used for age verification
@@ -129,21 +139,26 @@ class User(BaseModel):
     is_banned  = Column(Boolean, default=False, nullable=False, index=True)
     ban_reason = Column(Text, nullable=True)
 
-    # ── Phone verification ────────────────────────────────────────────────────
-    is_phone_verified      = Column(Boolean, default=False, nullable=False)
-    phone_verification_otp = Column(String(10), nullable=True)
-    otp_expires_at         = Column(DateTime(timezone=True), nullable=True)
-
-    # ── Password reset ────────────────────────────────────────────────────────
-    password_reset_otp     = Column(String(10), nullable=True)
-    password_reset_expires = Column(DateTime(timezone=True), nullable=True)
+    # ── Phone verification — set TRUE after OTP confirmed ────────────────────
+    # Blueprint §3.1 Step 2: OTP verified → phone marked verified in Redis session.
+    # This DB flag is the durable record: set once by mark_phone_verified().
+    is_phone_verified = Column(Boolean, default=False, nullable=False)
 
     # ── Session tracking ──────────────────────────────────────────────────────
     last_login = Column(DateTime(timezone=True), nullable=True)
 
+    # REMOVED: phone_verification_otp, otp_expires_at — Blueprint §3.1:
+    #   OTP stored ONLY in Redis (key: otp:{phone}, TTL=300s). Never in DB.
+    #   DB OTP columns are dead code that creates dual-truth confusion.
+    #   Drop via Alembic if they exist in your schema.
+    #
+    # REMOVED: password_reset_otp, password_reset_expires — same reason.
+    #   Reset OTP lives in Redis (same otp:{phone} key). auth_service.py
+    #   is already Redis-only — these DB columns were never written to.
+    #
     # REMOVED: oauth_provider, oauth_provider_id
-    # Blueprint §P05 HARD RULE: Google/Apple OAuth deleted entirely.
-    # Phone + password is the ONLY registration and login method.
+    #   Blueprint §P05 HARD RULE: Google/Apple OAuth deleted entirely.
+    #   Phone + password is the ONLY registration and login method.
 
     # ── Relationships ─────────────────────────────────────────────────────────
     business      = relationship(
@@ -221,7 +236,7 @@ class CustomerProfile(BaseModel):
 
     first_name      = Column(String(100), nullable=False)
     last_name       = Column(String(100), nullable=False)
-    date_of_birth   = Column(Date, nullable=True)   # mirrors users.date_of_birth for profile display
+    date_of_birth   = Column(Date, nullable=True)   # mirrors users.date_of_birth
     gender          = Column(String(20), nullable=True)
     profile_picture = Column(Text, nullable=True)
     bio             = Column(Text, nullable=True)

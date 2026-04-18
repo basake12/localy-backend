@@ -1,42 +1,41 @@
 """
 app/api/v1/wallet.py
 
-FIXES vs previous version:
-  1.  [CRITICAL] Monnify webhook endpoint added:
-      POST /webhooks/monnify/funding
-      Blueprint §5.1 / §5.5: "Transfer from any Nigerian bank triggers Monnify
-      webhook → POST /api/v1/webhooks/monnify/funding"
-      HMAC-SHA512 signature verification via X-Monnify-Signature header.
-      Blueprint §5.5: "verify HMAC signature → check idempotency key"
+FIXES:
+  [AUDIT BUG-8 FIX] Monnify and Paystack webhook endpoints REMOVED from this file.
 
-  2.  Crypto endpoints (/crypto/initiate, /crypto/webhook) DELETED.
-      Blueprint §5: Monnify + Paystack ONLY.
+  Root cause:
+    Webhook routes were defined here but wallet router is mounted at /wallet.
+    Actual URLs were /api/v1/wallet/webhooks/... instead of /api/v1/webhooks/...
+    Monnify was delivering to the wrong URL → 404 → no wallet ever funded.
 
-  3.  user.user_type → user.role.value throughout. Blueprint §14.
+  Fix:
+    Webhook endpoints moved to app/api/v1/webhooks.py, mounted at /webhooks.
+    router.py updated to include webhooks.router at prefix="/webhooks".
 
-  4.  WalletTopUpRequest minimum ₦500 → ₦1,000. Blueprint §5.1.
+  This file now contains ONLY wallet CRUD endpoints:
+    - GET  /wallet             → balance + virtual account info
+    - GET  /wallet/balance     → alias for home screen card
+    - GET  /wallet/virtual-account → Monnify account details
+    - POST /wallet/topup       → initialise Paystack card top-up
+    - POST /wallet/topup/verify → verify Paystack callback
+    - POST /wallet/withdraw    → business/rider withdrawal
+    - GET  /wallet/withdrawal-limits
+    - POST /wallet/transfer    → wallet-to-wallet transfer
+    - GET  /wallet/fee-breakdown → checkout fee preview
+    - GET  /wallet/transactions  → transaction history
+    - POST /wallet/business/credit → internal business wallet credit
+    - POST /wallet/rider/credit    → internal rider wallet credit
 
-  5.  /topup uses user.phone_number as Paystack identifier fallback.
-      user.email is optional in blueprint — phone_number is always present.
-
-  6.  /withdraw uses user.role.value instead of user.user_type.
-
-  7.  /withdrawal-limits returns correct blueprint values
-      (min ₦1,000, max ₦1,000,000 daily).
-
-  8.  Paystack CHARGE.SUCCESS webhook endpoint added.
-      Blueprint §5.1: "On Paystack webhook CHARGE.SUCCESS: same idempotency
-      flow as Monnify above. Paystack amounts are in kobo — DIVIDE by 100."
+All other wallet operations (webhook processing, fee middleware) are
+in wallet_service.py and webhooks.py respectively.
 """
-import hashlib
-import hmac
-import json
 import logging
 from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -47,7 +46,7 @@ from app.dependencies import (
     require_pin_set,
 )
 from app.models.user_model import User
-from app.models.wallet_model import TransactionType
+from app.models.wallet_model import TransactionTypeEnum
 from app.schemas.wallet_schema import (
     FeeBreakdownOut,
     TopUpInitResponse,
@@ -75,7 +74,10 @@ async def get_my_wallet(
     db:   AsyncSession = Depends(get_async_db),
     user: User         = Depends(get_async_current_active_user),
 ):
-    """Get wallet balance + virtual account info. Blueprint §5.1."""
+    """
+    Get wallet balance + virtual account info.
+    Blueprint §5.1: balance + Monnify virtual account (permanent, never changes).
+    """
     wallet = await wallet_service.get_user_wallet(db, user_id=user.id)
     return {"success": True, "data": wallet}
 
@@ -97,13 +99,14 @@ async def get_virtual_account(
 ):
     """
     Return this user's Monnify virtual account details.
-    Blueprint §5.1: permanent, never changes even on phone number update.
+    Blueprint §5.1: "Account number never changes, even on phone number update."
+    Display this to the user as the funding destination for bank transfers.
     """
     wallet = await wallet_service.get_user_wallet(db, user_id=user.id)
     if not wallet.virtual_acct_number:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Virtual account not yet provisioned. Please try again shortly.",
+            detail="Virtual account not yet provisioned. Please try again in a moment.",
         )
     return {
         "success": True,
@@ -132,10 +135,11 @@ async def topup_wallet(
     Initialise a Paystack card top-up.
     Blueprint §5.1: minimum ₦1,000. Daily limit ₦2,000,000.
 
-    For bank transfers, users send money to their permanent Monnify virtual
-    account — no action needed here. The Monnify webhook auto-credits the wallet.
+    For bank transfers: users send money to their permanent Monnify virtual account
+    (GET /wallet/virtual-account). The Monnify webhook at /api/v1/webhooks/monnify/funding
+    auto-credits the wallet — no action needed here.
     """
-    # Use phone_number as Paystack email fallback (email is optional in blueprint)
+    # Blueprint §14: email optional; phone_number always present
     paystack_email = user.email or f"{user.phone_number}@localy.ng"
 
     payment = await payment_service.initialize_transaction(
@@ -151,7 +155,7 @@ async def topup_wallet(
     if not payment_data.get("authorization_url"):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Paystack failed to initialise transaction",
+            detail="Paystack failed to initialise transaction. Please try again.",
         )
     return {
         "success": True,
@@ -173,7 +177,9 @@ async def verify_topup(
     """
     Verify Paystack callback and credit wallet.
     Blueprint §5.1: "Paystack amounts are in kobo — DIVIDE by 100 before crediting."
-    Idempotent — safe to call multiple times for same reference.
+    Idempotent — safe to call multiple times for the same reference.
+    The webhook at /webhooks/paystack/payment handles automatic verification;
+    this endpoint is for manual fallback from Flutter callback URL.
     """
     result   = await payment_service.verify_transaction(reference)
     pay_data = result.get("data", {})
@@ -181,18 +187,19 @@ async def verify_topup(
     if not result.get("status") or pay_data.get("status") != "success":
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Payment not successful",
+            detail="Payment not successful or reference not found.",
         )
 
-    # payment_service.verify_transaction() already converts kobo → NGN.
-    # Do NOT divide again — that would be a double-conversion.
-    amount_ngn = Decimal(str(pay_data.get("amount", 0)))
+    # payment_service.verify_transaction() returns amount in kobo.
+    # Blueprint §5.1: "DIVIDE by 100 before crediting wallet"
+    amount_kobo = Decimal(str(pay_data.get("amount", 0)))
+    amount_ngn  = amount_kobo / Decimal("100")
 
     txn = await wallet_service.credit_wallet(
         db,
         user_id=user.id,
         amount_ngn=amount_ngn,
-        description="Wallet top-up via Paystack",
+        description="Wallet top-up via Paystack card payment",
         reference=reference,
         metadata={"payment_data": pay_data},
     )
@@ -209,12 +216,17 @@ async def withdraw_from_wallet(
 ):
     """
     Withdraw to bank account.
+
     Blueprint §5.2:
-    - CUSTOMERS CANNOT WITHDRAW — wallet is spend-only.
-    - Business / Rider: min ₦1,000, max ₦1,000,000/day, same/next business day.
-    - Blueprint §3.3: PIN required for all withdrawals — verified in request body.
+      - CUSTOMERS CANNOT WITHDRAW — wallet is spend-only.
+      - Business / Rider: min ₦1,000, max ₦1,000,000/day.
+      - Processing: same/next business day.
+
+    Blueprint §3.3 HARD RULE:
+      PIN is required for ALL wallet withdrawals — no exceptions.
+      Verified in request body (payload.pin).
     """
-    # Blueprint §3.3: verify PIN before withdrawal
+    # Blueprint §3.3: verify PIN before withdrawal — no exceptions
     from app.core.security import verify_pin
     if not user.pin_hash or not verify_pin(payload.pin, user.pin_hash):
         raise HTTPException(
@@ -251,21 +263,24 @@ async def withdraw_from_wallet(
 async def get_withdrawal_limits(
     user: User = Depends(get_async_current_active_user),
 ):
-    """Return withdrawal limits. Blueprint §5.2."""
+    """
+    Return withdrawal limits. Blueprint §5.2.
+    Customer wallets cannot withdraw at all — spend-only.
+    """
     role_val = user.role.value if hasattr(user.role, "value") else str(user.role)
     if role_val == "customer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Customers cannot withdraw funds.",
+            detail="Customers cannot withdraw funds. Customer wallets are spend-only.",
         )
     return {
         "success": True,
         "data": {
-            "minimum_withdrawal":    1000.0,    # Blueprint §5.2
-            "maximum_daily":         1000000.0, # Blueprint §5.2
-            "currency":              "NGN",
-            "processing_time":       "Same business day or next business day",
-            "pin_required":          True,       # Blueprint §3.3
+            "minimum_withdrawal": 1000.0,    # Blueprint §5.2: min ₦1,000
+            "maximum_daily":      1000000.0, # Blueprint §5.2: max ₦1,000,000/day
+            "currency":           "NGN",
+            "processing_time":    "Same business day or next business day",
+            "pin_required":       True,       # Blueprint §3.3 HARD RULE
         },
     }
 
@@ -278,7 +293,10 @@ async def transfer_funds(
     db:      AsyncSession = Depends(get_async_db),
     user:    User         = Depends(get_async_fully_verified_user),
 ):
-    """Transfer to another Localy user by wallet number (LCY...)."""
+    """
+    Transfer to another Localy user by wallet number (LCY...).
+    Blueprint §3.3: PIN required for all wallet transactions — verified here.
+    """
     from app.core.security import verify_pin
     if not user.pin_hash or not verify_pin(payload.pin, user.pin_hash):
         raise HTTPException(
@@ -309,13 +327,15 @@ async def transfer_funds(
 @router.get("/fee-breakdown", response_model=SuccessResponse[FeeBreakdownOut])
 async def get_fee_breakdown(
     product_price:    float = Query(..., gt=0),
-    transaction_type: str   = Query(..., description="product_purchase|food_order|hotel_booking|service_booking|health_appointment|ticket_sale"),
-    user:             User  = Depends(get_async_current_active_user),
+    transaction_type: str   = Query(
+        ...,
+        description="product_purchase|food_order|hotel_booking|service_booking|health_appointment|ticket_sale",
+    ),
+    user: User = Depends(get_async_current_active_user),
 ):
     """
     Return fee breakdown for checkout display.
-    Blueprint §5.4: "All fees shown transparently in checkout summary
-    before user confirms."
+    Blueprint §5.4: "All fees shown transparently in checkout summary before user confirms."
     """
     breakdown = transaction_service.get_fee_breakdown(
         Decimal(str(product_price)), transaction_type
@@ -327,12 +347,16 @@ async def get_fee_breakdown(
 
 @router.get("/transactions", response_model=SuccessResponse[WalletTransactionListOut])
 async def get_wallet_transactions(
-    transaction_type: TransactionType = Query(None),
+    transaction_type: TransactionTypeEnum = Query(None),
     skip:  int        = Query(0, ge=0),
     limit: int        = Query(20, ge=1, le=100),
     db:    AsyncSession = Depends(get_async_db),
     user:  User         = Depends(get_async_current_active_user),
 ):
+    """
+    Full wallet transaction history with pagination.
+    Blueprint §5.2: "Full history — date, description, amount, balance, downloadable."
+    """
     transactions, total = await wallet_service.get_transaction_history(
         db,
         user_id=user.id,
@@ -351,159 +375,9 @@ async def get_wallet_transactions(
     }
 
 
-# ─── Monnify Webhook — PRIMARY FUNDING (Blueprint §5.1 / §5.5) ───────────────
-
-@router.post("/webhooks/monnify/funding", include_in_schema=False)
-async def monnify_funding_webhook(
-    request: Request,
-    db:      AsyncSession = Depends(get_async_db),
-):
-    """
-    Monnify bank transfer webhook — auto-credits wallet on bank transfer.
-
-    Blueprint §5.1:
-      "Transfer from any Nigerian bank triggers Monnify webhook →
-      POST /api/v1/webhooks/monnify/funding
-      Backend: verify HMAC signature → check idempotency key
-      (stored in wallet_transactions.external_reference — UNIQUE constraint)
-      On success: credit wallet, emit WebSocket event 'wallet_credited',
-      send push notification 'Your wallet has been funded with ₦X,XXX'
-      Processing time: within 60 seconds of bank transfer confirmation"
-
-    Blueprint §5.5: HMAC-SHA512 verification.
-      Header: X-Monnify-Signature
-      Verify: hmac.compare_digest(computed_sig, header_sig)
-    """
-    raw_body = await request.body()
-
-    # ── Signature verification — Blueprint §5.5 ───────────────────────────────
-    sig_header = request.headers.get("X-Monnify-Signature", "")
-    computed   = hmac.new(
-        settings.MONNIFY_SECRET_KEY.encode(),
-        raw_body,
-        hashlib.sha512,
-    ).hexdigest()
-
-    if not hmac.compare_digest(sig_header, computed):
-        logger.warning("Monnify webhook: invalid HMAC signature")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid webhook signature",
-        )
-
-    try:
-        payload = json.loads(raw_body)
-    except (json.JSONDecodeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid JSON payload",
-        )
-
-    # Only process PAID events
-    payment_status = payload.get("paymentStatus") or payload.get("transactionStatus")
-    if payment_status != "PAID":
-        logger.info("Monnify webhook: skipping non-PAID event (status=%s)", payment_status)
-        return {"status": "ignored", "reason": "not_paid"}
-
-    # Blueprint §5.1: "Monnify amounts are in Naira (amountPaid) — no conversion"
-    amount_ngn        = Decimal(str(payload.get("amountPaid", 0)))
-    monnify_reference = payload.get("transactionReference", "")
-    virtual_account   = payload.get("destinationAccountNumber", "") or \
-                        (payload.get("reservedAccountInfo", {}) or {}).get("accountNumber", "")
-    sender_bank       = (payload.get("paymentSource", {}) or {}).get("bankName", "")
-    sender_name       = (payload.get("paymentSource", {}) or {}).get("accountName", "")
-
-    if not monnify_reference or not virtual_account:
-        logger.error("Monnify webhook: missing reference or virtual account. payload=%s", payload)
-        return {"status": "error", "reason": "missing_fields"}
-
-    txn = await wallet_service.handle_monnify_funding(
-        db,
-        monnify_reference=monnify_reference,
-        virtual_account_number=virtual_account,
-        amount_ngn=amount_ngn,
-        sender_bank=sender_bank,
-        sender_name=sender_name,
-    )
-    if txn:
-        logger.info("Monnify: wallet credited ₦%s ref=%s", amount_ngn, monnify_reference)
-    return {"status": "ok"}
-
-
-# ─── Paystack Webhook (CHARGE.SUCCESS) ───────────────────────────────────────
-
-@router.post("/webhooks/paystack/payment", include_in_schema=False)
-async def paystack_payment_webhook(
-    request: Request,
-    db:      AsyncSession = Depends(get_async_db),
-):
-    """
-    Paystack CHARGE.SUCCESS webhook.
-    Blueprint §5.1: "On Paystack webhook CHARGE.SUCCESS: same idempotency flow.
-    Paystack amounts are in kobo — DIVIDE by 100 before crediting wallet."
-
-    Signature verification: X-Paystack-Signature = HMAC-SHA512 of raw body
-    using PAYSTACK_SECRET_KEY.
-    """
-    raw_body = await request.body()
-
-    # Signature verification
-    sig_header = request.headers.get("X-Paystack-Signature", "")
-    computed   = hmac.new(
-        settings.PAYSTACK_SECRET_KEY.encode(),
-        raw_body,
-        hashlib.sha512,
-    ).hexdigest()
-
-    if not hmac.compare_digest(sig_header, computed):
-        logger.warning("Paystack webhook: invalid HMAC signature")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid webhook signature",
-        )
-
-    try:
-        payload = json.loads(raw_body)
-    except (json.JSONDecodeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid JSON payload",
-        )
-
-    event = payload.get("event")
-    if event != "charge.success":
-        return {"status": "ignored"}
-
-    data      = payload.get("data", {})
-    reference = data.get("reference", "")
-    metadata  = data.get("metadata", {})
-
-    # Only process wallet top-up events
-    if metadata.get("type") != "wallet_topup":
-        return {"status": "ignored", "reason": "not_wallet_topup"}
-
-    user_id_str = metadata.get("user_id")
-    if not user_id_str:
-        logger.error("Paystack webhook: missing user_id in metadata. ref=%s", reference)
-        return {"status": "error", "reason": "missing_user_id"}
-
-    # Blueprint §5.1: "Paystack amounts in kobo — DIVIDE by 100 before crediting"
-    amount_kobo = Decimal(str(data.get("amount", 0)))
-    amount_ngn  = amount_kobo / 100
-
-    txn = await wallet_service.credit_wallet(
-        db,
-        user_id=UUID(user_id_str),
-        amount_ngn=amount_ngn,
-        description="Wallet top-up via Paystack",
-        reference=reference,
-        metadata={"payment_data": data},
-    )
-    logger.info("Paystack: wallet credited ₦%s ref=%s", amount_ngn, reference)
-    return {"status": "ok"}
-
-
 # ─── Internal: Business / Rider Wallet Credit ─────────────────────────────────
+# These endpoints are for internal service-to-service calls only.
+# They are excluded from the public Swagger docs.
 
 @router.post(
     "/business/credit",
@@ -521,7 +395,9 @@ async def credit_business_wallet(
 ):
     """
     Internal: credit business wallet after fee deduction.
-    Use transaction_service.process_payment() for standard flows.
+    Blueprint §5.4: business receives gross_amount - platform_fee.
+    Use transaction_service.process_payment() for standard checkout flows.
+    idempotency_key is REQUIRED. Blueprint §5.6 HARD RULE.
     """
     txn = await wallet_service.credit_business_wallet(
         db,
@@ -547,7 +423,10 @@ async def credit_rider_earnings(
     description:   str,
     db:            AsyncSession = Depends(get_async_db),
 ):
-    """Internal: credit rider wallet after delivery completion."""
+    """
+    Internal: credit rider wallet after delivery completion.
+    Blueprint §5.3: same withdrawal rules as business wallet.
+    """
     txn = await wallet_service.credit_rider_earnings(
         db,
         rider_user_id=rider_user_id,

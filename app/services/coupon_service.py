@@ -263,7 +263,7 @@ async def get_coupon_analytics(
     Returns aggregate statistics for a single coupon.
     If business_id is provided, verifies the coupon belongs to that business.
     """
-    from app.models.coupon_model import CouponUsage
+    from app.models.coupon_model import CouponRedemption
 
     coupon = await coupon_crud.get_coupon_by_id(db, coupon_id)
     if not coupon:
@@ -276,12 +276,12 @@ async def get_coupon_analytics(
     # Aggregate usage data
     result = await db.execute(
         select(
-            func.count(CouponUsage.id).label("total_redemptions"),
-            func.coalesce(func.sum(CouponUsage.discount_amount), 0).label("total_discount_given"),
+            func.count(CouponRedemption.id).label("total_redemptions"),
+            func.coalesce(func.sum(CouponRedemption.discount_amount), 0).label("total_discount_given"),
             func.coalesce(
-                func.sum(CouponUsage.cashback_amount), 0
+                func.sum(CouponRedemption.cashback_amount), 0
             ).label("total_cashback_credited"),
-        ).where(CouponUsage.coupon_id == coupon_id)
+        ).where(CouponRedemption.coupon_id == coupon_id)
     )
     row = result.one()
 
@@ -318,10 +318,10 @@ async def credit_cashback(
     Marks cashback_credited = True on the usage record.
     Wallet credit itself is handled by wallet_service.
     """
-    from app.models.coupon_model import CouponUsage
+    from app.models.coupon_model import CouponRedemption
 
     result = await db.execute(
-        select(CouponUsage).where(CouponUsage.id == usage_id)
+        select(CouponRedemption).where(CouponRedemption.id == usage_id)
     )
     usage = result.scalar_one_or_none()
     if not usage:

@@ -1,14 +1,30 @@
 """
 app/services/reel_service.py
 
-FIX:
-  get_feed() signature updated from lga_id to lat/lng/radius_meters to
-  align with the Blueprint radius-only location model and the corrected
-  reels.py route and reels_crud.py.
+FIXES:
+  [AUDIT BUG-9] create_reel() now enforces business.is_verified at the
+  SERVICE LAYER — not just at the router dependency level.
+
+  Root cause of original bug:
+    The router (reels.py) correctly uses require_verified_business.
+    However the SERVICE LAYER only checked ownership (business.user_id != user.id).
+    Blueprint §8.4 HARD RULE must be enforced at every call site for
+    defense-in-depth. Same reasoning as story_service.py BUG-8.
+
+  Blueprint §8.4 HARD RULE:
+    "Only VERIFIED businesses may post reels. Unverified businesses see these
+     features locked with a clear verification prompt — not a silent blank state."
+
+  get_feed() uses lat/lng/radius_meters (radius-only). No LGA.
+  Blueprint §4 / §2 HARD RULE: no LGA filtering anywhere.
+
+  Feed ranking: Enterprise > Pro > Starter > Free (subscription_tier_rank DESC).
+  Blueprint §7.3 / §7.2.
 """
 from typing import Optional, List
-from sqlalchemy.orm import Session
 from uuid import UUID
+
+from sqlalchemy.orm import Session
 
 from app.crud.reels_crud import (
     reel_crud, reel_like_crud, reel_comment_crud, reel_view_crud,
@@ -27,10 +43,28 @@ class ReelService:
     def create_reel(
         self, db: Session, *, business_id: UUID, obj_in: ReelCreate, user: User
     ) -> dict:
-        """Business owner creates a reel."""
+        """
+        Business owner creates a reel.
+
+        Blueprint §8.4 HARD RULE (enforced at SERVICE LAYER):
+          "Only VERIFIED businesses may post reels."
+
+        Tags JSONB structure (Blueprint §8.4 / §P08):
+          [{ timestamp_ms: INT, listing_id: UUID,
+             x_position: FLOAT, y_position: FLOAT }]
+        Stored in reels.tags JSONB array.
+        """
         business = business_crud.get(db, id=business_id)
         if not business or business.user_id != user.id:
-            raise PermissionDeniedException("You don't own this business")
+            raise PermissionDeniedException("You don't own this business.")
+
+        # [BUG-9 FIX] — Blueprint §8.4 HARD RULE: verified businesses only.
+        # Enforced at service layer for defense-in-depth (see module docstring).
+        if not business.is_verified:
+            raise PermissionDeniedException(
+                "Your business must be verified by an admin before you can post "
+                "reels. Complete your profile and await admin review."
+            )
 
         reel = reel_crud.create_for_business(
             db, business_id=business_id, obj_in=obj_in
@@ -44,6 +78,9 @@ class ReelService:
     ) -> dict:
         reel = reel_crud.get(db, id=reel_id)
         if not reel:
+            raise NotFoundException("Reel not found")
+
+        if not reel.is_active:
             raise NotFoundException("Reel not found")
 
         liked_by_me = False
@@ -64,14 +101,17 @@ class ReelService:
         radius_meters: int = DEFAULT_RADIUS_METERS,
         tags: Optional[List[str]] = None,
         linked_entity_type: Optional[str] = None,
+        category: Optional[str] = None,
         skip: int = 0,
         limit: int = 20,
     ) -> dict:
         """
         Returns paginated reel feed — radius-filtered, subscription-ranked.
-        lat/lng are device GPS coordinates for PostGIS ST_DWithin.
-        Blueprint §3: radius-only, no LGA.
-        Blueprint §5.4: Enterprise > Pro > Starter > Free.
+
+        Blueprint §4 HARD RULE: lat/lng GPS coordinates only. No LGA parameter.
+        Blueprint §7.3: Enterprise first → Pro → Starter → Free (organic).
+        Blueprint §7.3: Favourited businesses appear before all others in each tier.
+        Blueprint §7.3: "From businesses near you" label on all feed content.
         """
         reels, total = reel_crud.get_feed(
             db,
@@ -81,11 +121,12 @@ class ReelService:
             radius_meters=radius_meters,
             tags=tags,
             linked_entity_type=linked_entity_type,
+            category=category,
             skip=skip,
             limit=limit,
         )
 
-        # Attach liked_by_me flag per reel in the result set
+        # Attach liked_by_me flag per reel in the result set (batch query)
         if viewer_id and reels:
             reel_ids = [r.id for r in reels]
             liked = (
@@ -111,7 +152,7 @@ class ReelService:
 
         business = business_crud.get(db, id=reel.business_id)
         if not business or business.user_id != user.id:
-            raise PermissionDeniedException("You don't own this reel")
+            raise PermissionDeniedException("You don't own this reel.")
 
         updated = reel_crud.update(db, db_obj=reel, obj_in=obj_in)
         db.commit()
@@ -125,7 +166,7 @@ class ReelService:
 
         business = business_crud.get(db, id=reel.business_id)
         if not business or business.user_id != user.id:
-            raise PermissionDeniedException("You don't own this reel")
+            raise PermissionDeniedException("You don't own this reel.")
 
         reel_crud.remove(db, id=reel_id)
         db.commit()
@@ -181,6 +222,11 @@ class ReelService:
         obj_in: ReelViewCreate,
         viewer_id: Optional[UUID] = None,
     ) -> dict:
+        """
+        Record a reel view.
+        Blueprint §8.4 analytics: views, total play time, likes, shares,
+        taps on tagged items, conversion rate from reel to purchase.
+        """
         reel = reel_crud.get(db, id=reel_id)
         if not reel:
             raise NotFoundException("Reel not found")

@@ -44,8 +44,8 @@ from app.crud.wallet_crud import (
     wallet_transaction_crud,
 )
 from app.models.wallet_model import (
-    TransactionStatus,
-    TransactionType,
+    TransactionStatusEnum,
+    TransactionTypeEnum,
     Wallet,
     WalletTransaction,
 )
@@ -238,7 +238,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.TOP_UP,
+            transaction_type=TransactionTypeEnum.TOP_UP,
             description=f"Bank transfer from {sender_name or 'bank'} via Monnify",
             idempotency_key=f"MONNIFY_{monnify_reference}",
             external_reference=monnify_reference,   # UNIQUE constraint prevents double-credit
@@ -304,7 +304,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.TOP_UP,
+            transaction_type=TransactionTypeEnum.TOP_UP,
             description=description,
             idempotency_key=idem_key,
             external_reference=reference,
@@ -348,7 +348,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.PAYMENT,
+            transaction_type=TransactionTypeEnum.PAYMENT,
             description=description,
             idempotency_key=idempotency_key,
             external_reference=reference,
@@ -391,7 +391,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.REFUND,
+            transaction_type=TransactionTypeEnum.REFUND,
             description=description,
             idempotency_key=idempotency_key,
             external_reference=reference,
@@ -441,7 +441,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=bonus,
-            transaction_type=TransactionType.REFERRAL_BONUS,
+            transaction_type=TransactionTypeEnum.REFERRAL_BONUS,
             description=f"Referral bonus — your friend completed their first order",
             idempotency_key=idem_key,
             metadata={
@@ -489,7 +489,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=net_amount,
-            transaction_type=TransactionType.CREDIT,
+            transaction_type=TransactionTypeEnum.CREDIT,
             description=description,
             idempotency_key=idempotency_key,
             external_reference=reference,
@@ -567,7 +567,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.DEBIT,
+            transaction_type=TransactionTypeEnum.DEBIT,
             description=description or "Withdrawal to bank account",
             idempotency_key=idem_key,
             metadata={
@@ -604,7 +604,7 @@ class WalletService:
                 db,
                 wallet_id=wallet.id,
                 amount=amount_ngn,
-                transaction_type=TransactionType.REFUND,
+                transaction_type=TransactionTypeEnum.REFUND,
                 description=f"Withdrawal reversal — transfer failed",
                 idempotency_key=reversal_key,
             )
@@ -645,7 +645,7 @@ class WalletService:
             db,
             wallet_id=wallet.id,
             amount=delivery_fee,
-            transaction_type=TransactionType.CREDIT,
+            transaction_type=TransactionTypeEnum.CREDIT,
             description=description,
             idempotency_key=idem_key,
             metadata={"delivery_id": str(delivery_id)},
@@ -701,7 +701,7 @@ class WalletService:
             db,
             wallet_id=sender_wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.DEBIT,
+            transaction_type=TransactionTypeEnum.DEBIT,
             description=f"Transfer to {recipient_wallet_number}: {description}",
             idempotency_key=debit_key,
             metadata={
@@ -713,7 +713,7 @@ class WalletService:
             db,
             wallet_id=recipient_wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.CREDIT,
+            transaction_type=TransactionTypeEnum.CREDIT,
             description=f"Transfer from {sender_wallet.wallet_number}: {description}",
             idempotency_key=credit_key,
             metadata={
@@ -764,8 +764,8 @@ class WalletService:
         result = await db.execute(
             select(func.sum(WalletTransaction.amount)).where(
                 WalletTransaction.wallet_id == wallet_id,
-                WalletTransaction.transaction_type == TransactionType.TOP_UP,
-                WalletTransaction.status == TransactionStatus.COMPLETED,
+                WalletTransaction.transaction_type == TransactionTypeEnum.TOP_UP,
+                WalletTransaction.status == TransactionStatusEnum.COMPLETED,
                 WalletTransaction.created_at >= today_start,
             )
         )
@@ -789,8 +789,8 @@ class WalletService:
         result = await db.execute(
             select(func.sum(WalletTransaction.amount)).where(
                 WalletTransaction.wallet_id == wallet.id,
-                WalletTransaction.transaction_type == TransactionType.DEBIT,
-                WalletTransaction.status == TransactionStatus.COMPLETED,
+                WalletTransaction.transaction_type == TransactionTypeEnum.DEBIT,
+                WalletTransaction.status == TransactionStatusEnum.COMPLETED,
                 WalletTransaction.created_at >= today_start,
             )
         )

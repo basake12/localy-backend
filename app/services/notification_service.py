@@ -109,10 +109,10 @@ class NotificationService:
                     )
 
             elif channel == NotificationChannelEnum.SMS:
-                if user.phone:
+                if user.phone_number:
                     dispatch_sms_task.delay(
                         notification_id=str(notif.id),
-                        phone=user.phone,
+                        phone=user.phone_number,
                         body=payload.body,
                     )
 

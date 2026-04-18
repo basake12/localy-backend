@@ -1,38 +1,31 @@
 """
 app/api/v1/products.py
 
-FIXES vs previous version:
-  1.  [HARD RULE §2] FREE PLAN 20-PRODUCT LIMIT ENFORCED at POST /
-      BEFORE any DB write.
+FIXES:
+  [AUDIT BUG-2] _build_wishlist_item_dict(): p.base_price / p.sale_price /
+    p.vendor.store_name replaced with blueprint-aligned field p.price.
+    Root cause: blueprint-aligned Product model has single price field.
+    p.base_price and p.sale_price no longer exist — AttributeError crash
+    on every wishlist endpoint.
 
-      Blueprint §2 / §6.4 full implementation:
-        - Check: SELECT COUNT(*) FROM products
-                 WHERE business_id = :bid
-                   AND is_deleted = FALSE AND is_archived = FALSE
-        - If count >= 20 AND tier == 'free' AND no admin override:
-            HTTP 403 with exact body:
-            {
-              "error": "product_limit_reached",
-              "message": "Free plan allows up to 20 active product listings.",
-              "upgrade_url": "/plans/upgrade",
-              "current_count": N,
-              "limit": 20
-            }
-        - Admin override: business.product_limit_override = TRUE
-                          business.product_limit_override_value = N
-        - Starter / Pro / Enterprise: unlimited (not checked)
-        - Archived / deleted products do NOT count toward the limit
+  [AUDIT BUG-3] _assert_owns_product() / _get_vendor_or_404():
+    Ownership check now uses product.business_id vs business.id.
+    Root cause: Product's primary ownership FK is business_id (Blueprint §14).
+    vendor_id is an optional supplementary FK for store branding only.
+    Checking vendor_id silently blocked ownership for products where vendor_id
+    is NULL (any product created without a vendor profile).
 
-  2.  Soft delete now sets is_deleted = True (not just is_active = False).
-      Blueprint §2: "Archived/deleted products do NOT count toward the limit."
-      is_deleted = True correctly excludes the product from the limit query.
+  [AUDIT BUG-4] create_product: Depends(require_business) →
+    Depends(require_verified_business).
+    Root cause: Blueprint §6.4 IMPLEMENTATION SPEC explicitly states:
+      "Dependencies: [get_current_business_user, require_verified_business]"
+    Unverified businesses (awaiting admin review) could create product listings,
+    bypassing the admin verification gate entirely.
 
-  3.  current_user.user_type → current_user.role.value × 2. Blueprint §14.
-
-  4.  current_user.phone → current_user.phone_number. Blueprint §14.
-
-  5.  product creation now sets business_id from business lookup in addition
-      to vendor_id. The free plan limit query uses business_id directly.
+EXISTING FIXES (from previous version, retained):
+  [HARD RULE §2] Free plan 20-product limit enforced BEFORE any DB write.
+  [HARD RULE §2] Soft delete sets is_deleted = True (not just is_active = False).
+  Blueprint §14 field names: role (not user_type), phone_number (not phone).
 """
 import re
 from typing import List, Optional
@@ -49,6 +42,7 @@ from app.dependencies import (
     get_pagination_params,
     require_business,
     require_customer,
+    require_verified_business,   # [BUG-4 FIX] — needed for create_product
 )
 from app.models.business_model import Business
 from app.models.products_model import Product
@@ -110,17 +104,43 @@ def _get_business_or_404(db: Session, user: User) -> Business:
     return business
 
 
+def _get_vendor_optional(db: Session, business: Business):
+    """
+    Return the ProductVendor for this business, or None.
+    [BUG-3 FIX] Vendor is supplementary — not required for ownership checks.
+    Business is the authoritative owner per Blueprint §14.
+    """
+    return product_vendor_crud.get_by_business_id(db, business_id=business.id)
+
+
 def _get_vendor_or_404(db: Session, user: User):
+    """
+    Get vendor for endpoints that specifically manage store branding.
+    For product ownership, use _get_business_or_404 + _assert_product_owned_by_business.
+    """
     business = _get_business_or_404(db, user)
     vendor = product_vendor_crud.get_by_business_id(db, business_id=business.id)
     if not vendor:
-        raise NotFoundException("Store not found. Create a store first.")
+        raise NotFoundException("Store profile not found. Create a store first.")
     return vendor
 
 
-def _assert_owns_product(vendor, product):
-    if product.vendor_id != vendor.id:
-        raise PermissionDeniedException("You don't own this product")
+def _assert_product_owned_by_business(business: Business, product: Product) -> None:
+    """
+    [BUG-3 FIX] Ownership check uses product.business_id, not product.vendor_id.
+
+    Root cause of original bug:
+      _assert_owns_product(vendor, product) checked product.vendor_id != vendor.id.
+      - product.vendor_id is an optional FK (can be NULL for products without a store profile)
+      - NULL vendor_id caused PermissionDeniedException for ALL products created
+        before a store profile exists
+      - Blueprint §14: business_id is the primary ownership FK on products
+        ("products.business_id UUID NOT NULL REFERENCES businesses(id)")
+
+    Correct check: product.business_id must equal the authenticated business's id.
+    """
+    if product.business_id != business.id:
+        raise PermissionDeniedException("You don't own this product.")
 
 
 def _enum_val(v) -> str:
@@ -128,7 +148,24 @@ def _enum_val(v) -> str:
 
 
 def _build_wishlist_item_dict(wishlist_item) -> dict:
+    """
+    [BUG-2 FIX] Use p.price instead of p.base_price / p.sale_price.
+
+    Root cause:
+      Blueprint-aligned Product model (products_model.py) uses single field:
+        price NUMERIC(12,2) NOT NULL  — Blueprint §14
+      The old fields p.base_price and p.sale_price no longer exist on the ORM
+      object. Any call to this function crashed with:
+        AttributeError: 'Product' object has no attribute 'base_price'
+
+    Fix: Use p.price for both. Guard p.vendor safely (optional relationship).
+    """
     p = wishlist_item.product
+    # Guard: vendor is an optional relationship — may not be eagerly loaded
+    vendor_name = None
+    if hasattr(p, "vendor") and p.vendor is not None:
+        vendor_name = getattr(p.vendor, "store_name", None)
+
     return {
         "id":          wishlist_item.id,
         "product_id":  wishlist_item.product_id,
@@ -137,14 +174,14 @@ def _build_wishlist_item_dict(wishlist_item) -> dict:
             "id":             p.id,
             "name":           p.name,
             "category":       p.category,
-            "brand":          p.brand,
-            "base_price":     p.base_price,
-            "sale_price":     p.sale_price,
+            "brand":          getattr(p, "brand", None),
+            # [BUG-2 FIX]: blueprint-aligned Product uses single price field
+            "price":          p.price,
             "images":         p.images or [],
-            "average_rating": p.average_rating,
-            "in_stock":       p.stock_quantity > 0,
+            "average_rating": getattr(p, "average_rating", 0.0),
+            "in_stock":       (p.stock_quantity or 0) > 0,
             "vendor_id":      p.vendor_id,
-            "vendor_name":    p.vendor.store_name if p.vendor else None,
+            "vendor_name":    vendor_name,
         },
     }
 
@@ -173,9 +210,10 @@ def _enforce_free_plan_product_limit(db: Session, business: Business) -> None:
 
     Flutter must handle error code "product_limit_reached" and render
     UpgradePlanBottomSheet — NOT a generic error snackbar.
+    Blueprint §6.4 / §P07.
     """
-    # Only enforce on Free plan
-    tier = business.subscription_tier
+    # Only enforce on Free plan — all other plans are unlimited
+    tier     = business.subscription_tier
     tier_val = tier.value if hasattr(tier, "value") else str(tier or "free")
     if tier_val != "free":
         return
@@ -187,10 +225,10 @@ def _enforce_free_plan_product_limit(db: Session, business: Business) -> None:
         if override_val is not None:
             limit = int(override_val)
         else:
-            return  # Override enabled with no value = unlimited
+            return  # Override enabled with no value = unlimited for this business
 
     # Count active (non-deleted, non-archived) products
-    # Blueprint §2 IMPLEMENTATION SPEC — exact query:
+    # Blueprint §6.4 IMPLEMENTATION SPEC — exact query per blueprint:
     #   SELECT COUNT(*) FROM products
     #   WHERE business_id = :bid AND is_deleted = FALSE AND is_archived = FALSE
     active_count: int = db.execute(
@@ -205,16 +243,16 @@ def _enforce_free_plan_product_limit(db: Session, business: Business) -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
-                "error":        "product_limit_reached",
-                "message":      "Free plan allows up to 20 active product listings.",
-                "upgrade_url":  "/plans/upgrade",
+                "error":         "product_limit_reached",
+                "message":       "Free plan allows up to 20 active product listings.",
+                "upgrade_url":   "/plans/upgrade",
                 "current_count": active_count,
                 "limit":         limit,
             },
         )
 
 
-# ─── STATIC PATHS ─────────────────────────────────────────────────────────────
+# ─── STATIC PATHS (must be declared before parameterised paths) ───────────────
 
 @router.get("/categories/list", response_model=SuccessResponse[List[str]])
 def get_categories(*, db: Session = Depends(get_db)) -> dict:
@@ -260,6 +298,7 @@ def search_products(
         max_price=search_params.max_price,
         in_stock_only=search_params.in_stock_only,
         location=location,
+        # Blueprint §4.1: default 5 km radius
         radius_km=search_params.radius_km or 5.0,
         sort_by=search_params.sort_by or "created_at",
         skip=pagination["skip"],
@@ -268,7 +307,7 @@ def search_products(
     return {"success": True, "data": results}
 
 
-# ─── Vendor ───────────────────────────────────────────────────────────────────
+# ─── Vendor (Store Profile) ───────────────────────────────────────────────────
 
 @router.get("/vendors/my", response_model=SuccessResponse[VendorResponse])
 def get_my_vendor(
@@ -287,11 +326,11 @@ def create_vendor(
 ) -> dict:
     business = _get_business_or_404(db, current_user)
     if business.category != "products":
-        raise ValidationException("Only products category businesses can create stores")
+        raise ValidationException("Only businesses in the 'products' category can create store profiles.")
 
     existing = product_vendor_crud.get_by_business_id(db, business_id=business.id)
     if existing:
-        raise ValidationException("Store already exists for this business")
+        raise ValidationException("Store profile already exists for this business.")
 
     vendor_data = vendor_in.model_dump()
     vendor_data["business_id"] = business.id
@@ -311,13 +350,31 @@ def update_my_vendor(
     return {"success": True, "data": vendor}
 
 
+@router.get("/analytics/summary", response_model=SuccessResponse[VendorAnalyticsSummary])
+def get_analytics_summary(
+    *, db: Session = Depends(get_db),
+    current_user: User = Depends(require_business),
+) -> dict:
+    vendor = _get_vendor_or_404(db, current_user)
+    analytics = product_crud.get_vendor_analytics(db, vendor_id=vendor.id)
+    return {"success": True, "data": analytics}
+
+
 # ─── Products ─────────────────────────────────────────────────────────────────
 
-@router.post("/", response_model=SuccessResponse[ProductResponse], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=SuccessResponse[ProductResponse],
+    status_code=status.HTTP_201_CREATED,
+)
 def create_product(
-    *, db: Session = Depends(get_db),
-    product_in: ProductCreateRequest,
-    current_user: User = Depends(require_business),
+    *,
+    db:           Session = Depends(get_db),
+    product_in:   ProductCreateRequest,
+    # [BUG-4 FIX] require_verified_business — Blueprint §6.4 IMPLEMENTATION SPEC:
+    # "Dependencies: [get_current_business_user, require_verified_business]"
+    # Unverified businesses must not be able to create product listings.
+    current_user: User    = Depends(require_verified_business),
 ) -> dict:
     """
     Create a new product listing.
@@ -327,46 +384,63 @@ def create_product(
     products. Returns HTTP 403 with error code "product_limit_reached" if exceeded.
     Admin override via business.product_limit_override.
     Starter / Pro / Enterprise: unlimited.
+
+    Blueprint §6.4 IMPLEMENTATION SPEC:
+      Dependencies: [get_current_business_user, require_verified_business]
     """
-    vendor = _get_vendor_or_404(db, current_user)
     business = _get_business_or_404(db, current_user)
 
     # ── [HARD RULE §2] Enforce free plan limit BEFORE any DB write ────────────
     _enforce_free_plan_product_limit(db, business)
 
     product_data = product_in.model_dump()
-    product_data["vendor_id"]   = vendor.id
-    # Blueprint §14: business_id is the primary FK for limit queries
+    # Blueprint §14: business_id is the primary FK for all blueprint operations
     product_data["business_id"] = business.id
+
+    # Optionally link to vendor store profile if one exists
+    vendor = _get_vendor_optional(db, business)
+    if vendor:
+        product_data["vendor_id"] = vendor.id
 
     slug_base = re.sub(r"[^\w\s-]", "", product_data["name"].lower())
     slug_base = re.sub(r"[-\s]+", "-", slug_base)
     product_data["slug"] = f"{slug_base}-{str(uuid4())[:8]}"
 
+    # SKU restore path: if archived product with same SKU exists, restore it
+    # Note: _enforce_free_plan_product_limit was already called above.
+    # Restoring an archived product that was previously active is safe because:
+    #   - archived products don't count toward the 20-product limit
+    #   - restoring returns count back to what it was when the product was archived
     sku = product_data.get("sku")
     if sku:
         archived = db.query(Product).filter(
-            Product.sku       == sku,
-            Product.vendor_id == vendor.id,
-            Product.is_active == False,
+            Product.sku         == sku,
+            Product.business_id == business.id,
+            Product.is_active   == False,
+            Product.is_archived == True,
         ).first()
         if archived:
             for k, v in product_data.items():
                 setattr(archived, k, v)
             archived.is_active  = True
-            archived.is_deleted = False   # restore from soft-delete
+            archived.is_deleted  = False
+            archived.is_archived = False
             db.commit()
             db.refresh(archived)
             return {"success": True, "data": archived}
 
     try:
         product = product_crud.create_from_dict(db, obj_in=product_data)
-        vendor.total_products += 1
+        if vendor:
+            vendor.total_products += 1
         db.commit()
     except IntegrityError as e:
         db.rollback()
-        if "ix_products_sku" in str(e):
-            raise HTTPException(status_code=400, detail="A product with this SKU already exists.")
+        if "ix_products_sku" in str(e) or "unique" in str(e).lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A product with this SKU already exists.",
+            )
         raise
 
     return {"success": True, "data": product}
@@ -379,10 +453,16 @@ def get_my_products(
     pagination: dict = Depends(get_pagination_params),
     active_only: bool = Query(True),
 ) -> dict:
-    vendor = _get_vendor_or_404(db, current_user)
-    products = product_crud.get_by_vendor(
-        db, vendor_id=vendor.id,
-        skip=pagination["skip"], limit=pagination["limit"],
+    """
+    [BUG-3 FIX] Now queries by business_id, not vendor_id.
+    Businesses without a vendor store profile can still manage products.
+    """
+    business = _get_business_or_404(db, current_user)
+    products = product_crud.get_by_business(
+        db,
+        business_id=business.id,
+        skip=pagination["skip"],
+        limit=pagination["limit"],
         active_only=active_only,
     )
     return {"success": True, "data": products}
@@ -393,19 +473,9 @@ def get_low_stock(
     *, db: Session = Depends(get_db),
     current_user: User = Depends(require_business),
 ) -> dict:
-    vendor = _get_vendor_or_404(db, current_user)
-    products = product_crud.get_low_stock(db, vendor_id=vendor.id)
+    business = _get_business_or_404(db, current_user)
+    products = product_crud.get_low_stock(db, business_id=business.id)
     return {"success": True, "data": products}
-
-
-@router.get("/analytics/summary", response_model=SuccessResponse[VendorAnalyticsSummary])
-def get_analytics_summary(
-    *, db: Session = Depends(get_db),
-    current_user: User = Depends(require_business),
-) -> dict:
-    vendor = _get_vendor_or_404(db, current_user)
-    analytics = product_crud.get_vendor_analytics(db, vendor_id=vendor.id)
-    return {"success": True, "data": analytics}
 
 
 # ─── Cart ─────────────────────────────────────────────────────────────────────
@@ -436,7 +506,7 @@ def add_to_cart(
     if not product or not product.is_active:
         raise NotFoundException("Product")
 
-    active_variants = [v for v in product.variants if v.is_active]
+    active_variants = [v for v in (product.variant_rows or []) if v.is_active]
     if active_variants and not cart_item_in.variant_id:
         raise ValidationException(
             f"This product has variants. Please select one. "
@@ -448,7 +518,7 @@ def add_to_cart(
         variant_id=cart_item_in.variant_id,
         quantity=cart_item_in.quantity,
     ):
-        raise ValidationException("Insufficient stock")
+        raise ValidationException("Insufficient stock for the requested quantity.")
 
     raw_item = cart_crud.add_to_cart(
         db,
@@ -492,7 +562,7 @@ def update_cart_item(
         variant_id=cart_item.variant_id,
         quantity=update_data.quantity,
     ):
-        raise ValidationException("Insufficient stock")
+        raise ValidationException("Insufficient stock for the requested quantity.")
 
     cart_crud.update_quantity(db, cart_item_id=cart_item_id, quantity=update_data.quantity)
     item = cart_crud.get_cart_item_with_relations(db, cart_item_id=cart_item_id)
@@ -514,7 +584,7 @@ def remove_from_cart(
     if cart_item.customer_id != current_user.id:
         raise PermissionDeniedException()
     cart_crud.delete(db, id=cart_item_id)
-    return {"success": True, "data": {"message": "Item removed"}}
+    return {"success": True, "data": {"message": "Item removed from cart"}}
 
 
 # ─── Wishlist ─────────────────────────────────────────────────────────────────
@@ -525,6 +595,7 @@ def get_wishlist(
     current_user: User = Depends(require_customer),
 ) -> dict:
     items      = wishlist_crud.get_by_customer(db, customer_id=current_user.id)
+    # [BUG-2 FIX] _build_wishlist_item_dict now uses p.price, not p.base_price
     serialized = [_build_wishlist_item_dict(w) for w in items]
     return {"success": True, "data": {"items": serialized, "total": len(serialized)}}
 
@@ -578,11 +649,11 @@ def create_order(
 
     if not recipient_name:
         raise ValidationException(
-            "recipient_name could not be resolved. Add your name to your profile."
+            "recipient_name is required. Add your name to your profile."
         )
     if not recipient_phone:
         raise ValidationException(
-            "recipient_phone could not be resolved. Add your phone to your profile."
+            "recipient_phone is required. Add your phone number to your profile."
         )
 
     items = [item.model_dump() for item in order_in.items]
@@ -632,12 +703,18 @@ def get_vendor_orders(
     pagination: dict = Depends(get_pagination_params),
     order_status: Optional[str] = Query(None),
 ) -> dict:
+    """
+    [BUG-3 FIX] Uses business_id for order lookup.
+    Businesses without a vendor profile can still view their orders.
+    """
+    business = _get_business_or_404(db, current_user)
     normalised_status = order_status.lower().strip() if order_status else None
-    vendor = _get_vendor_or_404(db, current_user)
-    orders = product_order_crud.get_vendor_orders(
-        db, vendor_id=vendor.id,
+    orders = product_order_crud.get_business_orders(
+        db,
+        business_id=business.id,
         status=normalised_status,
-        skip=pagination["skip"], limit=pagination["limit"],
+        skip=pagination["skip"],
+        limit=pagination["limit"],
     )
     return {"success": True, "data": orders}
 
@@ -673,8 +750,9 @@ def get_order_details(
         if order.customer_id != current_user.id:
             raise PermissionDeniedException()
     elif role_val == "business":
-        vendor = _get_vendor_or_404(db, current_user)
-        if not any(item.vendor_id == vendor.id for item in order.items):
+        # [BUG-3 FIX] Check via business_id, not vendor_id
+        business = _get_business_or_404(db, current_user)
+        if not any(item.product and item.product.business_id == business.id for item in order.items):
             raise PermissionDeniedException()
 
     return {"success": True, "data": order}
@@ -691,8 +769,9 @@ def update_order_status(
     if not order:
         raise NotFoundException("Order")
 
-    vendor = _get_vendor_or_404(db, current_user)
-    if not any(item.vendor_id == vendor.id for item in order.items):
+    # [BUG-3 FIX] Verify business owns at least one item in this order
+    business = _get_business_or_404(db, current_user)
+    if not any(item.product and item.product.business_id == business.id for item in order.items):
         raise PermissionDeniedException()
 
     order = product_order_crud.update_order_status(
@@ -738,7 +817,7 @@ def request_return(
     return {"success": True, "data": return_record}
 
 
-# ─── PARAMETERISED PATHS — must come last ─────────────────────────────────────
+# ─── PARAMETERISED PATHS — must come LAST (after all static path segments) ────
 
 @router.patch("/{product_id}", response_model=SuccessResponse[ProductResponse])
 def update_product(
@@ -750,8 +829,10 @@ def update_product(
     product = product_crud.get(db, id=product_id)
     if not product:
         raise NotFoundException("Product")
-    vendor = _get_vendor_or_404(db, current_user)
-    _assert_owns_product(vendor, product)
+
+    # [BUG-3 FIX] Ownership check via business_id
+    business = _get_business_or_404(db, current_user)
+    _assert_product_owned_by_business(business, product)
 
     update_data = product_in.model_dump(exclude_unset=True)
     product = product_crud.update(db, db_obj=product, obj_in=update_data)
@@ -768,8 +849,10 @@ def update_inventory(
     product = product_crud.get(db, id=product_id)
     if not product:
         raise NotFoundException("Product")
-    vendor = _get_vendor_or_404(db, current_user)
-    _assert_owns_product(vendor, product)
+
+    # [BUG-3 FIX] Ownership check via business_id
+    business = _get_business_or_404(db, current_user)
+    _assert_product_owned_by_business(business, product)
 
     product = product_crud.update(
         db, db_obj=product, obj_in=inventory_in.model_dump(exclude_unset=True)
@@ -786,13 +869,16 @@ def delete_product(
     """
     Soft-delete product.
     Blueprint §2: "Archived/deleted products do NOT count toward the limit."
-    Sets is_deleted = True so the product is excluded from limit queries.
+    Sets is_deleted = True so the product is EXCLUDED from limit queries:
+      WHERE business_id = :bid AND is_deleted = FALSE AND is_archived = FALSE
     """
     product = product_crud.get(db, id=product_id)
     if not product:
         raise NotFoundException("Product")
-    vendor = _get_vendor_or_404(db, current_user)
-    _assert_owns_product(vendor, product)
+
+    # [BUG-3 FIX] Ownership check via business_id
+    business = _get_business_or_404(db, current_user)
+    _assert_product_owned_by_business(business, product)
 
     # Blueprint §2: is_deleted = True excludes from limit count
     product.is_active  = False
@@ -811,8 +897,10 @@ def create_variant(
     product = product_crud.get(db, id=product_id)
     if not product:
         raise NotFoundException("Product")
-    vendor = _get_vendor_or_404(db, current_user)
-    _assert_owns_product(vendor, product)
+
+    # [BUG-3 FIX] Ownership check via business_id
+    business = _get_business_or_404(db, current_user)
+    _assert_product_owned_by_business(business, product)
 
     duplicate = product_variant_crud.get_by_attributes(
         db, product_id=product_id, attributes=variant_in.attributes
@@ -846,9 +934,13 @@ def update_variant(
     variant = product_variant_crud.get(db, id=variant_id)
     if not variant:
         raise NotFoundException("Variant")
-    vendor = _get_vendor_or_404(db, current_user)
-    product = product_crud.get(db, id=variant.product_id)
-    _assert_owns_product(vendor, product)
+
+    # [BUG-3 FIX] Ownership check via business_id
+    business = _get_business_or_404(db, current_user)
+    product  = product_crud.get(db, id=variant.product_id)
+    if not product:
+        raise NotFoundException("Product")
+    _assert_product_owned_by_business(business, product)
 
     if variant_in.attributes is not None:
         duplicate = product_variant_crud.get_by_attributes(
@@ -874,9 +966,13 @@ def delete_variant(
     variant = product_variant_crud.get(db, id=variant_id)
     if not variant:
         raise NotFoundException("Variant")
-    vendor = _get_vendor_or_404(db, current_user)
-    product = product_crud.get(db, id=variant.product_id)
-    _assert_owns_product(vendor, product)
+
+    # [BUG-3 FIX] Ownership check via business_id
+    business = _get_business_or_404(db, current_user)
+    product  = product_crud.get(db, id=variant.product_id)
+    if not product:
+        raise NotFoundException("Product")
+    _assert_product_owned_by_business(business, product)
 
     variant.is_active = False
     db.commit()

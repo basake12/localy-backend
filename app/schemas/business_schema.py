@@ -4,7 +4,16 @@ from uuid import UUID
 from datetime import datetime, time
 from decimal import Decimal
 
-from app.models.business_model import BusinessCategoryEnum, VerificationBadgeEnum
+from app.models.business_model import BusinessCategoryEnum
+
+import enum
+
+class VerificationBadgeEnum(str, enum.Enum):
+    """Verification badge level for business profiles."""
+    NONE       = "none"
+    VERIFIED   = "verified"
+    PREMIUM    = "premium"
+
 
 
 # ─── Business Hours ────────────────────────────────────────────────────────

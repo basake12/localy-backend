@@ -62,8 +62,8 @@ from app.models.user_model import User
 from app.models.wallet_model import (
     Wallet,
     WalletTransaction,
-    TransactionType,
-    TransactionStatus,
+    TransactionTypeEnum,
+    TransactionStatusEnum,
     generate_wallet_number,
 )
 from app.schemas.common_schema import SuccessResponse
@@ -143,11 +143,11 @@ async def _debit_wallet_async(
 
     txn = WalletTransaction(
         wallet_id=wallet.id,
-        transaction_type=TransactionType.PAYMENT,
+        transaction_type=TransactionTypeEnum.PAYMENT,
         amount=amount,
         balance_before=balance_before,
         balance_after=wallet.balance,
-        status=TransactionStatus.COMPLETED,
+        status=TransactionStatusEnum.COMPLETED,
         description=description,
         external_reference=external_reference,  # Blueprint §14
         idempotency_key=_idem(),                # Blueprint §5.6 HARD RULE
@@ -171,11 +171,11 @@ async def _credit_wallet_async(
 
     txn = WalletTransaction(
         wallet_id=wallet.id,
-        transaction_type=TransactionType.CREDIT,
+        transaction_type=TransactionTypeEnum.CREDIT,
         amount=amount,
         balance_before=balance_before,
         balance_after=wallet.balance,
-        status=TransactionStatus.COMPLETED,
+        status=TransactionStatusEnum.COMPLETED,
         description=description,
         external_reference=external_reference,  # Blueprint §14
         idempotency_key=_idem(),                # Blueprint §5.6 HARD RULE
@@ -319,8 +319,8 @@ async def purchase_tickets(
     seat_hold_key = f"seat_hold:{event_id}:{tier_id}"
     redis = None
     try:
-        from app.core.redis import get_async_redis_client
-        redis = await get_async_redis_client()
+        from app.core.cache import get_async_redis
+        redis = await get_async_redis()
         hold = await redis.set(
             seat_hold_key, str(current_user.id), nx=True, ex=600
         )

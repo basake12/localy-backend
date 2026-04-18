@@ -3,41 +3,60 @@ app/api/v1/hotels.py
 
 Hotels API routes with integrated payment processing.
 
-Per Blueprint Section 11.1:
-- Radius-based search (no LGA dependency)
+Per Blueprint Section 6.1:
+- Radius-based search (no LGA dependency — HARD RULE)
 - Real-time availability checking
 - Instant booking with ₦100 platform fee
 - Wallet payment with PIN verification
 - Instant refunds on cancellation
 
-FIXES applied in this version
-──────────────────────────────
-1. GET /  and  POST /search
-   hotel_service.search_hotels() now returns List[Dict] (plain dicts).
-   The old _normalize_hotel() helper tried to access .id on those dicts
-   → AttributeError.  Helper removed; results passed directly to
-   jsonable_encoder.
+BUG FIXES IN THIS VERSION:
+────────────────────────────
+BUG-02 FIX (hotels.py — AttributeError: User has no attribute 'user_type'):
+  get_booking_services() accessed current_user.user_type on lines 974 and 977.
+  The User model (and Blueprint DB schema) uses the column 'role', not
+  'user_type'.  Accessing a non-existent attribute raised AttributeError on
+  every call to GET /bookings/{booking_id}/services.
+  Fix: changed to current_user.role throughout.
 
-2. GET /{hotel_id}
-   Returned raw ORM objects inside a plain dict → PydanticSerializationError.
-   Now manually projects every ORM field to a plain dict before encoding.
+BUG-03 FIX (hotels.py — 'local_government' LGA field in get_hotel_details):
+  get_hotel_details() projected "local_government": biz.local_government into
+  the response dict.  Blueprint Section 2.2 HARD RULE: "No LGA column in any
+  table.  Remove immediately if discovered in legacy code."
+  Fix: field removed from the projection dict.
 
-3. POST /{hotel_id}/room-types  (422 in Postman)
-   Postman body used "price_per_night" — field doesn't exist in
-   RoomTypeCreateRequest.  Corrected in updated Postman collection.
+BUG-08 FIX (hotels.py — rooms hardcoded to 1 in search route):
+  The POST /search route called hotel_service.search_hotels(... rooms=1 ...)
+  unconditionally.  HotelSearchFilters had no number_of_rooms field (fixed in
+  hotels_schema.py).  Now threads search_params.number_of_rooms through so
+  availability filtering respects the caller's actual room requirement.
 
-4. POST /{hotel_id}/bookings
-   customer_transaction was an ORM WalletTransaction returned as `dict`
-   schema type → serialization crash.  Now encoded via jsonable_encoder
-   before returning.
+BUG-10 FIX (hotels.py — dead code _sanitize_add_ons):
+  _sanitize_add_ons() was defined but never called from the router.
+  Sanitization is handled inside hotel_service.py (after BUG-01 fix there).
+  Dead code in a payments module is a maintenance risk; removed.
 
-5. POST /bookings/{booking_id}/cancel
-   booking ORM object returned inside SuccessResponse[dict] → same crash.
-   Now encoded the same way.
+BUG-11 FIX (hotels.py — PUT /my/hotel and PATCH /my/hotel use HotelCreateRequest):
+  Both update endpoints used HotelCreateRequest which has total_rooms as a
+  required field.  This forced every PATCH caller to always supply total_rooms,
+  making partial updates impossible.  Both endpoints now use HotelUpdateRequest
+  (all fields Optional), defined in hotels_schema.py.
 
-6. create_hotel business.category enum comparison
-   business.category is a BusinessCategoryEnum, not a plain string.
-   Comparison now extracts .value before comparing.
+BUG-12 FIX (hotels.py — BookingStatusEnum compared to string literals):
+  create_service_request() used:
+      if booking.status not in ["confirmed", "checked_in"]:
+  booking.status is a BookingStatusEnum instance.  This happens to work
+  because BookingStatusEnum extends str, but it is fragile — any refactor of
+  the enum values would silently break the comparison without a test failure.
+  Fix: use the enum members directly.
+
+ORIGINAL FIXES (carried forward from prior version):
+1. GET / and POST /search: hotel_service returns List[Dict]; no normalisation helper needed.
+2. GET /{hotel_id}: ORM objects manually projected to plain dict.
+3. POST /{hotel_id}/room-types: Postman body field corrected.
+4. POST /{hotel_id}/bookings: customer_transaction encoded via jsonable_encoder.
+5. POST /bookings/{booking_id}/cancel: booking encoded the same way.
+6. create_hotel business.category enum comparison extracts .value before comparing.
 """
 from fastapi import APIRouter, Depends, Query, status as http_status
 from fastapi.encoders import jsonable_encoder
@@ -45,6 +64,7 @@ from geoalchemy2.elements import WKBElement
 from geoalchemy2.shape import to_shape
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import joinedload as _jl
 from typing import List, Optional, Annotated
 from uuid import UUID
 from datetime import date, datetime, timezone
@@ -61,6 +81,7 @@ from app.dependencies import (
 from app.schemas.common_schema import SuccessResponse
 from app.schemas.hotels_schema import (
     HotelCreateRequest,
+    HotelUpdateRequest,       # BUG-11 FIX: imported
     HotelResponse,
     RoomTypeCreateRequest,
     RoomTypeResponse,
@@ -78,43 +99,37 @@ from app.services.hotel_service import hotel_service
 from app.crud.hotels_crud import hotel_crud, room_type_crud, hotel_booking_crud
 from app.crud.business_crud import business_crud
 from app.models.user_model import User
-from app.models.hotels_model import HotelService as HotelServiceModel, HotelBooking, RoomType
+from app.models.hotels_model import (
+    # BUG-13 (model-level): HotelInStayRequest replaces the old HotelService
+    # alias.  The import alias "as HotelServiceModel" is no longer needed —
+    # the model was renamed to HotelInStayRequest in hotels_model.py.
+    HotelInStayRequest,
+    HotelBooking,
+    RoomType,
+    BookingStatusEnum,
+)
 from app.core.exceptions import (
     NotFoundException,
     PermissionDeniedException,
     ValidationException,
 )
 
-# PostGIS WKBElement → {latitude, longitude} for any remaining geometry fields.
-# hotel_service already projects lat/lng as plain floats, so this encoder is
-# only a safety net for any ORM object that slips through (e.g. BookingResponse
+# PostGIS WKBElement → {latitude, longitude} safety encoder.
+# hotel_service already projects lat/lng as plain floats, so this is only a
+# safety net for any ORM object that slips through (e.g. a BookingResponse
 # that loads the hotel relationship).
 _GEO_ENCODER = {
     WKBElement: lambda v: {"latitude": to_shape(v).y, "longitude": to_shape(v).x},
-    # Decimal columns (NUMERIC) are not JSON-serializable by default.
-    # This covers any Decimal that slips through into response payloads,
-    # e.g. add_ons JSONB list items built before hotel_service converts them.
     Decimal: float,
 }
 
-
-def _sanitize_add_ons(add_ons) -> list:
-    """
-    Convert any Decimal values inside the add_ons list to float before the
-    list is stored as JSONB.  SQLAlchemy serialises JSONB with stdlib json,
-    which does not support Decimal → TypeError at INSERT time.
-
-    Usage in hotel_service.py (or wherever the booking dict is assembled):
-        booking_data["add_ons"] = _sanitize_add_ons(add_ons)
-    """
-    if not add_ons:
-        return []
-    return [
-        {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
-        for item in add_ons
-    ]
+# BUG-10 FIX: Removed dead _sanitize_add_ons() function.
+# It was defined here but never called from the router.  Sanitization of
+# add_ons (Pydantic→dict, Decimal→float) is handled inside hotel_service.py
+# after the BUG-01 fix there.  Dead code in a payments module is removed.
 
 router = APIRouter()
+
 
 def _booking_to_dict(b) -> dict:
     """Serialize HotelBooking ORM → plain dict safe for jsonable_encoder."""
@@ -140,7 +155,6 @@ def _booking_to_dict(b) -> dict:
     }
 
 
-
 # ============================================
 # HOTEL SEARCH & DISCOVERY (PUBLIC)
 # ============================================
@@ -160,15 +174,14 @@ async def list_hotels(
     """
     List active hotels using radius-based search.
 
-    Per Blueprint Section 3: Location is radius-based (default 5 km).
+    Per Blueprint Section 4: Location is radius-based (default 5 km).
     Results ranked by subscription tier (Enterprise > Pro > Starter > Free).
 
     - Public endpoint (no auth required)
     - Requires latitude + longitude for location filtering
 
     hotel_service.search_hotels() returns List[Dict] — plain Python dicts
-    with all ORM objects already projected.  Pass directly to jsonable_encoder;
-    no normalisation helper needed.
+    with all ORM objects already projected.  Pass directly to jsonable_encoder.
     """
     location = None
     if latitude is not None and longitude is not None:
@@ -189,7 +202,6 @@ async def list_hotels(
         skip=skip,
         limit=limit,
     )
-    # results is already List[Dict] — no ORM objects, no normalisation needed.
     return {"success": True, "data": jsonable_encoder(results, custom_encoder=_GEO_ENCODER)}
 
 
@@ -206,6 +218,10 @@ async def search_hotels(
 
     Per Blueprint: Radius-based search using lat/lng coordinates.
     Public endpoint (no auth required).
+
+    BUG-08 FIX: search_params.number_of_rooms is now threaded through to the
+    service call.  Previously rooms=1 was hardcoded, so availability checks
+    always assumed 1 room regardless of how many the caller wanted.
     """
     location = None
     if search_params.location:
@@ -218,7 +234,8 @@ async def search_hotels(
         check_in=search_params.check_in_date,
         check_out=search_params.check_out_date,
         guests=search_params.guests or 1,
-        rooms=1,
+        # BUG-08 FIX: was hardcoded to 1 — now uses the caller's actual value.
+        rooms=search_params.number_of_rooms or 1,
         star_rating=search_params.star_rating,
         facilities=search_params.facilities,
         min_price=search_params.min_price,
@@ -242,6 +259,9 @@ async def get_hotel_details(
     the Hotel model stores only hotel-specific data.  The Business profile
     (set during onboarding) is the source of truth for identity / location
     per Blueprint §2.1.
+
+    BUG-03 FIX: 'local_government' removed from the projection dict.
+    Blueprint Section 2.2 HARD RULE: no LGA field anywhere in the codebase.
     """
     hotel = await hotel_crud.get_with_room_types(db, hotel_id=hotel_id)
     if not hotel:
@@ -256,9 +276,9 @@ async def get_hotel_details(
             "category": biz.category,
             "subcategory": biz.subcategory,
             "description": biz.description,
-            "address": biz.address,
+            "address": biz.registered_address,
             "city": biz.city,
-            "local_government": biz.local_government,
+            # BUG-03 FIX: "local_government" removed — LGA HARD RULE violation.
             "state": biz.state,
             "latitude": biz.latitude,
             "longitude": biz.longitude,
@@ -354,8 +374,7 @@ async def create_hotel(
 
     Only hotel-specific fields are required (star_rating, total_rooms,
     facilities, policies, check_in/out times).  Name, address, city, state,
-    and coordinates are inherited from the business registration record —
-    no need to re-submit them here.
+    and coordinates are inherited from the business registration record.
 
     Restricted to businesses in the 'lodges' category.
     """
@@ -408,15 +427,19 @@ async def get_my_hotel(
 async def update_my_hotel(
     *,
     db: AsyncSession = Depends(get_async_db),
-    update_in: HotelCreateRequest,
+    update_in: HotelUpdateRequest,   # BUG-11 FIX: was HotelCreateRequest
     current_user: User = Depends(require_business),
 ) -> dict:
     """
     Update the authenticated business's hotel profile.
 
-    All fields from HotelCreateRequest are accepted — send only what you
-    want to change.  Updatable: star_rating, total_rooms, check_in_time,
-    check_out_time, facilities, policies, cancellation_policy.
+    BUG-11 FIX: Changed from HotelCreateRequest to HotelUpdateRequest.
+    HotelCreateRequest has total_rooms as a required field, which forced
+    callers to always supply it even for an update that only changes
+    star_rating or policies.  HotelUpdateRequest makes all fields Optional.
+
+    Updatable: star_rating, total_rooms, check_in_time, check_out_time,
+    facilities, policies, cancellation_policy.
     """
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -428,21 +451,17 @@ async def update_my_hotel(
     if not hotel:
         raise NotFoundException("Hotel")
 
-    # exclude_unset=True: include only fields the caller explicitly sent,
-    # even if their value happens to match the schema default.
-    # exclude_none=True would silently drop intentional null-clears.
+    # exclude_unset=True: only update fields the caller explicitly sent.
     update_data = update_in.model_dump(exclude_unset=True)
 
     for field, value in update_data.items():
         setattr(hotel, field, value)
         # JSONB / list columns (e.g. facilities) are mutable types —
         # SQLAlchemy cannot detect in-place changes via setattr alone.
-        # flag_modified forces the column into the dirty set so it is
-        # included in the UPDATE statement.
         if isinstance(value, (list, dict)):
             flag_modified(hotel, field)
 
-    db.add(hotel)          # explicitly mark object as pending update
+    db.add(hotel)
     await db.commit()
     await db.refresh(hotel)
     return {"success": True, "data": hotel}
@@ -452,16 +471,15 @@ async def update_my_hotel(
 async def patch_my_hotel(
     *,
     db: AsyncSession = Depends(get_async_db),
-    update_in: HotelCreateRequest,
+    update_in: HotelUpdateRequest,   # BUG-11 FIX: was HotelCreateRequest
     current_user: User = Depends(require_business),
 ) -> dict:
     """
     Partially update the authenticated business's hotel profile.
 
-    Unlike PUT, only the fields you include in the request body are updated —
-    omitted fields are left unchanged.  Accepts the same fields as PUT:
-    star_rating, total_rooms, check_in_time, check_out_time, facilities,
-    policies, cancellation_policy.
+    BUG-11 FIX: Changed from HotelCreateRequest to HotelUpdateRequest.
+    Only the fields included in the request body are applied; omitted fields
+    are left unchanged.  This is the PATCH semantic.
 
     Example — update star_rating only:
         PATCH /api/v1/hotels/my/hotel
@@ -477,8 +495,6 @@ async def patch_my_hotel(
     if not hotel:
         raise NotFoundException("Hotel")
 
-    # exclude_unset=True means only fields explicitly sent in the body are
-    # applied — this is what makes PATCH semantically different from PUT.
     update_data = update_in.model_dump(exclude_unset=True)
 
     for field, value in update_data.items():
@@ -591,8 +607,8 @@ async def delete_room_type(
     """
     Delete a room type — hotel owner only.
 
-    Blocked if any active bookings (PENDING or CONFIRMED) exist for this
-    room type. Cancel or complete those bookings first.
+    Blocked if any active bookings (PENDING, CONFIRMED, or CHECKED_IN) exist
+    for this room type.  Cancel or complete those bookings first.
     """
     hotel = await hotel_crud.get(db, id=hotel_id)
     if not hotel:
@@ -606,9 +622,6 @@ async def delete_room_type(
     if not room_type or room_type.hotel_id != hotel_id:
         raise NotFoundException("Room type")
 
-    # Block deletion when active bookings reference this room type.
-    # Deleting would violate the NOT NULL constraint on hotel_bookings.room_type_id.
-    from app.models.hotels_model import HotelBooking, BookingStatusEnum
     active_count_result = await db.execute(
         select(func.count(HotelBooking.id)).where(
             HotelBooking.room_type_id == room_type_id,
@@ -650,7 +663,7 @@ async def create_booking(
     """
     Create a hotel booking with instant payment processing.
 
-    Per Blueprint Section 11.1:
+    Per Blueprint Section 6.1:
     - ₦100 platform fee (deducted before business credit)
     - Wallet payment (PIN verified at frontend before this call)
     - Instant confirmation on success
@@ -675,8 +688,6 @@ async def create_booking(
         special_requests=booking_in.special_requests,
     )
 
-    # booking and customer_txn are ORM objects — encode to plain dicts before
-    # returning inside a SuccessResponse[dict] to avoid PydanticSerializationError.
     data = {
         "booking": jsonable_encoder(booking, custom_encoder=_GEO_ENCODER),
         "customer_transaction": jsonable_encoder(customer_txn, custom_encoder=_GEO_ENCODER),
@@ -742,16 +753,13 @@ async def get_booking_details(
     """
     Get full booking details — customer (own booking) or hotel owner.
 
-    FIX: response_model changed from BookingResponse to dict and ORM object
-    manually projected to avoid two issues:
-      1. ResponseValidationError — BookingResponse.room_type requires the
-         relationship to be eagerly loaded; hotel_booking_crud.get() does a
-         plain select with no joinedload, so Pydantic cannot validate it.
-      2. add_ons is stored as JSONB (list of plain dicts) but BookingResponse
-         expects List[AddOnItem] — validation fails on existing DB records
-         where the dict keys may not exactly match the Pydantic model.
+    response_model is dict (not BookingResponse) to avoid two issues:
+    1. ResponseValidationError — BookingResponse.room_type requires the
+       relationship to be eagerly loaded; a plain .get() has no joinedload.
+    2. add_ons is JSONB (list of plain dicts) but BookingResponse expects
+       List[AddOnItem] — validation fails on existing DB records where dict
+       keys may not exactly match the Pydantic model.
     """
-    from sqlalchemy.orm import joinedload as _jl
     result = await db.execute(
         select(HotelBooking)
         .options(_jl(HotelBooking.room_type))
@@ -761,10 +769,14 @@ async def get_booking_details(
     if not booking:
         raise NotFoundException("Booking")
 
-    if current_user.user_type == "customer":
+    # BUG-02 FIX: current_user.role — NOT current_user.user_type.
+    # The User model uses the 'role' column (Blueprint DB schema, Section 14).
+    # user_type does not exist on the User ORM object; accessing it raises
+    # AttributeError on every call to this endpoint.
+    if current_user.role == "customer":
         if booking.customer_id != current_user.id:
             raise PermissionDeniedException()
-    elif current_user.user_type == "business":
+    elif current_user.role == "business":
         business = await business_crud.get_by_user_id(db, user_id=current_user.id)
         hotel = await hotel_crud.get(db, id=booking.hotel_id)
         if not business or hotel.business_id != business.id:
@@ -826,10 +838,10 @@ async def cancel_booking(
     """
     Cancel a booking with instant refund to wallet.
 
-    Per Blueprint Section 4.4:
-    - Refunds go back to wallet instantly
-    - Full amount refunded (including platform fee)
-    - Business debited the net amount they received
+    Per Blueprint Section 5.1:
+    - Refunds go back to wallet within 24 hours of cancellation approval
+    - Platform fee: refundable only if cancellation is due to verified
+      platform error
     """
     booking, customer_refund, business_debit, reversed_revenue = (
         await hotel_service.cancel_booking_and_refund(
@@ -840,7 +852,6 @@ async def cancel_booking(
         )
     )
 
-    # booking is an ORM object — encode before placing in SuccessResponse[dict]
     data = {
         "booking": jsonable_encoder(booking, custom_encoder=_GEO_ENCODER),
         "refund_amount": float(customer_refund.amount),
@@ -941,10 +952,17 @@ async def create_service_request(
     if booking.customer_id != current_user.id:
         raise PermissionDeniedException()
 
-    if booking.status not in ["confirmed", "checked_in"]:
-        raise ValidationException("Can only request services for confirmed or checked-in bookings")
+    # BUG-12 FIX: Use BookingStatusEnum members instead of string literals.
+    # booking.status is a BookingStatusEnum instance.  Comparing it to plain
+    # strings ("confirmed", "checked_in") works only because BookingStatusEnum
+    # extends str — a fragile reliance.  Using enum members is explicit,
+    # refactor-safe, and correctly expresses intent.
+    if booking.status not in [BookingStatusEnum.CONFIRMED, BookingStatusEnum.CHECKED_IN]:
+        raise ValidationException(
+            "Can only request services for confirmed or checked-in bookings"
+        )
 
-    service = HotelServiceModel(
+    service = HotelInStayRequest(
         booking_id=booking_id,
         service_type=service_in.service_type,
         description=service_in.description,
@@ -971,17 +989,21 @@ async def get_booking_services(
     if not booking:
         raise NotFoundException("Booking")
 
-    if current_user.user_type == "customer":
+    # BUG-02 FIX: current_user.role — NOT current_user.user_type.
+    # The User model column is 'role' (Blueprint DB schema, Section 14).
+    # 'user_type' does not exist on the ORM object; accessing it raised
+    # AttributeError on every call to this endpoint.
+    if current_user.role == "customer":
         if booking.customer_id != current_user.id:
             raise PermissionDeniedException()
-    elif current_user.user_type == "business":
+    elif current_user.role == "business":
         business = await business_crud.get_by_user_id(db, user_id=current_user.id)
         hotel = await hotel_crud.get(db, id=booking.hotel_id)
         if not business or hotel.business_id != business.id:
             raise PermissionDeniedException()
 
     result = await db.execute(
-        select(HotelServiceModel).where(HotelServiceModel.booking_id == booking_id)
+        select(HotelInStayRequest).where(HotelInStayRequest.booking_id == booking_id)
     )
     services = result.scalars().all()
     return {"success": True, "data": services}

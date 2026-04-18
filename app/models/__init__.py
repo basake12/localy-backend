@@ -6,11 +6,13 @@ Centralized SQLAlchemy model exports.
 CHANGES:
   - AdminUser replaces Admin (admin_users table is now separate from users)
   - UserAgreement added (Blueprint §14 / §3 step 8)
-  - UserRoleEnum replaces UserTypeEnum (no 'admin' in mobile role enum)
+  - UserRoleEnum replaces UserRoleEnum (no 'admin' in mobile role enum)
   - CouponRedemption replaces CouponUsage (renamed per Blueprint §9.2)
   - ReelView / ReelLike / ReelComment kept
   - StoryView.viewer_user_id field (renamed from viewer_id per Blueprint §14)
   - CryptoTopUp REMOVED — not in blueprint
+  - HotelService → HotelInStayRequest (BUG-13 FIX: naming collision with service layer)
+  - DriverSubscriptionPlan REMOVED — riders have no subscription plan (Blueprint §8.1)
 """
 
 from app.models.analytics_model import DailyAnalyticsSnapshot
@@ -87,7 +89,7 @@ from app.models.hotels_model import (
     BookingStatusEnum as HotelBookingStatusEnum,
     Hotel,
     HotelBooking,
-    HotelService,
+    HotelInStayRequest,          # was HotelService — BUG-13 FIX
     PaymentStatusEnum as HotelPaymentStatusEnum,
     Room,
     RoomStatusEnum,
@@ -154,7 +156,7 @@ from app.models.reviews_model import (
     ReviewableTypeEnum,
     ReviewStatusEnum,
 )
-from app.models.rider_model import DriverSubscriptionPlan, Rider
+from app.models.rider_model import Rider  # DriverSubscriptionPlan removed — Blueprint §8.1
 from app.models.search_model import SearchQuery
 from app.models.services_model import (
     BookingStatusEnum as ServiceBookingStatusEnum,
@@ -279,8 +281,8 @@ __all__ = [
     "Hotel",
     "HotelBooking",
     "HotelBookingStatusEnum",
+    "HotelInStayRequest",        # was HotelService — BUG-13 FIX
     "HotelPaymentStatusEnum",
-    "HotelService",
     "Room",
     "RoomStatusEnum",
     "RoomType",
@@ -346,8 +348,8 @@ __all__ = [
     "ReviewStatusEnum",
     "ReviewableTypeEnum",
     # Rider
-    "DriverSubscriptionPlan",
     "Rider",
+    # DriverSubscriptionPlan removed — Blueprint §8.1: riders have no subscription plan
     # Search
     "SearchQuery",
     # Services

@@ -42,8 +42,8 @@ from sqlalchemy.orm import Session
 from app.crud.base_crud import AsyncCRUDBase as CRUDBase
 from app.models.wallet_model import (
     PlatformRevenue,
-    TransactionStatus,
-    TransactionType,
+    TransactionStatusEnum,
+    TransactionTypeEnum,
     Wallet,
     WalletTransaction,
     generate_wallet_number,
@@ -203,7 +203,7 @@ class CRUDWallet(CRUDBase[Wallet, dict, dict]):
         *,
         wallet_id: UUID,
         amount: Decimal,
-        transaction_type: TransactionType,
+        transaction_type: TransactionTypeEnum,
         description: str,
         idempotency_key: str,                   # Blueprint §5.6 HARD RULE: REQUIRED
         external_reference: Optional[str] = None,  # Monnify/Paystack reference
@@ -239,7 +239,7 @@ class CRUDWallet(CRUDBase[Wallet, dict, dict]):
             amount=amount,
             balance_before=balance_before,
             balance_after=wallet.balance,
-            status=TransactionStatus.COMPLETED,
+            status=TransactionStatusEnum.COMPLETED,
             description=description,
             # Blueprint §5.6 HARD RULE: idempotency_key UNIQUE NOT NULL
             idempotency_key=idempotency_key,
@@ -262,7 +262,7 @@ class CRUDWallet(CRUDBase[Wallet, dict, dict]):
         *,
         wallet_id: UUID,
         amount: Decimal,
-        transaction_type: TransactionType,
+        transaction_type: TransactionTypeEnum,
         description: str,
         idempotency_key: str,                   # Blueprint §5.6 HARD RULE: REQUIRED
         external_reference: Optional[str] = None,
@@ -295,7 +295,7 @@ class CRUDWallet(CRUDBase[Wallet, dict, dict]):
             amount=amount,
             balance_before=balance_before,
             balance_after=wallet.balance,
-            status=TransactionStatus.COMPLETED,
+            status=TransactionStatusEnum.COMPLETED,
             description=description,
             idempotency_key=idempotency_key,
             external_reference=external_reference,
@@ -380,7 +380,7 @@ class CRUDWalletTransaction(CRUDBase[WalletTransaction, dict, dict]):
         db: AsyncSession,
         *,
         wallet_id: UUID,
-        transaction_type: Optional[TransactionType] = None,
+        transaction_type: Optional[TransactionTypeEnum] = None,
         skip: int = 0,
         limit: int = 20,
     ) -> Tuple[List[WalletTransaction], int]:

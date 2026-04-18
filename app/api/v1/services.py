@@ -522,10 +522,12 @@ def get_booking_details(
     if not booking:
         raise NotFoundException("Booking")
 
-    if current_user.user_type == "customer":
+    # Blueprint §14: use role (not user_type)
+    role_val = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    if role_val == "customer":
         if booking.customer_id != current_user.id:
             raise PermissionDeniedException()
-    elif current_user.user_type == "business":
+    elif role_val == "business":
         biz = business_crud.get_by_user_id_sync(db, user_id=current_user.id)
         if not biz:
             raise NotFoundException("Business")

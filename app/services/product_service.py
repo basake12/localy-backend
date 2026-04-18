@@ -17,8 +17,8 @@ FIXES vs previous version:
   6.  Wallet(user_id=...) → Wallet(owner_id=..., owner_type='customer').
       Blueprint §14.
 
-  7.  TransactionTypeEnum → TransactionType (correct import from wallet_model).
-      TransactionStatusEnum → TransactionStatus (correct import).
+  7.  TransactionTypeEnum → TransactionTypeEnum (correct import from wallet_model).
+      TransactionStatusEnum → TransactionStatusEnum (correct import).
 
   8.  Platform fee structure corrected.
       Blueprint §5.4: "₦50 from business + ₦50 from customer."
@@ -56,8 +56,8 @@ from app.models.user_model import User
 from app.models.wallet_model import (
     Wallet,
     WalletTransaction,
-    TransactionType,      # correct import (not TransactionTypeEnum)
-    TransactionStatus,    # correct import (not TransactionStatusEnum)
+    TransactionTypeEnum,      # correct import (not TransactionTypeEnum)
+    TransactionStatusEnum,    # correct import (not TransactionStatusEnum)
 )
 
 logger = logging.getLogger(__name__)
@@ -177,11 +177,11 @@ class ProductService:
 
         db.add(WalletTransaction(
             wallet_id=biz_wallet.id,
-            transaction_type=TransactionType.CREDIT,
+            transaction_type=TransactionTypeEnum.CREDIT,
             amount=amount,
             balance_before=balance_before,
             balance_after=biz_wallet.balance,
-            status=TransactionStatus.COMPLETED,
+            status=TransactionStatusEnum.COMPLETED,
             description=description,
             # Blueprint §14: external_reference (not reference_id)
             external_reference=external_reference,
@@ -428,11 +428,11 @@ class ProductService:
                 customer_idem = _idem_key()
                 db.add(WalletTransaction(
                     wallet_id=wallet.id,
-                    transaction_type=TransactionType.PAYMENT,
+                    transaction_type=TransactionTypeEnum.PAYMENT,
                     amount=order.total_amount,
                     balance_before=balance_before,
                     balance_after=wallet.balance,
-                    status=TransactionStatus.COMPLETED,
+                    status=TransactionStatusEnum.COMPLETED,
                     description=f"Payment for order #{str(order.id)[:8].upper()}",
                     # Blueprint §14: external_reference
                     external_reference=f"prod_debit_{order.id}",

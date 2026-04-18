@@ -1,16 +1,24 @@
 """
 app/services/property_service.py
 
-FIXES vs previous version:
-  1.  [HARD RULE §2/§4] local_government removed from search_properties()
-      signature and from the call to property_crud.search_properties().
-      Blueprint §2: no LGA filtering anywhere in the codebase.
-      local_government remains in _property_to_dict() for DISPLAY only.
+FIXES:
+  [AUDIT BUG-7] _business_to_dict(): biz.address → biz.registered_address.
 
-  2.  [HARD RULE §16.4] datetime.utcnow() × 2 → datetime.now(timezone.utc)
-      in accept_offer() and reject_offer().
+  Root cause:
+    Blueprint §14 explicitly renames the column:
+      businesses.registered_address  TEXT NOT NULL
+    The Business ORM model (business_model.py) was already corrected to use
+    registered_address. But _business_to_dict() at line 78 still accessed
+    biz.address, causing AttributeError at runtime on every property endpoint
+    that returns a business profile dict (search, detail, agent profile).
 
-  3.  timezone imported from datetime module.
+  [KEPT] local_government removed from search_properties() signature.
+    Blueprint §2/§4 HARD RULE: "No LGA filtering anywhere in the codebase."
+    local_government is retained in _property_to_dict() for DISPLAY only
+    (it is a property-level label, not a business or discovery filter).
+
+  [KEPT] All datetime.utcnow() → datetime.now(timezone.utc).
+    Blueprint §16.4 HARD RULE.
 """
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -72,16 +80,19 @@ class PropertyService:
         if biz is None:
             return None
         return {
-            "id":                biz.id,
-            "business_name":     biz.business_name,
-            "address":           biz.address,
-            "city":              getattr(biz, "city", None),
-            "state":             getattr(biz, "state", None),
-            "business_phone":    getattr(biz, "business_phone", None),
-            "logo":              getattr(biz, "logo", None),
-            "average_rating":    float(biz.average_rating) if biz.average_rating else 0.0,
-            "total_reviews":     getattr(biz, "total_reviews", 0),
-            "is_verified":       getattr(biz, "is_verified", False),
+            "id":               biz.id,
+            "business_name":    biz.business_name,
+            # [BUG-7 FIX] biz.address → biz.registered_address
+            # Blueprint §14: "registered_address TEXT NOT NULL" on businesses table.
+            # business_model.py was already corrected; this service had stale field name.
+            "address":          biz.registered_address,
+            "city":             getattr(biz, "city", None),
+            "state":            getattr(biz, "state", None),
+            "business_phone":   getattr(biz, "business_phone", None),
+            "logo":             getattr(biz, "logo", None),
+            "average_rating":   float(biz.average_rating) if biz.average_rating else 0.0,
+            "total_reviews":    getattr(biz, "total_reviews", 0),
+            "is_verified":      getattr(biz, "is_verified", False),
             "subscription_tier": getattr(biz, "subscription_tier", None),
         }
 
@@ -89,8 +100,9 @@ class PropertyService:
     def _property_to_dict(prop, agent, biz) -> Dict[str, Any]:
         """
         Project Property ORM to plain dict.
-        Geography/WKBElement columns excluded. local_government included
-        for display only — NOT used for filtering.
+        Geography/WKBElement columns excluded from serialisation.
+        local_government included for display only — NOT used for filtering.
+        Blueprint §4 HARD RULE: discovery is radius-based only.
         """
         return {
             "id":                    prop.id,
@@ -110,10 +122,11 @@ class PropertyService:
             "address":               prop.address,
             "city":                  prop.city,
             "state":                 prop.state,
-            # local_government: display label only — NOT for filtering
+            # local_government is a property display label — NOT a discovery filter.
+            # Blueprint §4 HARD RULE: no LGA-based filtering anywhere.
             "local_government":      prop.local_government,
             "postal_code":           prop.postal_code,
-            # location (Geography/WKBElement) intentionally omitted
+            # location (Geography/WKBElement) intentionally omitted — not JSON-serialisable
             "bedrooms":              prop.bedrooms,
             "bathrooms":             prop.bathrooms,
             "toilets":               prop.toilets,
@@ -158,7 +171,8 @@ class PropertyService:
         listing_type:      Optional[str]     = None,
         city:              Optional[str]     = None,
         state:             Optional[str]     = None,
-        # local_government DELETED — Blueprint §2/§4 HARD RULE
+        # local_government PARAMETER DELETED — Blueprint §2/§4 HARD RULE:
+        # "No LGA filtering anywhere in the codebase. No LGA column in any table."
         location:          Optional[tuple]   = None,
         radius_km:         float             = 5.0,
         min_price:         Optional[Decimal] = None,
@@ -226,10 +240,9 @@ class PropertyService:
             PropertyOffer.status      == OfferStatusEnum.PENDING,
         ).count()
 
-        from datetime import date as _date
         upcoming_viewings = db.query(PropertyViewing).filter(
             PropertyViewing.property_id == property_id,
-            PropertyViewing.viewing_date >= _date.today(),
+            PropertyViewing.viewing_date >= date.today(),
             PropertyViewing.status.in_(["pending", "confirmed"]),
         ).count()
 
@@ -258,6 +271,7 @@ class PropertyService:
         offer.status      = OfferStatusEnum.ACCEPTED
         offer.accepted_at = _utcnow()   # Blueprint §16.4 HARD RULE
 
+        # Auto-reject all other pending offers on this property
         db.query(PropertyOffer).filter(
             PropertyOffer.property_id == offer.property_id,
             PropertyOffer.id          != offer_id,
@@ -269,12 +283,16 @@ class PropertyService:
             property_obj.status = PropertyStatusEnum.SOLD
             if agent:
                 agent.properties_sold        += 1
-                agent.total_value_transacted += offer.offer_amount
+                agent.total_value_transacted  = (
+                    (agent.total_value_transacted or Decimal("0")) + offer.offer_amount
+                )
         else:
             property_obj.status = PropertyStatusEnum.RENTED
             if agent:
                 agent.properties_rented      += 1
-                agent.total_value_transacted += offer.offer_amount
+                agent.total_value_transacted  = (
+                    (agent.total_value_transacted or Decimal("0")) + offer.offer_amount
+                )
 
         db.commit()
         db.refresh(offer)

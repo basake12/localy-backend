@@ -139,7 +139,7 @@ def create_and_pay_delivery(
             amount=delivery.total_fee,
             transaction_type=TransactionType.PAYMENT,
             description=f"Delivery fee — {delivery.tracking_code}",
-            reference_id=str(delivery.id),
+            external_reference=str(delivery.id),
         )
 
         delivery.payment_status = "paid"
@@ -278,7 +278,7 @@ def refund_delivery_fee(
         amount=delivery.total_fee,
         transaction_type=TransactionType.REFUND,
         description=f"Refund for cancelled delivery — {delivery.tracking_code}",
-        reference_id=str(delivery.id),
+        external_reference=str(delivery.id),
     )
 
     delivery.payment_status = "refunded"

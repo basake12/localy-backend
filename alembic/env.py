@@ -1,5 +1,5 @@
 from logging.config import fileConfig
-
+from sqlalchemy import text
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
@@ -63,6 +63,11 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Ensure PostGIS and uuid-ossp exist before any migration DDL runs
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
+        connection.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'))
+        connection.commit()
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

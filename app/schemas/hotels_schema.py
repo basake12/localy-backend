@@ -1,12 +1,23 @@
 """
 app/schemas/hotels_schema.py
 
-Hotel module schemas per Blueprint v2.0 Section 11.1
+Hotel module schemas per Blueprint v2.0 Section 6.1
 
-CHANGES:
+CHANGES FROM ORIGINAL:
 - Removed lga_id from search filters (replaced with location + radius)
 - Added BookingPaymentResponse for booking + payment data
 - Proper enum types for status fields
+
+BUG-08 FIX: Added number_of_rooms to HotelSearchFilters.
+  The field was entirely absent, so the search route was forced to hardcode
+  rooms=1 regardless of how many rooms the caller wanted.  This could lead to
+  a guest booking into a type that only has 1 room left when they need 2.
+
+BUG-11 FIX: Introduced HotelUpdateRequest with all fields Optional.
+  HotelCreateRequest has total_rooms as a required field (Field(...)).  Using
+  it on both PUT and PATCH endpoints forced callers to always supply total_rooms
+  even for a PATCH that only intends to change star_rating.  HotelUpdateRequest
+  makes every field Optional so partial updates work correctly.
 """
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional, List
@@ -55,6 +66,35 @@ class HotelCreateRequest(BaseModel):
             "facilities": ["pool", "gym", "spa", "restaurant", "parking", "wifi"],
             "policies": "No smoking in rooms",
             "cancellation_policy": "Free cancellation up to 24 hours before check-in"
+        }
+    })
+
+
+# BUG-11 FIX: Dedicated update schema — every field Optional so callers can
+# PATCH a single attribute without re-supplying all others.
+class HotelUpdateRequest(BaseModel):
+    """
+    Partial hotel update schema.  All fields are optional.
+
+    Supply only the fields you want to change.  Omitted fields are left
+    unchanged on both PUT (full) and PATCH (partial) endpoints.
+
+    Difference from HotelCreateRequest:
+    - total_rooms is Optional here (required in Create)
+    - Used by PUT /my/hotel and PATCH /my/hotel
+    """
+    star_rating: Optional[int] = Field(None, ge=1, le=5)
+    total_rooms: Optional[int] = Field(None, gt=0)
+    check_in_time: Optional[time] = None
+    check_out_time: Optional[time] = None
+    facilities: Optional[List[str]] = None
+    policies: Optional[str] = None
+    cancellation_policy: Optional[str] = None
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "star_rating": 5,
+            "facilities": ["pool", "gym", "spa", "restaurant", "parking", "wifi", "ev_charging"]
         }
     })
 
@@ -122,7 +162,7 @@ class RoomTypeResponse(BaseModel):
     base_price_per_night: Decimal
     images: List[str]
     total_rooms: int
-    available_rooms: Optional[int] = None  # Calculated at runtime
+    available_rooms: Optional[int] = None  # Calculated at runtime for availability queries
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -239,9 +279,9 @@ class BookingListResponse(BaseModel):
 class BookingPaymentResponse(BaseModel):
     """
     Response for booking creation with payment details.
-    
+
     Includes booking record + transaction info + platform fee breakdown.
-    Per Blueprint Section 4.4: ₦100 platform fee for hotel bookings.
+    Per Blueprint Section 5.4: ₦100 platform fee for hotel bookings.
     """
     booking: BookingResponse
     customer_transaction: dict  # WalletTransaction details
@@ -301,23 +341,30 @@ class ServiceRequestResponse(BaseModel):
 
 class HotelSearchFilters(BaseModel):
     """
-    Hotel search filters - RADIUS-BASED ONLY.
-    
-    Per Blueprint Section 3: "Location model — Radius-based (default 5 km)
-    — no LGA dependency"
-    
+    Hotel search filters — RADIUS-BASED ONLY.
+
+    Per Blueprint Section 4: "Location is Localy's core differentiator."
+    Section 4.1: Default radius is 5 km; adjustable 1–50 km.
+    Section 2.2 HARD RULE: "Location is radius-based exclusively.
+    There is no local government area (LGA) filtering anywhere in the
+    codebase."
+
     LGA filtering has been removed completely.
+
+    BUG-08 FIX: Added number_of_rooms field.  Previously absent, which
+    forced the search route to hardcode rooms=1, causing the availability
+    check to ignore the actual room-count requirement for group bookings.
     """
     # Primary: coordinate-based radius search
     location: Optional[LocationSchema] = Field(
         None,
-        description="User's location (lat/lng) - required for radius filtering"
+        description="User's location (lat/lng) — required for radius filtering"
     )
     radius_km: Optional[float] = Field(
         None,
         gt=0,
         le=50,
-        description="Search radius in kilometers (default 5km, max 50km)"
+        description="Search radius in kilometres (default 5 km, max 50 km)"
     )
 
     # Content filters
@@ -334,6 +381,17 @@ class HotelSearchFilters(BaseModel):
     check_out_date: Optional[date] = None
     guests: Optional[int] = Field(None, gt=0)
 
+    # BUG-08 FIX: This field was missing entirely.
+    # The search route was forced to pass rooms=1 unconditionally, meaning
+    # availability filtering was always checked against 1 room even when the
+    # caller wanted 2+.  A group booking for 2 rooms could receive results
+    # for hotels that only had 1 room free, leading to overbooking at checkout.
+    number_of_rooms: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Number of rooms required (used for availability filtering)"
+    )
+
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "location": {"latitude": 6.5244, "longitude": 3.3792},
@@ -344,6 +402,7 @@ class HotelSearchFilters(BaseModel):
             "facilities": ["pool", "gym", "wifi"],
             "check_in_date": "2026-04-15",
             "check_out_date": "2026-04-18",
-            "guests": 2
+            "guests": 2,
+            "number_of_rooms": 1
         }
     })

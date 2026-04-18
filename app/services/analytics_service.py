@@ -3,7 +3,7 @@ Analytics and reporting service.
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 
 from app.models.user_model import User
@@ -20,18 +20,18 @@ class AnalyticsService:
         """Get real-time dashboard statistics."""
         # User stats
         total_users = db.query(User).count()
-        total_customers = db.query(User).filter(User.user_type == "customer").count()
+        total_customers = db.query(User).filter(User.role == "customer").count()
         total_businesses = db.query(Business).count()
         total_riders = db.query(Rider).count()
 
         # Today's stats
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         new_users_today = db.query(User).filter(
             func.date(User.created_at) == today
         ).count()
 
         # Active users (logged in last 30 days)
-        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
         active_users = db.query(User).filter(
             User.last_login >= thirty_days_ago
         ).count()
@@ -56,7 +56,7 @@ class AnalyticsService:
             "wallet": {
                 "total_balance": float(total_wallet_balance),
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     def get_revenue_stats(
@@ -119,7 +119,7 @@ class AnalyticsService:
         businesses, riders (not total_* prefixed variants).
         """
         if snapshot_dt is None:
-            snapshot_dt = datetime.utcnow()
+            snapshot_dt = datetime.now(timezone.utc)
 
         snap_date = snapshot_dt.date()
 
@@ -158,7 +158,7 @@ class AnalyticsService:
             days: int = 30,
     ) -> List[Dict[str, Any]]:
         """Get growth trends for last N days from snapshot table."""
-        start_date = datetime.utcnow().date() - timedelta(days=days)
+        start_date = datetime.now(timezone.utc).date() - timedelta(days=days)
 
         snapshots = (
             db.query(DailyAnalyticsSnapshot)

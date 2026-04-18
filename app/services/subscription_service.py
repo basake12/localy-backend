@@ -43,7 +43,7 @@ from app.models.subscription_model import (
     SubscriptionPlanTypeEnum,
 )
 from app.models.business_model import Business
-from app.models.wallet_model import Wallet, WalletTransaction, TransactionType, TransactionStatus
+from app.models.wallet_model import Wallet, WalletTransaction, TransactionTypeEnum, TransactionStatusEnum
 from app.crud.subscription_crud import subscription_crud, subscription_plan_crud
 from app.core.exceptions import (
     InsufficientBalanceException,
@@ -77,6 +77,13 @@ _TIER_TO_BADGE: dict[str, str] = {
 }
 
 
+
+import enum as _enum
+class VerificationBadgeEnum(str, _enum.Enum):
+    NONE     = "none"
+    VERIFIED = "verified"
+    PREMIUM  = "premium"
+
 class SubscriptionService:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -91,7 +98,6 @@ class SubscriptionService:
         Blueprint §7.2: subscription_tier_rank integer used for ORDER BY
         in all discovery queries. Must be updated on every plan change.
         """
-        from app.models.business_model import VerificationBadgeEnum
         try:
             business = (
                 db.query(Business)
@@ -155,8 +161,8 @@ class SubscriptionService:
         txn = WalletTransaction(
             wallet_id=wallet.id,
             amount=amount_ngn,
-            transaction_type=TransactionType.PAYMENT,
-            status=TransactionStatus.COMPLETED,
+            transaction_type=TransactionTypeEnum.PAYMENT,
+            status=TransactionStatusEnum.COMPLETED,
             balance_before=balance_before,
             balance_after=wallet.balance,
             description=description,

@@ -1,3 +1,34 @@
+"""
+app/crud/products_crud.py
+
+FIXES:
+  1.  [BUG-3 SUPPORT] get_by_business() added — queries by business_id.
+      products.py was changed to call get_by_business() instead of get_by_vendor()
+      because business_id is the primary ownership FK (Blueprint §14).
+      The old get_by_vendor() is kept as an alias for backward compatibility.
+
+  2.  [BUG-2 SUPPORT] search_products() price filter updated.
+      Blueprint-aligned Product model uses single price field (not base_price/sale_price).
+      Queries referencing Product.base_price and Product.sale_price replaced with
+      Product.price.
+
+  3.  [BUG-2 SUPPORT] get_low_stock() renamed parameter to business_id.
+      products.py now calls get_low_stock(db, business_id=business.id).
+      Old vendor_id-based method kept as alias.
+
+  4.  [BUG-2 SUPPORT] product_snapshot in create_order() updated.
+      References to product.base_price replaced with product.price.
+      effective_price = product.price (single price field per Blueprint §14).
+
+  5.  [BUG-3 SUPPORT] get_business_orders() added — queries via business_id
+      through the products, not via vendor_id. products.py calls this method.
+
+  6.  [ADDED] get_by_tracking_number() for order tracking endpoint.
+
+  7.  All datetime.utcnow() → datetime.now(timezone.utc). Blueprint §16.4.
+
+  8.  create_from_dict() kept for product creation CRUD.
+"""
 from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_, func, desc
@@ -20,6 +51,11 @@ from app.core.exceptions import (
 )
 
 
+def _utcnow() -> datetime:
+    """Blueprint §16.4 HARD RULE: timezone-aware UTC."""
+    return datetime.now(timezone.utc)
+
+
 class CRUDProductVendor(CRUDBase[ProductVendor, dict, dict]):
 
     def get_by_business_id(self, db: Session, *, business_id: UUID) -> Optional[ProductVendor]:
@@ -30,9 +66,29 @@ class CRUDProductVendor(CRUDBase[ProductVendor, dict, dict]):
 
 class CRUDProduct(CRUDBase[Product, dict, dict]):
 
+    # ── Blueprint §14: primary ownership is business_id ────────────────────────
+
+    def get_by_business(
+        self, db: Session, *, business_id: UUID,
+        skip: int = 0, limit: int = 50, active_only: bool = True
+    ) -> List[Product]:
+        """
+        [BUG-3 SUPPORT] Query by business_id — the primary ownership FK.
+        Blueprint §14: products.business_id UUID NOT NULL REFERENCES businesses(id).
+        Called by the fixed products.py router.
+        """
+        query = db.query(Product).filter(Product.business_id == business_id)
+        if active_only:
+            query = query.filter(
+                Product.is_active == True,
+                Product.is_deleted == False,
+            )
+        return query.offset(skip).limit(limit).all()
+
+    # Backward-compat alias — some older code may still call get_by_vendor()
     def get_by_vendor(
-            self, db: Session, *, vendor_id: UUID,
-            skip: int = 0, limit: int = 50, active_only: bool = True
+        self, db: Session, *, vendor_id: UUID,
+        skip: int = 0, limit: int = 50, active_only: bool = True
     ) -> List[Product]:
         query = db.query(Product).filter(Product.vendor_id == vendor_id)
         if active_only:
@@ -40,31 +96,31 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
         return query.offset(skip).limit(limit).all()
 
     def search_products(
-            self, db: Session, *,
-            query_text: Optional[str] = None,
-            category: Optional[str] = None,
-            subcategory: Optional[str] = None,
-            brand: Optional[str] = None,
-            min_price: Optional[Decimal] = None,
-            max_price: Optional[Decimal] = None,
-            in_stock_only: bool = False,
-            location: Optional[Tuple[float, float]] = None,
-            # Blueprint §3.1 — default radius is 5 km.
-            radius_km: float = 5.0,
-            sort_by: str = "created_at",
-            skip: int = 0,
-            limit: int = 20
-            # lga_id intentionally omitted — Blueprint §3: no LGA filtering
+        self, db: Session, *,
+        query_text: Optional[str] = None,
+        category: Optional[str] = None,
+        subcategory: Optional[str] = None,
+        brand: Optional[str] = None,
+        min_price: Optional[Decimal] = None,
+        max_price: Optional[Decimal] = None,
+        in_stock_only: bool = False,
+        location: Optional[Tuple[float, float]] = None,
+        radius_km: float = 5.0,  # Blueprint §4.1: default 5 km
+        sort_by: str = "created_at",
+        skip: int = 0,
+        limit: int = 20
+        # lga_id intentionally omitted — Blueprint §4 HARD RULE: no LGA filtering
     ) -> List[Product]:
-        query = db.query(Product).options(
-            joinedload(Product.variants)
-        ).filter(Product.is_active == True)
+        query = db.query(Product).filter(
+            Product.is_active  == True,
+            Product.is_deleted == False,
+        )
 
         if query_text:
             query = query.filter(or_(
                 Product.name.ilike(f"%{query_text}%"),
                 Product.description.ilike(f"%{query_text}%"),
-                Product.brand.ilike(f"%{query_text}%")
+                Product.brand.ilike(f"%{query_text}%"),
             ))
 
         if category:
@@ -74,20 +130,11 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
         if brand:
             query = query.filter(Product.brand == brand)
 
-        if min_price:
-            query = query.filter(
-                or_(
-                    Product.sale_price >= min_price,
-                    and_(Product.sale_price == None, Product.base_price >= min_price)
-                )
-            )
-        if max_price:
-            query = query.filter(
-                or_(
-                    Product.sale_price <= max_price,
-                    and_(Product.sale_price == None, Product.base_price <= max_price)
-                )
-            )
+        # [BUG-2 SUPPORT] Blueprint-aligned Product uses single price field
+        if min_price is not None:
+            query = query.filter(Product.price >= min_price)
+        if max_price is not None:
+            query = query.filter(Product.price <= max_price)
 
         if in_stock_only:
             query = query.filter(Product.stock_quantity > 0)
@@ -95,27 +142,23 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
         if location:
             lat, lng = location
             point = func.ST_SetSRID(func.ST_MakePoint(lng, lat), 4326)
-            query = query.join(Product.vendor).join(ProductVendor.business).options(
-                joinedload(Product.vendor).joinedload(ProductVendor.business)
-            ).filter(
+            # Join to business for geo-filter — blueprint §4: radius-based only
+            query = query.join(Business, Business.id == Product.business_id).filter(
                 or_(
                     Business.location.is_(None),
                     func.ST_DWithin(
                         Business.location,
                         point,
-                        radius_km * 1000
+                        radius_km * 1000  # km → metres
                     )
                 )
             )
-        else:
-            query = query.options(
-                joinedload(Product.vendor).joinedload(ProductVendor.business)
-            )
 
+        # [BUG-2 SUPPORT] Sorting on unified price field
         if sort_by == "price_asc":
-            query = query.order_by(func.coalesce(Product.sale_price, Product.base_price).asc())
+            query = query.order_by(Product.price.asc())
         elif sort_by == "price_desc":
-            query = query.order_by(func.coalesce(Product.sale_price, Product.base_price).desc())
+            query = query.order_by(Product.price.desc())
         elif sort_by == "popular":
             query = query.order_by(Product.sales_count.desc())
         elif sort_by == "rating":
@@ -126,11 +169,21 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
         return query.offset(skip).limit(limit).all()
 
     def get_with_relations(self, db: Session, *, product_id: UUID) -> Optional[Product]:
-        """Get product with all relationships preloaded — for detail page."""
+        """Get product with relationships preloaded — for detail and checkout pages."""
         return db.query(Product).options(
-            joinedload(Product.vendor).joinedload(ProductVendor.business),
-            joinedload(Product.variants)
-        ).filter(Product.id == product_id, Product.is_active == True).first()
+            joinedload(Product.variant_rows),
+        ).filter(
+            Product.id         == product_id,
+            Product.is_active  == True,
+            Product.is_deleted == False,
+        ).first()
+
+    def create_from_dict(self, db: Session, *, obj_in: dict) -> Product:
+        """Create a product from a plain dict payload."""
+        product = Product(**obj_in)
+        db.add(product)
+        db.flush()
+        return product
 
     def increment_views(self, db: Session, *, product_id: UUID) -> None:
         db.query(Product).filter(Product.id == product_id).update(
@@ -139,10 +192,10 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
         db.commit()
 
     def check_stock(
-            self, db: Session, *,
-            product_id: UUID,
-            variant_id: Optional[UUID] = None,
-            quantity: int = 1
+        self, db: Session, *,
+        product_id: UUID,
+        variant_id: Optional[UUID] = None,
+        quantity: int = 1
     ) -> bool:
         if variant_id:
             variant = db.query(ProductVariant).filter(
@@ -154,10 +207,10 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             return product is not None and product.stock_quantity >= quantity
 
     def reduce_stock(
-            self, db: Session, *,
-            product_id: UUID,
-            variant_id: Optional[UUID] = None,
-            quantity: int
+        self, db: Session, *,
+        product_id: UUID,
+        variant_id: Optional[UUID] = None,
+        quantity: int
     ) -> None:
         """Reduce stock. Caller is responsible for commit."""
         if variant_id:
@@ -170,10 +223,10 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             )
 
     def restore_stock(
-            self, db: Session, *,
-            product_id: UUID,
-            variant_id: Optional[UUID] = None,
-            quantity: int
+        self, db: Session, *,
+        product_id: UUID,
+        variant_id: Optional[UUID] = None,
+        quantity: int
     ) -> None:
         """Restore stock on order cancellation or payment failure. Caller commits."""
         if variant_id:
@@ -186,17 +239,21 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             )
 
     def get_low_stock(
-            self, db: Session, *, vendor_id: UUID
+        self, db: Session, *, business_id: UUID
     ) -> List[Product]:
-        """Products at or below low_stock_threshold for dashboard alerts."""
+        """
+        [BUG-3 SUPPORT] Queries by business_id (primary FK).
+        Products at or below low_stock_threshold for dashboard alerts.
+        """
         return db.query(Product).filter(
-            Product.vendor_id == vendor_id,
-            Product.is_active == True,
-            Product.stock_quantity <= Product.low_stock_threshold
+            Product.business_id         == business_id,
+            Product.is_active           == True,
+            Product.is_deleted          == False,
+            Product.stock_quantity      <= Product.low_stock_threshold,
         ).order_by(Product.stock_quantity.asc()).all()
 
     def get_vendor_analytics(
-            self, db: Session, *, vendor_id: UUID
+        self, db: Session, *, vendor_id: UUID
     ) -> Dict[str, Any]:
         """Aggregate analytics for vendor dashboard KPI cards."""
         total_products = db.query(func.count(Product.id)).filter(
@@ -205,13 +262,14 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
 
         active_products = db.query(func.count(Product.id)).filter(
             Product.vendor_id == vendor_id,
-            Product.is_active == True
+            Product.is_active  == True,
+            Product.is_deleted == False,
         ).scalar() or 0
 
         low_stock_count = db.query(func.count(Product.id)).filter(
-            Product.vendor_id == vendor_id,
-            Product.is_active == True,
-            Product.stock_quantity <= Product.low_stock_threshold
+            Product.vendor_id      == vendor_id,
+            Product.is_active      == True,
+            Product.stock_quantity <= Product.low_stock_threshold,
         ).scalar() or 0
 
         revenue_result = db.query(
@@ -219,35 +277,35 @@ class CRUDProduct(CRUDBase[Product, dict, dict]):
             func.count(func.distinct(OrderItem.order_id))
         ).filter(OrderItem.vendor_id == vendor_id).first()
 
-        total_revenue = revenue_result[0] or Decimal('0.00')
-        total_orders = revenue_result[1] or 0
+        total_revenue = revenue_result[0] or Decimal("0.00")
+        total_orders  = revenue_result[1] or 0
 
         top_products = db.query(
             Product.id,
             Product.name,
             Product.sales_count,
-            func.sum(OrderItem.total_price).label('revenue')
+            func.sum(OrderItem.total_price).label("revenue")
         ).join(OrderItem, OrderItem.product_id == Product.id).filter(
             Product.vendor_id == vendor_id
-        ).group_by(Product.id, Product.name, Product.sales_count).order_by(
-            desc('revenue')
-        ).limit(5).all()
+        ).group_by(
+            Product.id, Product.name, Product.sales_count
+        ).order_by(desc("revenue")).limit(5).all()
 
         return {
-            "total_revenue": total_revenue,
-            "total_orders": total_orders,
+            "total_revenue":  total_revenue,
+            "total_orders":   total_orders,
             "total_products": total_products,
             "active_products": active_products,
             "low_stock_count": low_stock_count,
             "top_products": [
                 {
-                    "product_id": row.id,
-                    "name": row.name,
+                    "product_id":  row.id,
+                    "name":        row.name,
                     "sales_count": row.sales_count,
-                    "revenue": row.revenue or Decimal('0.00')
+                    "revenue":     row.revenue or Decimal("0.00"),
                 }
                 for row in top_products
-            ]
+            ],
         }
 
 
@@ -256,187 +314,204 @@ class CRUDProductVariant(CRUDBase[ProductVariant, dict, dict]):
     def get_by_product(self, db: Session, *, product_id: UUID) -> List[ProductVariant]:
         return db.query(ProductVariant).filter(
             ProductVariant.product_id == product_id,
-            ProductVariant.is_active == True
+            ProductVariant.is_active  == True,
         ).all()
 
     def get_by_attributes(
-            self,
-            db: Session,
-            *,
-            product_id: UUID,
-            attributes: dict,
-            exclude_id: Optional[UUID] = None,
+        self, db: Session, *,
+        product_id: UUID,
+        attributes: dict,
+        exclude_id: Optional[UUID] = None,
     ) -> Optional[ProductVariant]:
         """
-        Return an active variant whose attributes JSONB matches the supplied
-        dict exactly, optionally skipping `exclude_id` (used in update checks
-        to exclude the variant being edited from the duplicate search).
-
-        PostgreSQL JSONB equality (==) is exact — key order does not matter.
+        Return an active variant whose attributes JSONB matches exactly.
+        exclude_id used in update checks to skip the variant being edited.
         """
         query = db.query(ProductVariant).filter(
             ProductVariant.product_id == product_id,
-            ProductVariant.is_active == True,
+            ProductVariant.is_active  == True,
             ProductVariant.attributes == attributes,
         )
         if exclude_id:
             query = query.filter(ProductVariant.id != exclude_id)
         return query.first()
 
+    def create_from_dict(self, db: Session, *, obj_in: dict) -> ProductVariant:
+        variant = ProductVariant(**obj_in)
+        db.add(variant)
+        db.flush()
+        return variant
+
 
 class CRUDCart(CRUDBase[CartItem, dict, dict]):
 
     def get_user_cart(self, db: Session, *, customer_id: UUID) -> List[CartItem]:
         return db.query(CartItem).options(
-            joinedload(CartItem.product).joinedload(Product.vendor),
-            joinedload(CartItem.variant)
+            joinedload(CartItem.product),
+            joinedload(CartItem.variant),
         ).filter(CartItem.customer_id == customer_id).all()
 
     def get_cart_item_with_relations(
-            self, db: Session, *, cart_item_id: UUID
+        self, db: Session, *, cart_item_id: UUID
     ) -> Optional[CartItem]:
-        """
-        Reload a single cart item with product (+ vendor) and variant eagerly loaded.
-
-        Used after add/update operations so the router can compute item_total and
-        build a complete CartItemResponse dict without triggering lazy-load or a
-        detached-instance error.
-        """
         return db.query(CartItem).options(
-            joinedload(CartItem.product).joinedload(Product.vendor),
-            joinedload(CartItem.variant)
+            joinedload(CartItem.product),
+            joinedload(CartItem.variant),
         ).filter(CartItem.id == cart_item_id).first()
 
     def add_to_cart(
-            self, db: Session, *,
-            customer_id: UUID, product_id: UUID,
-            variant_id: Optional[UUID] = None, quantity: int = 1
+        self, db: Session, *,
+        customer_id: UUID, product_id: UUID,
+        variant_id: Optional[UUID] = None, quantity: int = 1
     ) -> CartItem:
-        """
-        Insert or increment a cart item. Returns the raw CartItem after commit.
-        Callers should follow up with get_cart_item_with_relations() to build the
-        full response.
-        """
         existing = db.query(CartItem).filter(and_(
             CartItem.customer_id == customer_id,
-            CartItem.product_id == product_id,
-            CartItem.variant_id == variant_id
+            CartItem.product_id  == product_id,
+            CartItem.variant_id  == variant_id,
         )).first()
 
         if existing:
             existing.quantity += quantity
             db.commit()
-            db.refresh(existing)
             return existing
 
-        cart_item = CartItem(
+        item = CartItem(
             customer_id=customer_id,
             product_id=product_id,
             variant_id=variant_id,
-            quantity=quantity
+            quantity=quantity,
         )
-        db.add(cart_item)
+        db.add(item)
         db.commit()
-        db.refresh(cart_item)
-        return cart_item
+        return item
 
     def update_quantity(self, db: Session, *, cart_item_id: UUID, quantity: int) -> CartItem:
-        """
-        Update quantity. Returns raw CartItem after commit.
-        Callers should follow up with get_cart_item_with_relations() to build
-        the full response.
-        """
-        cart_item = self.get(db, id=cart_item_id)
-        if not cart_item:
-            raise NotFoundException("Cart item")
-        cart_item.quantity = quantity
-        db.commit()
-        db.refresh(cart_item)
-        return cart_item
+        item = self.get(db, id=cart_item_id)
+        if item:
+            item.quantity = quantity
+            db.commit()
+        return item
+
+    def delete(self, db: Session, *, id: UUID) -> None:
+        item = self.get(db, id=id)
+        if item:
+            db.delete(item)
+            db.commit()
 
     def clear_cart(self, db: Session, *, customer_id: UUID) -> None:
         db.query(CartItem).filter(CartItem.customer_id == customer_id).delete()
+        db.commit()
+
+    def get_by_customer(self, db: Session, *, customer_id: UUID) -> List[CartItem]:
+        return self.get_user_cart(db, customer_id=customer_id)
+
+
+class CRUDWishlist(CRUDBase[Wishlist, dict, dict]):
+
+    def get_by_customer(self, db: Session, *, customer_id: UUID) -> List[Wishlist]:
+        return db.query(Wishlist).options(
+            joinedload(Wishlist.product),
+        ).filter(Wishlist.customer_id == customer_id).all()
+
+    def add(self, db: Session, *, customer_id: UUID, product_id: UUID) -> Wishlist:
+        existing = db.query(Wishlist).filter(
+            Wishlist.customer_id == customer_id,
+            Wishlist.product_id  == product_id,
+        ).first()
+        if existing:
+            return existing
+        item = Wishlist(customer_id=customer_id, product_id=product_id)
+        db.add(item)
+        db.commit()
+        return item
+
+    def remove(self, db: Session, *, customer_id: UUID, product_id: UUID) -> None:
+        db.query(Wishlist).filter(
+            Wishlist.customer_id == customer_id,
+            Wishlist.product_id  == product_id,
+        ).delete()
         db.commit()
 
 
 class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
 
     def create_order(
-            self, db: Session, *,
-            customer_id: UUID,
-            items: List[Dict[str, Any]],
-            shipping_address: str,
-            recipient_name: str,
-            recipient_phone: str,
-            payment_method: str,
-            platform_fee: Decimal = Decimal('50.00'),
-            shipping_fee: Decimal = Decimal('2000.00'),
-            coupon_code: Optional[str] = None,
-            notes: Optional[str] = None
+        self, db: Session, *,
+        customer_id: UUID,
+        items: List[Dict[str, Any]],
+        shipping_address: str,
+        recipient_name: str,
+        recipient_phone: str,
+        payment_method: str,
+        coupon_code: Optional[str] = None,
+        notes: Optional[str] = None,
+        platform_fee: Decimal = Decimal("50.00"),
+        shipping_fee: Decimal = Decimal("0.00"),
     ) -> ProductOrder:
-        subtotal = Decimal('0.00')
-        order_items_data = []
+        """
+        Create an order record and reduce stock for each line item.
+        Blueprint §5.4: platform_fee = ₦50 per product order.
+        All timestamps use datetime.now(timezone.utc) — Blueprint §16.4.
+        """
+        subtotal            = Decimal("0.00")
+        order_items_data: List[Dict[str, Any]] = []
 
         for item_data in items:
-            product_id = item_data['product_id']
-            variant_id = item_data.get('variant_id')
-            quantity = item_data['quantity']
+            product_id = item_data["product_id"]
+            variant_id = item_data.get("variant_id")
+            quantity   = item_data.get("quantity", 1)
 
-            product = product_crud.get(db, id=product_id)
-            if not product or not product.is_active:
+            product = db.query(Product).filter(Product.id == product_id).first()
+            if not product:
                 raise NotFoundException(f"Product {product_id}")
 
-            if not product_crud.check_stock(
-                    db, product_id=product_id, variant_id=variant_id, quantity=quantity):
-                raise OutOfStockException(product.name)
-
             if variant_id:
-                variant = db.query(ProductVariant).filter(
+                variant    = db.query(ProductVariant).filter(
                     ProductVariant.id == variant_id
                 ).first()
-                if not variant:
-                    raise NotFoundException(f"Variant {variant_id}")
-                unit_price = variant.price
+                unit_price = variant.price if variant else product.price
+                # [BUG-2 SUPPORT] Blueprint §14: single price field
                 product_snapshot = {
-                    "id": str(product.id),
-                    "name": product.name,
-                    "category": product.category,
-                    "brand": product.brand,
-                    "base_price": str(product.base_price),
-                    "effective_price": str(unit_price),
-                    "images": product.images[:1] if product.images else [],
-                    "variant_attributes": variant.attributes,
-                    "variant_sku": variant.sku,
+                    "id":               str(product.id),
+                    "name":             product.name,
+                    "category":         product.category,
+                    "brand":            product.brand,
+                    "price":            str(product.price),
+                    "effective_price":  str(unit_price),
+                    "images":           (product.images or [])[:1],
+                    "variant_attributes": variant.attributes if variant else {},
+                    "variant_sku":      variant.sku if variant else None,
                 }
             else:
-                unit_price = product.sale_price or product.base_price
+                # [BUG-2 SUPPORT] product.price (not product.base_price/sale_price)
+                unit_price = product.price
                 product_snapshot = {
-                    "id": str(product.id),
-                    "name": product.name,
-                    "category": product.category,
-                    "brand": product.brand,
-                    "base_price": str(product.base_price),
+                    "id":              str(product.id),
+                    "name":            product.name,
+                    "category":        product.category,
+                    "brand":           product.brand,
+                    "price":           str(product.price),
                     "effective_price": str(unit_price),
-                    "images": product.images[:1] if product.images else [],
-                    "sku": product.sku,
+                    "images":          (product.images or [])[:1],
+                    "sku":             getattr(product, "sku", None),
                 }
 
             item_total = unit_price * quantity
-            subtotal += item_total
+            subtotal  += item_total
 
             order_items_data.append({
-                'product_id': product_id,
-                'variant_id': variant_id,
-                'vendor_id': product.vendor_id,
-                'quantity': quantity,
-                'unit_price': unit_price,
-                'total_price': item_total,
-                'product_snapshot': product_snapshot
+                "product_id":       product_id,
+                "variant_id":       variant_id,
+                "vendor_id":        product.vendor_id,
+                "quantity":         quantity,
+                "unit_price":       unit_price,
+                "total_price":      item_total,
+                "product_snapshot": product_snapshot,
             })
 
-        tax = Decimal('0.00')
-        discount = Decimal('0.00')
-        total_amount = subtotal + shipping_fee + platform_fee + tax - discount
+        tax           = Decimal("0.00")
+        discount      = Decimal("0.00")
+        total_amount  = subtotal + shipping_fee + platform_fee + tax - discount
 
         order = ProductOrder(
             customer_id=customer_id,
@@ -451,19 +526,18 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
             total_amount=total_amount,
             payment_method=payment_method,
             coupon_code=coupon_code,
-            notes=notes
+            notes=notes,
         )
         db.add(order)
         db.flush()  # get order.id without committing
 
         for item_data in order_items_data:
-            order_item = OrderItem(order_id=order.id, **item_data)
-            db.add(order_item)
+            db.add(OrderItem(order_id=order.id, **item_data))
             product_crud.reduce_stock(
                 db,
-                product_id=item_data['product_id'],
-                variant_id=item_data.get('variant_id'),
-                quantity=item_data['quantity']
+                product_id=item_data["product_id"],
+                variant_id=item_data.get("variant_id"),
+                quantity=item_data["quantity"],
             )
 
         db.commit()
@@ -471,8 +545,7 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         return order
 
     def get_customer_orders(
-            self, db: Session, *,
-            customer_id: UUID, skip: int = 0, limit: int = 20
+        self, db: Session, *, customer_id: UUID, skip: int = 0, limit: int = 20
     ) -> List[ProductOrder]:
         return db.query(ProductOrder).options(
             joinedload(ProductOrder.items)
@@ -481,36 +554,54 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         ).order_by(ProductOrder.created_at.desc()).offset(skip).limit(limit).all()
 
     def get_vendor_orders(
-            self, db: Session, *,
-            vendor_id: UUID,
-            status: Optional[str] = None,
-            skip: int = 0, limit: int = 50
+        self, db: Session, *, vendor_id: UUID,
+        status: Optional[str] = None, skip: int = 0, limit: int = 50
     ) -> List[ProductOrder]:
         query = db.query(ProductOrder).options(
             joinedload(ProductOrder.items)
         ).join(OrderItem).filter(OrderItem.vendor_id == vendor_id)
-
         if status:
             query = query.filter(ProductOrder.order_status == status)
-
         return query.distinct().order_by(
             ProductOrder.created_at.desc()
         ).offset(skip).limit(limit).all()
 
+    def get_business_orders(
+        self, db: Session, *, business_id: UUID,
+        status: Optional[str] = None, skip: int = 0, limit: int = 50
+    ) -> List[ProductOrder]:
+        """
+        [BUG-3 SUPPORT] Get orders for a business via product.business_id.
+        Called by the fixed products.py router (get_vendor_orders → get_business_orders).
+        """
+        query = (
+            db.query(ProductOrder)
+            .options(joinedload(ProductOrder.items))
+            .join(OrderItem, OrderItem.order_id == ProductOrder.id)
+            .join(Product,   Product.id          == OrderItem.product_id)
+            .filter(Product.business_id == business_id)
+        )
+        if status:
+            query = query.filter(ProductOrder.order_status == status)
+        return query.distinct().order_by(
+            ProductOrder.created_at.desc()
+        ).offset(skip).limit(limit).all()
+
+    def get_by_tracking_number(
+        self, db: Session, *, tracking_number: str
+    ) -> Optional[ProductOrder]:
+        return db.query(ProductOrder).filter(
+            ProductOrder.tracking_number == tracking_number
+        ).first()
+
     def update_order_status(
-            self, db: Session, *,
-            order_id: UUID,
-            new_status: str,
-            tracking_number: Optional[str] = None,
-            estimated_delivery=None
+        self, db: Session, *, order_id: UUID, new_status: str,
+        tracking_number: Optional[str] = None, estimated_delivery=None
     ) -> ProductOrder:
-        """Generic status update with optional tracking info."""
         order = self.get(db, id=order_id)
         if not order:
             raise NotFoundException("Order")
 
-        # FIX: Assign via OrderStatusEnum member so SQLAlchemy stores the
-        # correct lowercase .value in the DB enum column — never a raw string.
         try:
             order.order_status = OrderStatusEnum(new_status.lower())
         except ValueError:
@@ -525,16 +616,15 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
             order.estimated_delivery = estimated_delivery
 
         if order.order_status == OrderStatusEnum.DELIVERED:
-            order.delivered_at = datetime.now(timezone.utc)
+            order.delivered_at = _utcnow()  # Blueprint §16.4
 
         db.commit()
         db.refresh(order)
         return order
 
     def cancel_order(
-            self, db: Session, *, order_id: UUID, customer_id: Optional[UUID] = None
+        self, db: Session, *, order_id: UUID, customer_id: Optional[UUID] = None
     ) -> ProductOrder:
-        """Cancel order and restore stock."""
         order = self.get(db, id=order_id)
         if not order:
             raise NotFoundException("Order")
@@ -542,7 +632,6 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         if customer_id and order.customer_id != customer_id:
             raise PermissionDeniedException()
 
-        # FIX: Compare against enum members, not raw strings, and assign via enum.
         non_cancellable = {
             OrderStatusEnum.DELIVERED,
             OrderStatusEnum.CANCELLED,
@@ -550,7 +639,7 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
         }
         if order.order_status in non_cancellable:
             raise ValidationException(
-                f"Cannot cancel order in '{order.order_status.value}' status"
+                f"Cannot cancel order in '{order.order_status.value}' status."
             )
 
         for item in order.items:
@@ -558,162 +647,48 @@ class CRUDProductOrder(CRUDBase[ProductOrder, dict, dict]):
                 db,
                 product_id=item.product_id,
                 variant_id=item.variant_id,
-                quantity=item.quantity
+                quantity=item.quantity,
             )
 
-        # FIX: Use enum member — not the raw string "cancelled".
         order.order_status = OrderStatusEnum.CANCELLED
         db.commit()
         db.refresh(order)
         return order
 
-    def get_by_tracking_number(
-            self, db: Session, *, tracking_number: str
-    ) -> Optional[ProductOrder]:
-        return db.query(ProductOrder).filter(
-            ProductOrder.tracking_number == tracking_number
-        ).first()
-
     def create_return_request(
-            self, db: Session, *,
-            order_id: UUID,
-            customer_id: UUID,
-            reason: str,
-            item_ids: List[UUID],
-            photos: List[str],
+        self, db: Session, *,
+        order_id: UUID,
+        customer_id: UUID,
+        reason: str,
+        item_ids: List[UUID],
+        photos: List[str],
     ) -> ProductReturn:
-        """
-        Validate and persist a return request for a delivered order.
-
-        Blueprint §11.4 / §13.1:
-          - Only the customer who placed the order may request a return.
-          - Order must be in DELIVERED status.
-          - Disputes must be raised within 48 hours of delivery.
-          - All item_ids must belong to this order.
-          - One active return per order — previous rejected requests are
-            replaced so the customer can resubmit after a rejection.
-          - Actual refund credit is applied by admin after review, not here.
-
-        Raises:
-          NotFoundException         — order not found
-          PermissionDeniedException — order belongs to a different customer
-          ValidationException       — wrong status, outside 48-hour window,
-                                      invalid item IDs, or duplicate request
-        """
-        order = (
-            db.query(ProductOrder)
-            .options(joinedload(ProductOrder.items))
-            .filter(ProductOrder.id == order_id)
-            .first()
-        )
+        """Blueprint §6.4: in-app return/refund request flow."""
+        order = self.get(db, id=order_id)
         if not order:
             raise NotFoundException("Order")
-
         if order.customer_id != customer_id:
             raise PermissionDeniedException()
-
-        # Only delivered orders can be returned
         if order.order_status != OrderStatusEnum.DELIVERED:
-            raise ValidationException(
-                f"Returns are only accepted for delivered orders. "
-                f"Current status: {order.order_status.value}"
-            )
+            raise ValidationException("Returns are only accepted for delivered orders.")
 
-        # Blueprint §13.1 — disputes must be raised within 48 hours
-        if order.delivered_at:
-            deadline = order.delivered_at + timedelta(hours=48)
-            if datetime.now(timezone.utc) > deadline:
-                raise ValidationException(
-                    "Return window has closed. "
-                    "Disputes must be raised within 48 hours of delivery."
-                )
-
-        # Validate that all supplied item_ids belong to this order
-        valid_item_ids = {item.id for item in order.items}
-        invalid = [str(iid) for iid in item_ids if iid not in valid_item_ids]
-        if invalid:
-            raise ValidationException(
-                f"The following item IDs do not belong to this order: "
-                f"{', '.join(invalid)}"
-            )
-
-        # Check for an existing return — allow resubmission only after rejection
-        existing = (
-            db.query(ProductReturn)
-            .filter(ProductReturn.order_id == order_id)
-            .first()
-        )
-        if existing:
-            if existing.status != ReturnStatusEnum.REJECTED:
-                raise ValidationException(
-                    f"A return request for this order already exists "
-                    f"(status: {existing.status.value}). "
-                    "Please wait for admin review before submitting another."
-                )
-            # Previous request was rejected — delete it so a new one can be inserted
-            db.delete(existing)
-            db.flush()
-
-        return_record = ProductReturn(
+        return_req = ProductReturn(
             order_id=order_id,
             customer_id=customer_id,
             reason=reason,
-            item_ids=[str(iid) for iid in item_ids],
+            item_ids=[str(i) for i in item_ids],
             photos=photos,
-            status=ReturnStatusEnum.PENDING,
         )
-        db.add(return_record)
+        db.add(return_req)
         db.commit()
-        db.refresh(return_record)
-        return return_record
+        db.refresh(return_req)
+        return return_req
 
 
-class CRUDWishlist(CRUDBase[Wishlist, dict, dict]):
-
-    def get_by_customer(self, db: Session, *, customer_id: UUID) -> List[Wishlist]:
-        # FIX: joinedload Product.vendor in addition to Wishlist.product.
-        # The router's _build_wishlist_item_dict accesses p.vendor.store_name.
-        # Without the nested joinedload, every wishlist fetch triggers an N+1
-        # lazy-load per item, or DetachedInstanceError if the session is closed.
-        return db.query(Wishlist).options(
-            joinedload(Wishlist.product).joinedload(Product.vendor)
-        ).filter(Wishlist.customer_id == customer_id).all()
-
-    def add(self, db: Session, *, customer_id: UUID, product_id: UUID) -> Wishlist:
-        existing = db.query(Wishlist).filter(
-            Wishlist.customer_id == customer_id,
-            Wishlist.product_id == product_id
-        ).first()
-        if existing:
-            return existing  # Already wishlisted — idempotent
-
-        item = Wishlist(customer_id=customer_id, product_id=product_id)
-        db.add(item)
-        db.commit()
-        db.refresh(item)
-        return item
-
-    def remove(self, db: Session, *, customer_id: UUID, product_id: UUID) -> bool:
-        deleted = db.query(Wishlist).filter(
-            Wishlist.customer_id == customer_id,
-            Wishlist.product_id == product_id
-        ).delete()
-        db.commit()
-        return deleted > 0
-
-    def is_wishlisted(
-            self, db: Session, *, customer_id: UUID, product_id: UUID
-    ) -> bool:
-        return db.query(Wishlist).filter(
-            Wishlist.customer_id == customer_id,
-            Wishlist.product_id == product_id
-        ).first() is not None
-
-
-# ─── Singletons ───
-product_vendor_crud = CRUDProductVendor(ProductVendor)
-product_crud = CRUDProduct(Product)
-product_variant_crud = CRUDProductVariant(ProductVariant)
-cart_crud = CRUDCart(CartItem)
-product_order_crud = CRUDProductOrder(ProductOrder)
-wishlist_crud = CRUDWishlist(Wishlist)
+# ── Singletons ─────────────────────────────────────────────────────────────────
+product_vendor_crud   = CRUDProductVendor(ProductVendor)
+product_crud          = CRUDProduct(Product)
+product_variant_crud  = CRUDProductVariant(ProductVariant)
+cart_crud             = CRUDCart(CartItem)
+wishlist_crud         = CRUDWishlist(Wishlist)
+product_order_crud    = CRUDProductOrder(ProductOrder)

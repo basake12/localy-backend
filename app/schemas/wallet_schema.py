@@ -22,7 +22,7 @@ from datetime import datetime, date
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
-from app.models.wallet_model import TransactionType, TransactionStatus
+from app.models.wallet_model import TransactionTypeEnum, TransactionStatusEnum
 
 
 # ─── Wallet ───────────────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ class WalletTransactionOut(BaseModel):
 
     id:               UUID
     wallet_id:        UUID
-    transaction_type: TransactionType
+    transaction_type: TransactionTypeEnum
     amount:           Decimal
     balance_before:   Decimal
     balance_after:    Decimal
@@ -156,7 +156,7 @@ class WalletTransactionOut(BaseModel):
     external_reference: Optional[str] = None
     idempotency_key:    str
 
-    status:           TransactionStatus
+    status:           TransactionStatusEnum
     meta_data:        Optional[dict] = None
     created_at:       datetime
     completed_at:     Optional[datetime] = None

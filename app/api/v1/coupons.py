@@ -75,11 +75,11 @@ async def apply_coupon(
     # Determine if this user is placing their first order
     # Check via coupon usage history as a proxy — zero prior usages = likely new user
     # A more precise check would query all order tables; this is the lightweight approach.
-    from app.models.coupon_model import CouponUsage
+    from app.models.coupon_model import CouponRedemption
     from sqlalchemy import select, func
 
     usage_result = await db.execute(
-        select(func.count(CouponUsage.id)).where(CouponUsage.user_id == current_user.id)
+        select(func.count(CouponRedemption.id)).where(CouponRedemption.user_id == current_user.id)
     )
     total_usages = usage_result.scalar_one() or 0
     is_new_user = total_usages == 0

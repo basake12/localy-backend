@@ -254,8 +254,9 @@ def get_current_rider_user(
         )
     return current_user
 
-get_current_rider = get_current_rider_user
-require_rider     = get_current_rider_user
+get_current_rider    = get_current_rider_user
+require_rider        = get_current_rider_user
+require_customer     = get_current_customer_user
 
 
 # REMOVED: get_current_admin_user / require_admin
@@ -470,3 +471,45 @@ def verify_api_key(
             detail={"error": "invalid_api_key", "message": "Invalid API key format."},
         )
     return x_api_key
+
+# ════════════════════════════════════════════════════════════════════════════
+# ADMIN DEPENDENCY RE-EXPORT
+# Imported here for backwards compatibility — any v1 router that does
+# `from app.dependencies import require_admin` will get the real implementation
+# from admin_dependencies without needing individual file fixes.
+# ════════════════════════════════════════════════════════════════════════════
+from app.admin_dependencies import require_admin  # noqa: F401, E402
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MISSING ALIASES — added for compatibility with routers expecting these names
+# ════════════════════════════════════════════════════════════════════════════
+
+async def get_async_fully_verified_user(
+    current_user: User = Depends(get_async_current_active_user),
+) -> User:
+    """
+    Require active + phone-verified account (async).
+    Alias used by wallet and other sensitive routers.
+    Same as get_async_current_active_user — phone verification IS the gate.
+    """
+    return current_user
+
+# Common aliases routers may use
+require_active_user          = get_current_active_user
+get_async_verified_user      = get_async_fully_verified_user
+require_async_active_user    = get_async_current_active_user
+require_async_verified_user  = get_async_fully_verified_user
+
+# ════════════════════════════════════════════════════════════════════════════
+# ADDITIONAL ALIASES — get_current_* style names used by various routers
+# ════════════════════════════════════════════════════════════════════════════
+get_current_business      = get_current_business_user
+get_current_customer      = get_current_customer_user
+get_current_rider         = get_current_rider_user
+get_current_admin         = require_admin          # from app.admin_dependencies
+get_current_active        = get_current_active_user
+get_async_current_active  = get_async_current_active_user
+get_async_current_business = get_async_current_business_user
+get_async_current_customer = get_async_current_customer_user
+get_async_current_rider   = get_async_current_rider_user

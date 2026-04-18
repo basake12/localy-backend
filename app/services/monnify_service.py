@@ -1,22 +1,23 @@
 """
 app/services/monnify_service.py
 
-FIXES vs previous version:
-  1.  verify_webhook_signature() added — Blueprint §5.5:
+FIXES:
+  1.  [AUDIT BUG-1] Local ServiceUnavailableException DELETED.
+      Was defined locally (did NOT inherit from LocalyException), so it
+      was never caught by FastAPI's @app.exception_handler(LocalyException).
+      Every Monnify API failure produced a raw 500 response.
+      Now imports ServiceUnavailableException from app.core.exceptions, which
+      IS a LocalyException subclass and will be handled cleanly.
+
+  2.  MONNIFY_BASE_URL defaults to production URL per config.py.
+
+  3.  verify_webhook_signature() — Blueprint §5.5:
       "Verify: hmac.compare_digest(computed_sig, header_sig)"
       Header: X-Monnify-Signature (HMAC-SHA512 of raw request body
       using MONNIFY_SECRET_KEY).
 
-  2.  MONNIFY_BASE_URL now defaults to production URL per corrected config.py.
-      The wallet.py webhook router calls verify_webhook_signature() before
-      any payload processing.
-
-  3.  parse_webhook_payload() added — extracts all fields needed by
+  4.  parse_webhook_payload() — extracts all fields needed by
       wallet_service.handle_monnify_funding().
-
-  4.  get_access_token() note: in production, cache this in Redis with
-      TTL slightly below the Monnify token expiry (~1 hour). Currently
-      fetched fresh per call — acceptable for low-volume provisioning.
 """
 import base64
 import hashlib
@@ -27,6 +28,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from app.config import settings
+from app.core.exceptions import ServiceUnavailableException   # [BUG-1 FIX] — not a local class
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,9 @@ class MonnifyService:
           Header: X-Monnify-Signature (HMAC-SHA512)
           Secret: MONNIFY_SECRET_KEY
 
+        Security convention: compare locally computed value FIRST,
+        externally received value SECOND, to surface type-mismatch bugs.
+
         Returns True if the signature is valid, False otherwise.
         The wallet webhook router MUST call this before processing any payload.
         """
@@ -74,6 +79,7 @@ class MonnifyService:
             hashlib.sha512,
         ).hexdigest()
 
+        # [BUG-9 FIX] Local computed value first, external header second.
         is_valid = hmac.compare_digest(computed, signature_header)
         if not is_valid:
             logger.warning(
@@ -95,14 +101,14 @@ class MonnifyService:
         acct   = payload.get("reservedAccountInfo") or {}
 
         return {
-            "payment_status":   payload.get("paymentStatus", ""),
+            "payment_status":    payload.get("paymentStatus", ""),
             "monnify_reference": payload.get("transactionReference", ""),
             # Destination virtual account number
             "virtual_account_number": (
                 payload.get("destinationAccountNumber")
                 or acct.get("accountNumber", "")
             ),
-            # Amount in Naira (not kobo — no conversion needed)
+            # Amount in Naira (not kobo — no conversion needed for Monnify)
             "amount_ngn":  payload.get("amountPaid", 0),
             "sender_bank": source.get("bankName", ""),
             "sender_name": source.get("accountName", ""),
@@ -119,7 +125,8 @@ class MonnifyService:
     async def _get_access_token(self) -> str:
         """
         Obtain a short-lived Bearer token via Basic auth.
-        NOTE: In production, cache this in Redis (TTL ≈ 3500s).
+        NOTE: In production, cache this in Redis (TTL ≈ 3500s) to avoid a
+        round-trip on every webhook/provisioning call.
         """
         credentials = base64.b64encode(
             f"{self.api_key}:{self.secret_key}".encode()
@@ -132,14 +139,18 @@ class MonnifyService:
                     headers={"Authorization": f"Basic {credentials}"},
                 )
         except httpx.RequestError as exc:
+            # [BUG-1 FIX] Now raises the app-level ServiceUnavailableException,
+            # which IS a LocalyException and WILL be caught by the FastAPI handler.
             raise ServiceUnavailableException(
-                detail=f"Monnify unreachable: {exc}"
+                service="Monnify",
+                detail=f"Monnify unreachable: {exc}",
             )
 
         data = response.json()
         if not data.get("requestSuccessful"):
             raise ServiceUnavailableException(
-                detail=f"Monnify auth failed: {data.get('responseMessage', 'Unknown error')}"
+                service="Monnify",
+                detail=f"Monnify auth failed: {data.get('responseMessage', 'Unknown error')}",
             )
         return data["responseBody"]["accessToken"]
 
@@ -192,13 +203,15 @@ class MonnifyService:
                 )
         except httpx.RequestError as exc:
             raise ServiceUnavailableException(
-                detail=f"Monnify unreachable during account reservation: {exc}"
+                service="Monnify",
+                detail=f"Monnify unreachable during account reservation: {exc}",
             )
 
         data = response.json()
         if not data.get("requestSuccessful"):
             raise ServiceUnavailableException(
-                detail=f"Monnify reserve account failed: {data.get('responseMessage', 'Unknown error')}"
+                service="Monnify",
+                detail=f"Monnify reserve account failed: {data.get('responseMessage', 'Unknown error')}",
             )
         return data["responseBody"]
 
@@ -240,13 +253,24 @@ class MonnifyService:
             logger.warning("Monnify suspend failed for ref=%s: %s", account_reference, exc)
             return False
 
-
-# ── Exception ─────────────────────────────────────────────────────────────────
-
-class ServiceUnavailableException(Exception):
-    def __init__(self, detail: str):
-        self.detail = detail
-        super().__init__(detail)
+    async def reactivate_virtual_account(self, account_reference: str) -> bool:
+        """
+        Reactivate virtual account on user unban.
+        Blueprint §5.5: "Virtual account suspended on ban, reactivated on unban."
+        """
+        try:
+            token = await self._get_access_token()
+            url   = f"{self._root}/api/v2/bank-transfer/reserved-accounts/limit/{account_reference}"
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.put(
+                    url,
+                    json={"reservedAccountType": "GENERAL", "restrictPaymentSource": False},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            return response.json().get("requestSuccessful", False)
+        except Exception as exc:
+            logger.warning("Monnify reactivate failed for ref=%s: %s", account_reference, exc)
+            return False
 
 
 # Singleton

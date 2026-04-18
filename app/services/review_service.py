@@ -11,7 +11,7 @@ from uuid import UUID
 
 from app.crud.reviews_crud import review_crud, helpful_vote_crud, review_response_crud
 from app.models.reviews_model import Review, ReviewStatusEnum, ReviewableTypeEnum, ReviewContextEnum
-from app.models.user_model import User, UserTypeEnum
+from app.models.user_model import User, UserRoleEnum
 from app.schemas.reviews_schema import (
     ReviewCreate, ReviewUpdate,
     ReviewResponseCreate, ReviewResponseUpdate,
@@ -326,7 +326,7 @@ class ReviewResponseService:
         # Business owner check: the responder must own a Business whose id == reviewable_id
         # (for hotel/product/service/restaurant/doctor/property the reviewable_id IS the business-linked entity)
         # Simplified: allow if user is business type OR admin
-        if responder.user_type not in (UserTypeEnum.BUSINESS, UserTypeEnum.ADMIN):
+        if responder.user_type not in (UserRoleEnum.BUSINESS, UserRoleEnum.ADMIN):
             raise PermissionDeniedException("Only business owners can respond to reviews.")
 
         return review
@@ -366,7 +366,7 @@ class ReviewResponseService:
         existing = review_response_crud.get(db, review_id=review_id)
         if not existing:
             raise NotFoundException("Response")
-        if existing.responder_id != responder.id and responder.user_type != UserTypeEnum.ADMIN:
+        if existing.responder_id != responder.id and responder.user_type != UserRoleEnum.ADMIN:
             raise PermissionDeniedException()
 
         review_response_crud.delete(db, response=existing)

@@ -1,15 +1,34 @@
+"""
+app/schemas/chat_schema.py
+
+FIXES vs previous version:
+  1. MessageCreateRequest: message_type → content_type (Blueprint §14 column name).
+     media: dict → media_url: str (Blueprint §14: media_url TEXT).
+
+  2. MessageResponse: message_type → content_type.
+     media: dict → media_url: str.
+     chat_room_id field added (Blueprint §14 name).
+     sender_role field added (Blueprint §14 NOT NULL).
+
+  3. SupportChatRequest renamed → SupportTicketCreateRequest.
+     subject field added (required for ticket creation, §10.3).
+     Blueprint §15: POST /support/tickets requires a subject.
+
+  4. SupportTicketResponse schema added.
+     Blueprint §10.3: Open → In Progress → Resolved status visible to customer.
+     Blueprint §15: GET /support/tickets/{id} response shape.
+"""
+
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import UUID
 
 
-# ============================================
-# CONVERSATION SCHEMAS
-# ============================================
+# ── Conversation Schemas ──────────────────────────────────────────────────────
 
 class ConversationCreateRequest(BaseModel):
-    """Start a new 1:1 or business conversation"""
+    """Start a new business ↔ customer conversation."""
     other_user_id: UUID
     context_type: Optional[str] = None
     context_id: Optional[UUID] = None
@@ -20,20 +39,8 @@ class ConversationCreateRequest(BaseModel):
             "other_user_id": "uuid-of-business-user",
             "context_type": "food_order",
             "context_id": "uuid-of-order",
-            "initial_message": "Hi, I have a question about my order"
+            "initial_message": "Hi, I have a question about my order",
         }
-    })
-
-
-class SupportChatRequest(BaseModel):
-    """
-    Open or retrieve the platform support conversation.
-    Blueprint §9.3 — separate channel from business chat.
-    """
-    initial_message: Optional[str] = None
-
-    model_config = ConfigDict(json_schema_extra={
-        "example": {"initial_message": "I need help with a refund"}
     })
 
 
@@ -51,40 +58,97 @@ class ConversationResponse(BaseModel):
     is_muted: bool = False
     is_archived: bool = False
     is_active: bool = True
+    is_online: bool = False
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
 
-# ============================================
-# MESSAGE SCHEMAS
-# ============================================
+# ── Support Ticket Schemas ────────────────────────────────────────────────────
+
+class SupportTicketCreateRequest(BaseModel):
+    """
+    Blueprint §15: POST /support/tickets.
+    Blueprint §10.3: ticket requires a subject; status starts at 'open'.
+    SLA is set automatically from the user's subscription tier.
+
+    FIX: previously named SupportChatRequest with no subject field —
+    treated support as a plain conversation with no ticket concept.
+    """
+    subject: str = Field(..., min_length=5, max_length=500)
+    initial_message: Optional[str] = None
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "subject": "I need help with a refund for order #12345",
+            "initial_message": "The item arrived damaged.",
+        }
+    })
+
+
+class SupportTicketResponse(BaseModel):
+    """
+    Blueprint §10.3: Open → In Progress → Resolved.
+    Blueprint §15: GET /support/tickets/{id} response.
+    """
+    ticket_id: UUID
+    subject: str
+    status: str                          # open | in_progress | resolved
+    sla_deadline_at: Optional[datetime]
+    resolved_at: Optional[datetime]
+    resolution_note: Optional[str]
+    conversation: Optional[dict] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ── Message Schemas ───────────────────────────────────────────────────────────
 
 class MessageCreateRequest(BaseModel):
-    """Send a message"""
-    conversation_id: UUID
-    message_type: str = "text"
-    content: Optional[str] = None
-    media: Optional[Dict[str, Any]] = None
+    """
+    Send a message.
+    Blueprint §14: content_type IN ('text','image','voice_note').
+                   media_url TEXT (not a dict).
+    Blueprint §10.2 HARD RULE: content_type='voice_note' rejected in rider chats
+    (enforced at router + service layers).
+    """
+    # FIX: was 'message_type' — blueprint §14 column is 'content_type'
+    content_type: str = Field(
+        "text",
+        description="text | image | voice_note",
+        pattern="^(text|image|voice_note)$",
+    )
+    content: Optional[str] = Field(None, max_length=10_000)
+    # FIX: was 'media: dict' — blueprint §14 specifies media_url TEXT (single URL)
+    media_url: Optional[str] = Field(None, max_length=2048)
     reply_to_message_id: Optional[UUID] = None
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "conversation_id": "uuid",
-            "message_type": "text",
-            "content": "Hey, where is my order?"
+            "content_type": "text",
+            "content": "Where is my order?",
         }
     })
 
 
 class MessageResponse(BaseModel):
+    """
+    Blueprint §14 fields:
+      chat_room_id, sender_id, sender_role, content_type, content, media_url, is_read
+    """
     id: UUID
-    conversation_id: UUID
+    # FIX: Blueprint §14 name is chat_room_id (alias for conversation_id)
+    chat_room_id: UUID
     sender_id: UUID
+    # FIX: Blueprint §14 NOT NULL — was missing from response
+    sender_role: str
     sender_name: Optional[str] = None
-    message_type: str
+    # FIX: was 'message_type' — blueprint §14 column is 'content_type'
+    content_type: str
     content: Optional[str]
-    media: Optional[Dict[str, Any]]
+    # FIX: was 'media: dict' — blueprint §14 is media_url TEXT
+    media_url: Optional[str]
     reply_to_message_id: Optional[UUID]
     is_read: bool
     is_delivered: bool
@@ -98,19 +162,20 @@ class MessageResponse(BaseModel):
 
 
 class MessageUpdateRequest(BaseModel):
-    content: str = Field(..., min_length=1)
+    """Edit a text message."""
+    content: str = Field(..., min_length=1, max_length=10_000)
 
 
 class ReactionRequest(BaseModel):
-    emoji: str = Field(..., min_length=1, max_length=4)
+    """Toggle emoji reaction on a message."""
+    emoji: str = Field(..., min_length=1, max_length=8)
 
 
-# ============================================
-# PRESENCE SCHEMAS
-# ============================================
+# ── Presence Schemas ──────────────────────────────────────────────────────────
 
 class PresenceUpdateRequest(BaseModel):
-    status: str = "online"   # online | away | busy | offline
+    """Update own online/away/offline status."""
+    status: str = Field("online", description="online | away | busy | offline")
     device_type: Optional[str] = None
 
 
@@ -123,31 +188,29 @@ class PresenceResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# ============================================
-# TYPING INDICATOR SCHEMA
-# ============================================
+# ── Typing Indicator Schemas ──────────────────────────────────────────────────
 
 class TypingStartRequest(BaseModel):
+    """Sent when the user begins typing."""
     conversation_id: UUID
 
 
-# ============================================
-# WEBSOCKET EVENT PAYLOADS
-# ============================================
+# ── WebSocket Event Payloads ──────────────────────────────────────────────────
 
 class WSEventPayload(BaseModel):
-    """Generic envelope for all WebSocket frames"""
+    """
+    Generic envelope for all WebSocket frames (client → server and server → client).
+    Blueprint §10: "Real-time WebSocket messaging."
+    """
     event: str
     data: Dict[str, Any] = {}
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "event": "new_message",
+            "event": "send_message",
             "data": {
-                "message_id": "uuid",
-                "conversation_id": "uuid",
+                "content_type": "text",
                 "content": "Hello!",
-                "sender_id": "uuid"
-            }
+            },
         }
     })
